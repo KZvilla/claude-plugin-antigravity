@@ -5,6 +5,7 @@ tools:
   - mcp__antigravity__agy_run
   - mcp__antigravity__agy_plan
   - mcp__antigravity__agy_review
+  - mcp__antigravity__agy_usage
   - mcp__antigravity__agy_status
   - mcp__antigravity__agy_set_config
   - Read

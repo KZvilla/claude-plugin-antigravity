@@ -11,10 +11,12 @@ With this plugin, Claude Code can delegate deep reasoning, architectural plannin
 - 🤖 **Autonomous Subagent**: Claude can spin up Antigravity (`agy.exe`) to execute complex tasks, multi-step refactors, and test suites.
 - 🧠 **Dual Model Intelligence**: Combines Anthropic's Claude with Google's Gemini models (Gemini 2.5 / 3.7 Pro & Flash) with configurable reasoning effort (`low`, `medium`, `high`).
 - 🛡️ **Granular ALLOW / DENY Permissions**: Define exact capabilities, forbidden file paths (e.g. `.env*`, `*.key`), forbidden commands (e.g. `git push*`, `npm publish*`), and sandbox isolation.
+- ⏱️ **Robust Timeout Handling**: Automatic injection of `--print-timeout` into Antigravity CLI (15m default, 20m for reviews), preventing premature drops during deep reasoning.
+- 📊 **Model & Quota Telemetry**: Live tracking of token usage, deep thinking tokens, context caching savings, and context window saturation via `/agy-usage`.
 - 🔄 **Multi-Turn Continuity**: Sessions capture `conversation_id`, enabling back-and-forth iteration where Antigravity remembers all previous conversation turns and workspace context.
 - ⚙️ **Flexible Configuration**: Set model, effort, and permissions dynamically per prompt, persistently in JSON config files, or via environment variables.
 - ⚡ **Zero External Dependencies**: Lightweight stdio MCP server implemented directly in standard Node.js.
-- 🛠️ **Slash Commands**: Quick terminal commands (`/agy`, `/agy-plan`, `/agy-review`).
+- 🛠️ **Slash Commands**: Quick terminal commands (`/agy`, `/agy-plan`, `/agy-review`, `/agy-usage`).
 
 ---
 
@@ -22,13 +24,37 @@ With this plugin, Claude Code can delegate deep reasoning, architectural plannin
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| **MCP Server** | `mcp-server/index.js` | Zero-dependency MCP JSON-RPC server exposing `agy_run`, `agy_plan`, `agy_review`, `agy_status`, `agy_set_config` |
+| **MCP Server** | `mcp-server/index.js` | Zero-dependency MCP JSON-RPC server exposing `agy_run`, `agy_plan`, `agy_review`, `agy_usage`, `agy_status`, `agy_set_config` |
 | **Subagent** | `agents/antigravity.md` | Autonomous subagent definition for Claude Code (`antigravity:Antigravity`) |
 | **Skill** | `skills/antigravity/SKILL.md` | Context-aware guidelines on when and how to delegate to Antigravity |
 | **Commands** | `commands/agy.md` | Slash command `/agy <prompt>` |
 | | `commands/agy-plan.md` | Slash command `/agy-plan <task>` |
 | | `commands/agy-review.md` | Slash command `/agy-review [target]` |
+| | `commands/agy-usage.md` | Slash command `/agy-usage` |
 | **Installers** | `install.ps1` / `install.sh` | 1-step installation scripts for Windows, Linux, and macOS |
+
+---
+
+## 📊 Telemetry & Usage Tracking (`/agy-usage`)
+
+Antigravity automatically tracks token consumption, context caching efficiency, and context window saturation across all subagent calls:
+
+Run in terminal:
+```text
+/agy-usage
+```
+*(Or `/agy_usage`)*
+
+To reset the session counters:
+```text
+/agy-usage reset
+```
+
+### Metrics Reported:
+- **Active Model Specs:** Context window capacity (1M for Flash, 2M for Pro), maximum output tokens, and reasoning effort.
+- **Session Cumulative Telemetry:** Total delegated calls, input tokens, output tokens, thinking/reasoning tokens, and context caching savings.
+- **Last Task Breakdown:** Tokens consumed, duration, percentage of context window used (`[████████░░░░] 62.4%`), and conversation ID.
+- **API / Quota Health:** Real-time health indicator (`HEALTHY` vs `RATE_LIMITED / QUOTA EXCEEDED`).
 
 ---
 
@@ -65,6 +91,7 @@ Set default permissions globally or per-project in `.claude/antigravity.json`:
 {
   "model": "gemini-3.7-flash",
   "effort": "high",
+  "timeout_minutes": 15,
   "permissions": {
     "allow": ["read", "edit", "commands"],
     "deny": [],
@@ -74,12 +101,6 @@ Set default permissions globally or per-project in `.claude/antigravity.json`:
   }
 }
 ```
-
-### 3. Updating via Tool
-Ask Claude:
-> *"Claude, agregá a los paths denegados de agy el archivo `secrets.json` y denegá los comandos `git push`"*
-
-Claude will invoke `agy_set_config` to update your configuration.
 
 ---
 
@@ -101,10 +122,12 @@ Ask Claude:
 # Windows PowerShell
 $env:AGY_MODEL = "gemini-3.7-flash"
 $env:AGY_EFFORT = "high"
+$env:AGY_TIMEOUT_MINUTES = "20"
 
 # Bash / Zsh
 export AGY_MODEL="gemini-3.7-flash"
 export AGY_EFFORT="high"
+export AGY_TIMEOUT_MINUTES="20"
 ```
 
 ---
@@ -112,31 +135,22 @@ export AGY_EFFORT="high"
 ## MCP Tools Reference
 
 ### `agy_run`
-Executes an Antigravity subagent session with optional permission guardrails.
-
-**Parameters:**
-- `prompt` (string, required): The task, instructions, or question.
-- `model` (string, optional): Specific model override.
-- `effort` (`"low"` | `"medium"` | `"high"`, optional): Reasoning effort level.
-- `permissions` (object, optional): Granular ALLOW/DENY policies (`allow`, `deny`, `deny_paths`, `deny_commands`, `sandbox`).
-- `conversation_id` (string, optional): ID of previous conversation to resume context across turns.
-- `continue_session` (boolean, optional): Continue most recent conversation (`-c`).
-- `mode` (`"accept-edits"` | `"plan"`, default: `"accept-edits"`): Execution mode.
-- `dangerously_skip_permissions` (boolean, default: `true`): Run headlessly without interactive prompts.
-- `timeout_minutes` (number, default: `10`): Max runtime in minutes.
-- `cwd` (string, optional): Working directory.
+Executes an Antigravity subagent session with optional permission guardrails and configurable timeouts.
 
 ### `agy_plan`
 Generates a step-by-step architectural and implementation plan without modifying files (guaranteed read-only mode).
 
 ### `agy_review`
-Performs an adversarial code review on git diffs or specific files (guaranteed read-only mode).
+Performs an adversarial code review on git diffs or specific files (guaranteed read-only mode, 20m default timeout).
+
+### `agy_usage`
+Displays session token telemetry (input, output, thinking, cache read), context window saturation, active model limits, and quota health status. Supports `reset: true` to clear counters.
 
 ### `agy_status`
 Checks binary path, CLI version, active model/effort defaults, active ALLOW/DENY permission policies, and active configuration file.
 
 ### `agy_set_config`
-Saves default model, effort, or permission preferences persistently.
+Saves default model, effort, timeout, or permission preferences persistently.
 
 ---
 

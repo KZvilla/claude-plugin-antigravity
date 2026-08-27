@@ -82,10 +82,13 @@ Perform a thorough code review of recent changes (guaranteed read-only).
 }
 ```
 
-### 4. `mcp__antigravity__agy_status`
+### 4. `mcp__antigravity__agy_usage`
+Display session token telemetry (input, output, thinking, cache read), context window saturation, active model limits, and quota status. Pass `reset: true` to clear session counters.
+
+### 5. `mcp__antigravity__agy_status`
 Check CLI path, version, active model/effort defaults, and active ALLOW/DENY permission policies.
 
-### 5. `mcp__antigravity__agy_set_config`
+### 6. `mcp__antigravity__agy_set_config`
 Persist defaults for model, effort, or ALLOW/DENY policies in `~/.claude/antigravity.json` or `.claude/antigravity.json`.
 
 ```json

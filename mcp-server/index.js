@@ -4,7 +4,7 @@
  * Antigravity MCP Server for Claude Code
  * Bridges Claude Code / Claude CLI to the Antigravity CLI (`agy.exe`).
  * Implements MCP stdio JSON-RPC 2.0 protocol with zero external dependencies.
- * Includes granular ALLOW / DENY permission management and robust timeout handling.
+ * Includes granular ALLOW / DENY permissions, robust timeout handling, and telemetry / usage metrics.
  */
 
 const { spawn, execSync } = require('node:child_process');
@@ -40,7 +40,7 @@ function resolveAgyBin() {
 
 const AGY_BIN = resolveAgyBin();
 
-// Configuration & Permission Management
+// Configuration Management
 function loadConfig(cwd = process.cwd()) {
   const config = {
     defaultModel: process.env.AGY_MODEL || null,
@@ -117,6 +117,177 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
 
   fs.writeFileSync(targetFile, JSON.stringify(existing, null, 2), 'utf8');
   return { targetFile, config: existing };
+}
+
+// Telemetry & Usage Tracking
+function getUsageFilePath() {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  return path.join(homeDir, '.claude', 'antigravity-usage.json');
+}
+
+function loadUsage() {
+  const usageFile = getUsageFilePath();
+  const today = new Date().toISOString().slice(0, 10);
+
+  const defaultUsage = {
+    session_started_at: new Date().toISOString(),
+    session: {
+      total_calls: 0,
+      calls_by_tool: { run: 0, plan: 0, review: 0 },
+      input_tokens: 0,
+      output_tokens: 0,
+      thinking_tokens: 0,
+      cache_read_tokens: 0,
+      total_tokens: 0,
+      total_duration_seconds: 0
+    },
+    today: {
+      date: today,
+      total_calls: 0,
+      total_tokens: 0,
+      total_duration_seconds: 0
+    },
+    last_call: null,
+    quota_status: 'HEALTHY'
+  };
+
+  if (fs.existsSync(usageFile)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
+      if (data.today && data.today.date !== today) {
+        data.today = { date: today, total_calls: 0, total_tokens: 0, total_duration_seconds: 0 };
+      }
+      return { ...defaultUsage, ...data, usageFile };
+    } catch {}
+  }
+
+  return { ...defaultUsage, usageFile };
+}
+
+function recordUsage(tool, model, effort, conversationId, durationSeconds, usage, isError = false, errorMsg = '') {
+  try {
+    const usageFile = getUsageFilePath();
+    const claudeDir = path.dirname(usageFile);
+    if (!fs.existsSync(claudeDir)) {
+      fs.mkdirSync(claudeDir, { recursive: true });
+    }
+
+    const data = loadUsage();
+    const dur = typeof durationSeconds === 'number' ? durationSeconds : 0;
+    const inp = (usage && usage.input_tokens) || 0;
+    const out = (usage && usage.output_tokens) || 0;
+    const think = (usage && usage.thinking_tokens) || 0;
+    const cache = (usage && usage.cache_read_tokens) || 0;
+    const tot = (usage && usage.total_tokens) || (inp + out);
+
+    data.session.total_calls += 1;
+    data.session.calls_by_tool[tool] = (data.session.calls_by_tool[tool] || 0) + 1;
+    data.session.input_tokens += inp;
+    data.session.output_tokens += out;
+    data.session.thinking_tokens += think;
+    data.session.cache_read_tokens += cache;
+    data.session.total_tokens += tot;
+    data.session.total_duration_seconds += dur;
+
+    data.today.total_calls += 1;
+    data.today.total_tokens += tot;
+    data.today.total_duration_seconds += dur;
+
+    if (errorMsg && (errorMsg.includes('429') || errorMsg.toLowerCase().includes('quota'))) {
+      data.quota_status = 'RATE_LIMITED / QUOTA EXCEEDED';
+    } else {
+      data.quota_status = 'HEALTHY';
+    }
+
+    data.last_call = {
+      tool,
+      model: model || '(cli default)',
+      effort: effort || 'high',
+      conversation_id: conversationId || null,
+      duration_seconds: dur,
+      timestamp: new Date().toISOString(),
+      is_error: isError,
+      usage: {
+        input_tokens: inp,
+        output_tokens: out,
+        thinking_tokens: think,
+        cache_read_tokens: cache,
+        total_tokens: tot
+      }
+    };
+
+    fs.writeFileSync(usageFile, JSON.stringify(data, null, 2), 'utf8');
+  } catch (err) {
+    process.stderr.write(`[antigravity-mcp] Failed to record usage: ${err.message}\n`);
+  }
+}
+
+function resetUsage() {
+  const usageFile = getUsageFilePath();
+  const today = new Date().toISOString().slice(0, 10);
+  const fresh = {
+    session_started_at: new Date().toISOString(),
+    session: {
+      total_calls: 0,
+      calls_by_tool: { run: 0, plan: 0, review: 0 },
+      input_tokens: 0,
+      output_tokens: 0,
+      thinking_tokens: 0,
+      cache_read_tokens: 0,
+      total_tokens: 0,
+      total_duration_seconds: 0
+    },
+    today: {
+      date: today,
+      total_calls: 0,
+      total_tokens: 0,
+      total_duration_seconds: 0
+    },
+    last_call: null,
+    quota_status: 'HEALTHY'
+  };
+
+  try {
+    fs.writeFileSync(usageFile, JSON.stringify(fresh, null, 2), 'utf8');
+  } catch {}
+  return fresh;
+}
+
+function renderProgressBar(percent, length = 16) {
+  const p = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((p / 100) * length);
+  const empty = length - filled;
+  return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${p.toFixed(1)}%`;
+}
+
+function getModelSpecs(modelName) {
+  const m = (modelName || '').toLowerCase();
+  if (m.includes('pro')) {
+    return {
+      name: modelName || 'gemini-2.5-pro',
+      contextWindow: 2097152,
+      maxOutput: 65536,
+      description: 'Google Gemini Pro (Deep Reasoning & Multi-Turn Architecture)'
+    };
+  }
+  return {
+    name: modelName || 'gemini-3.7-flash',
+    contextWindow: 1048576,
+    maxOutput: 65536,
+    description: 'Google Gemini Flash (High-Speed Hybrid Thinking)'
+  };
+}
+
+function formatTokens(n) {
+  return Number(n || 0).toLocaleString('en-US');
+}
+
+function formatDuration(sec) {
+  const s = Math.round(sec || 0);
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m === 0) return `${rem}s`;
+  return `${m}m ${rem}s`;
 }
 
 // MCP Tool Definitions
@@ -259,7 +430,7 @@ const TOOLS = [
         },
         timeout_minutes: {
           type: 'number',
-          description: 'Timeout in minutes. Defaults to 15 (can be increased for large repositories/diffs).'
+          description: 'Timeout in minutes. Defaults to 20 (can be increased for large repositories/diffs).'
         },
         cwd: {
           type: 'string',
@@ -267,6 +438,24 @@ const TOOLS = [
         }
       },
       required: ['review_target']
+    }
+  },
+  {
+    name: 'agy_usage',
+    description: 'Display model metrics, context window capacity, token consumption (input, output, thinking, cache read), and quota health for Antigravity subagent sessions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reset: {
+          type: 'boolean',
+          description: 'Reset session usage counters to 0.'
+        },
+        scope: {
+          type: 'string',
+          enum: ['session', 'today'],
+          description: 'Display metrics for the current session (default) or cumulative for today.'
+        }
+      }
     }
   },
   {
@@ -339,10 +528,9 @@ const TOOLS = [
 // Helper: Run agy process
 function executeAgy(args, options = {}) {
   const timeoutMinutes = options.timeoutMinutes || 15;
-  const timeoutMs = (timeoutMinutes + 1) * 60 * 1000; // 1-minute buffer after agy's internal timeout
+  const timeoutMs = (timeoutMinutes + 1) * 60 * 1000;
   const cwd = options.cwd || process.cwd();
 
-  // Inject --print-timeout into args if not already present
   const finalArgs = [...args];
   if (!finalArgs.includes('--print-timeout')) {
     finalArgs.unshift('--print-timeout', `${timeoutMinutes}m`);
@@ -407,7 +595,6 @@ function executeAgy(args, options = {}) {
           rawOutput: stdout
         });
       } else {
-        // Structured error response handling
         let errorMsg = `Antigravity CLI exited with code ${code}.`;
         if (parsed && parsed.error) {
           errorMsg = `Antigravity error: "${parsed.error}"${parsed.duration_seconds ? ` after ${parsed.duration_seconds.toFixed(1)}s` : ''}.`;
@@ -437,6 +624,71 @@ async function handleToolCall(name, args) {
   const config = loadConfig(args.cwd);
 
   switch (name) {
+    case 'agy_usage': {
+      if (args.reset) {
+        resetUsage();
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Antigravity session usage metrics have been reset to 0.'
+            }
+          ]
+        };
+      }
+
+      const usageData = loadUsage();
+      const activeModel = config.defaultModel || 'gemini-3.7-flash';
+      const specs = getModelSpecs(activeModel);
+      const s = usageData.session;
+      const last = usageData.last_call;
+
+      let out = `### 📊 Antigravity Subagent — Model & Usage Metrics\n\n`;
+
+      out += `**🤖 Active Model Configuration:**\n`;
+      out += `- Model: \`${specs.name}\` (${specs.description})\n`;
+      out += `- Default Reasoning Effort: \`${config.defaultEffort || 'high'}\`\n`;
+      out += `- Context Window: \`${formatTokens(specs.contextWindow)} tokens\`\n`;
+      out += `- Max Output Tokens: \`${formatTokens(specs.maxOutput)} tokens\`\n`;
+      out += `- Session Default Timeout: \`${config.defaultTimeoutMinutes}m\` (20m for reviews)\n`;
+      out += `- Quota / API Health: **${usageData.quota_status}**\n\n`;
+
+      out += `**📈 Cumulative Session Usage:**\n`;
+      out += `- Total Delegated Calls: **${s.total_calls}** (run: ${s.calls_by_tool.run || 0}, plan: ${s.calls_by_tool.plan || 0}, review: ${s.calls_by_tool.review || 0})\n`;
+      out += `- Input Tokens: \`${formatTokens(s.input_tokens)}\`\n`;
+      out += `- Output Tokens: \`${formatTokens(s.output_tokens)}\`\n`;
+      out += `- Thinking / Reasoning Tokens: \`${formatTokens(s.thinking_tokens)}\`\n`;
+      out += `- Context Caching Reused: \`${formatTokens(s.cache_read_tokens)}\` tokens\n`;
+      out += `- Total Tokens Processed: **\`${formatTokens(s.total_tokens)}\`**\n`;
+      out += `- Total Reasoning Time: **${formatDuration(s.total_duration_seconds)}**\n\n`;
+
+      if (last && last.usage) {
+        const lastPercent = specs.contextWindow ? ((last.usage.total_tokens / specs.contextWindow) * 100) : 0;
+        out += `**🎯 Last Invocation (${last.tool}):**\n`;
+        out += `- Model: \`${last.model}\` | Effort: \`${last.effort}\`\n`;
+        out += `- Total Tokens: **\`${formatTokens(last.usage.total_tokens)}\`** ${renderProgressBar(lastPercent)} of context window\n`;
+        out += `- Deep Thinking: \`${formatTokens(last.usage.thinking_tokens)}\` tokens\n`;
+        out += `- Cached Tokens: \`${formatTokens(last.usage.cache_read_tokens)}\` tokens\n`;
+        out += `- Duration: ${formatDuration(last.duration_seconds)}\n`;
+        if (last.conversation_id) {
+          out += `- Conversation ID: \`${last.conversation_id}\`\n`;
+        }
+      } else {
+        out += `*No subagent invocations recorded in this session yet.*\n`;
+      }
+
+      out += `\n*Tip: Run \`/agy-usage reset\` or pass \`reset: true\` to clear session counters.*`;
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: out
+          }
+        ]
+      };
+    }
+
     case 'agy_status': {
       let version = 'unknown';
       try {
@@ -452,7 +704,7 @@ async function handleToolCall(name, args) {
         content: [
           {
             type: 'text',
-            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default)'}\n- Default Effort: ${config.defaultEffort || 'high'}\n- Default Timeout: ${config.defaultTimeoutMinutes}m\n- Permissions Policy:\n  * Allow: [${p.allow.join(', ')}]\n  * Deny: [${p.deny.join(', ') || 'none'}]\n  * Denied Paths: [${p.deny_paths.join(', ')}]\n  * Denied Commands: [${p.deny_commands.join(', ')}]\n  * Sandbox Mode: ${p.sandbox ? 'enabled' : 'disabled'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
+            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default: gemini-3.7-flash)'}\n- Default Effort: ${config.defaultEffort || 'high'}\n- Default Timeout: ${config.defaultTimeoutMinutes}m\n- Permissions Policy:\n  * Allow: [${p.allow.join(', ')}]\n  * Deny: [${p.deny.join(', ') || 'none'}]\n  * Denied Paths: [${p.deny_paths.join(', ')}]\n  * Denied Commands: [${p.deny_commands.join(', ')}]\n  * Sandbox Mode: ${p.sandbox ? 'enabled' : 'disabled'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
           }
         ]
       };
@@ -478,7 +730,6 @@ async function handleToolCall(name, args) {
     }
 
     case 'agy_run': {
-      // Merge effective permissions
       const callPerms = args.permissions || {};
       const basePerms = config.permissions;
       const effectivePerms = {
@@ -523,7 +774,6 @@ async function handleToolCall(name, args) {
         cliArgs.push('-c');
       }
 
-      // Security guardrails injection
       let finalPrompt = args.prompt;
       const securityRules = [];
 
@@ -557,10 +807,19 @@ ${args.prompt}`;
         timeoutMinutes: timeoutMin
       });
 
+      const resData = result.data || {};
+      const conversationId = resData.conversation_id || args.conversation_id || '';
+      const duration = resData.duration_seconds || 0;
+
+      // Record telemetry
+      if (resData.usage) {
+        recordUsage('run', effectiveModel, effectiveEffort, conversationId, duration, resData.usage, !result.success, result.error || '');
+      }
+
       if (!result.success) {
         let errText = `Error executing Antigravity subagent:\n${result.error}`;
-        if (result.data && result.data.conversation_id) {
-          errText += `\n\nSession Conversation ID: \`${result.data.conversation_id}\``;
+        if (conversationId) {
+          errText += `\n\nSession Conversation ID: \`${conversationId}\``;
         }
         return {
           isError: true,
@@ -568,10 +827,8 @@ ${args.prompt}`;
         };
       }
 
-      const resData = result.data || {};
-      const conversationId = resData.conversation_id || '';
       const responseText = resData.response || result.rawOutput || '(No response text returned)';
-      const duration = resData.duration_seconds ? `${resData.duration_seconds.toFixed(1)}s` : 'unknown';
+      const durationStr = duration ? `${duration.toFixed(1)}s` : 'unknown';
       const tokens = resData.usage ? `Input: ${resData.usage.input_tokens}, Output: ${resData.usage.output_tokens}, Thinking: ${resData.usage.thinking_tokens || 0}` : '';
 
       let formatted = `${responseText.trim()}\n\n---\n`;
@@ -583,7 +840,7 @@ ${args.prompt}`;
       if (conversationId) {
         formatted += `- Conversation ID: \`${conversationId}\` (pass as \`conversation_id\` to continue this thread)\n`;
       }
-      formatted += `- Duration: ${duration} (timeout limit: ${timeoutMin}m)\n`;
+      formatted += `- Duration: ${durationStr} (timeout limit: ${timeoutMin}m)\n`;
       if (tokens) {
         formatted += `- Tokens: ${tokens}\n`;
       }
@@ -628,10 +885,18 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         timeoutMinutes: timeoutMin
       });
 
+      const resData = result.data || {};
+      const conversationId = resData.conversation_id || '';
+      const duration = resData.duration_seconds || 0;
+
+      if (resData.usage) {
+        recordUsage('plan', effectiveModel, effectiveEffort, conversationId, duration, resData.usage, !result.success, result.error || '');
+      }
+
       if (!result.success) {
         let errText = `Error generating plan with Antigravity:\n${result.error}`;
-        if (result.data && result.data.conversation_id) {
-          errText += `\n\nSession Conversation ID: \`${result.data.conversation_id}\``;
+        if (conversationId) {
+          errText += `\n\nSession Conversation ID: \`${conversationId}\``;
         }
         return {
           isError: true,
@@ -639,8 +904,6 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         };
       }
 
-      const resData = result.data || {};
-      const conversationId = resData.conversation_id || '';
       const responseText = resData.response || result.rawOutput || '';
 
       let formatted = `### Antigravity Implementation Plan\n\n${responseText.trim()}\n\n---\n`;
@@ -689,16 +952,24 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
 
       cliArgs.push('-p', reviewPrompt);
 
-      const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 20; // 20 min default for reviews
+      const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 20;
       const result = await executeAgy(cliArgs, {
         cwd: args.cwd,
         timeoutMinutes: timeoutMin
       });
 
+      const resData = result.data || {};
+      const conversationId = resData.conversation_id || args.conversation_id || '';
+      const duration = resData.duration_seconds || 0;
+
+      if (resData.usage) {
+        recordUsage('review', effectiveModel, effectiveEffort, conversationId, duration, resData.usage, !result.success, result.error || '');
+      }
+
       if (!result.success) {
         let errText = `Error reviewing with Antigravity:\n${result.error}`;
-        if (result.data && result.data.conversation_id) {
-          errText += `\n\nSession Conversation ID: \`${result.data.conversation_id}\` (you can resume this review thread by passing this ID).`;
+        if (conversationId) {
+          errText += `\n\nSession Conversation ID: \`${conversationId}\` (you can resume this review thread by passing this ID).`;
         }
         return {
           isError: true,
@@ -706,9 +977,7 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
         };
       }
 
-      const resData = result.data || {};
       const responseText = resData.response || result.rawOutput || '';
-      const conversationId = resData.conversation_id || '';
 
       let formatted = `### Antigravity Code Review (Effort: ${effectiveEffort}${effectiveModel ? `, Model: ${effectiveModel}` : ''}, Mode: read-only)\n\n${responseText.trim()}\n\n---\n`;
       if (conversationId) {
@@ -776,7 +1045,7 @@ rl.on('line', async (line) => {
             },
             serverInfo: {
               name: 'antigravity-mcp',
-              version: '1.3.0'
+              version: '1.4.0'
             }
           }
         });
