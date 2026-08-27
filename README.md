@@ -1,6 +1,6 @@
 # Antigravity Claude Code Plugin
 
-![Version](https://img.shields.io/badge/version-1.4.0-blue)
+![Version](https://img.shields.io/badge/version-0.2.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-green)
 ![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
