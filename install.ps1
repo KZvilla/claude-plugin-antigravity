@@ -42,15 +42,25 @@ if ($AgyPath) {
 
 # ── Install / Update ────────────────────────────────────────────────
 if (Test-Path (Join-Path $InstallDir ".git")) {
-    Info "Existing installation detected - updating..."
+    Info "Existing git installation detected - updating..."
     git -C $InstallDir fetch --quiet origin main
+    if ($LASTEXITCODE -ne 0) { Fail "git fetch failed." }
     git -C $InstallDir reset --hard origin/main --quiet
+    if ($LASTEXITCODE -ne 0) { Fail "git reset failed." }
     Ok "Updated to latest version."
+} elseif (Test-Path $InstallDir) {
+    Warn "Existing non-git installation detected at $InstallDir"
+    Info "Removing old installation and re-cloning..."
+    Remove-Item -Recurse -Force $InstallDir
+    git clone --quiet --depth 1 $Repo $InstallDir
+    if ($LASTEXITCODE -ne 0) { Fail "git clone failed." }
+    Ok "Re-installed successfully."
 } else {
     Info "Cloning into $InstallDir..."
     $ParentDir = Split-Path $InstallDir -Parent
     if (-not (Test-Path $ParentDir)) { New-Item -ItemType Directory -Path $ParentDir -Force | Out-Null }
     git clone --quiet --depth 1 $Repo $InstallDir
+    if ($LASTEXITCODE -ne 0) { Fail "git clone failed." }
     Ok "Cloned successfully."
 }
 

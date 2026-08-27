@@ -40,10 +40,16 @@ fi
 
 # ── Install / Update ────────────────────────────────────────────────
 if [ -d "$INSTALL_DIR/.git" ]; then
-  info "Existing installation detected — updating…"
+  info "Existing git installation detected — updating…"
   git -C "$INSTALL_DIR" fetch --quiet origin main
   git -C "$INSTALL_DIR" reset --hard origin/main --quiet
   ok "Updated to latest version."
+elif [ -d "$INSTALL_DIR" ]; then
+  warn "Existing non-git installation detected at $INSTALL_DIR"
+  info "Removing old installation and re-cloning…"
+  rm -rf "$INSTALL_DIR"
+  git clone --quiet --depth 1 "$REPO" "$INSTALL_DIR"
+  ok "Re-installed successfully."
 else
   info "Cloning into ${INSTALL_DIR}…"
   mkdir -p "$(dirname "$INSTALL_DIR")"
