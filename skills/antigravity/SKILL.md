@@ -1,7 +1,7 @@
 ---
 name: antigravity
 description: Use this skill when delegating tasks to Google Antigravity CLI (agy), running Antigravity as an autonomous subagent, requesting architectural planning with Gemini reasoning, performing second-opinion code reviews, configuring ALLOW/DENY permissions, or when the user mentions "ask agy", "run in agy", "delegate to agy", "antigravity plan", or "cross-check with agy".
-version: 1.2.0
+version: 0.2.0
 ---
 
 # Antigravity Subagent Skill
