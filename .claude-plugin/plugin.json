@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "antigravity",
+  "version": "1.0.0",
+  "description": "Collaborate with Google Antigravity CLI (agy) as autonomous subagents and pair-programming partners",
+  "author": {
+    "name": "KZvilla",
+    "email": "krisvilla93@gmail.com"
+  },
+  "homepage": "https://antigravity.google",
+  "keywords": [
+    "antigravity",
+    "agy",
+    "subagent",
+    "gemini",
+    "pair-programming",
+    "code-review",
+    "planning",
+    "tdd"
+  ]
+}

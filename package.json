@@ -1,0 +1,21 @@
+{
+  "name": "claude-plugin-antigravity",
+  "version": "1.0.0",
+  "description": "Claude Code plugin integrating Google Antigravity CLI (agy) as autonomous subagents",
+  "main": "mcp-server/index.js",
+  "scripts": {
+    "test:mcp": "node -e \"require('./mcp-server/index.js')\"",
+    "validate": "claude plugin validate ."
+  },
+  "keywords": [
+    "claude-code",
+    "claude-plugin",
+    "antigravity",
+    "agy",
+    "subagents",
+    "gemini",
+    "mcp"
+  ],
+  "author": "KZvilla <krisvilla93@gmail.com>",
+  "license": "MIT"
+}
