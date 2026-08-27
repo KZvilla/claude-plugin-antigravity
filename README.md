@@ -1,82 +1,154 @@
 # Antigravity Claude Code Plugin
 
+![Version](https://img.shields.io/badge/version-1.4.0-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)
+![Dependencies](https://img.shields.io/badge/dependencies-0-green)
+![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-yellow)
+
 A Claude Code plugin that integrates **Google Antigravity CLI (`agy`)** as an autonomous subagent and pair-programming partner.
 
-With this plugin, Claude Code can delegate deep reasoning, architectural planning, TDD implementation, and adversarial code reviews to Antigravity running directly in your terminal.
+Delegate deep reasoning, architectural planning, TDD implementation, and adversarial code reviews to Antigravity — running directly in your terminal, orchestrated by Claude.
 
 ---
 
-## Features
+## 📑 Table of Contents
 
-- 🤖 **Autonomous Subagent**: Claude can spin up Antigravity (`agy.exe`) to execute complex tasks, multi-step refactors, and test suites.
-- 🧠 **Dual Model Intelligence**: Combines Anthropic's Claude with Google's Gemini models (Gemini 2.5 / 3.7 Pro & Flash) with configurable reasoning effort (`low`, `medium`, `high`).
-- 🛡️ **Granular ALLOW / DENY Permissions**: Define exact capabilities, forbidden file paths (e.g. `.env*`, `*.key`), forbidden commands (e.g. `git push*`, `npm publish*`), and sandbox isolation.
-- ⏱️ **Robust Timeout Handling**: Automatic injection of `--print-timeout` into Antigravity CLI (15m default, 20m for reviews), preventing premature drops during deep reasoning.
-- 📊 **Model & Quota Telemetry**: Live tracking of token usage, deep thinking tokens, context caching savings, and context window saturation via `/agy-usage`.
-- 🔄 **Multi-Turn Continuity**: Sessions capture `conversation_id`, enabling back-and-forth iteration where Antigravity remembers all previous conversation turns and workspace context.
-- ⚙️ **Flexible Configuration**: Set model, effort, and permissions dynamically per prompt, persistently in JSON config files, or via environment variables.
-- ⚡ **Zero External Dependencies**: Lightweight stdio MCP server implemented directly in standard Node.js.
-- 🛠️ **Slash Commands**: Quick terminal commands (`/agy`, `/agy-plan`, `/agy-review`, `/agy-usage`).
-
----
-
-## Components
-
-| Component | Path | Description |
-|-----------|------|-------------|
-| **MCP Server** | `mcp-server/index.js` | Zero-dependency MCP JSON-RPC server exposing `agy_run`, `agy_plan`, `agy_review`, `agy_usage`, `agy_status`, `agy_set_config` |
-| **Subagent** | `agents/antigravity.md` | Autonomous subagent definition for Claude Code (`antigravity:Antigravity`) |
-| **Skill** | `skills/antigravity/SKILL.md` | Context-aware guidelines on when and how to delegate to Antigravity |
-| **Commands** | `commands/agy.md` | Slash command `/agy <prompt>` |
-| | `commands/agy-plan.md` | Slash command `/agy-plan <task>` |
-| | `commands/agy-review.md` | Slash command `/agy-review [target]` |
-| | `commands/agy-usage.md` | Slash command `/agy-usage` |
-| **Installers** | `install.ps1` / `install.sh` | 1-step installation scripts for Windows, Linux, and macOS |
+- [Quick Start](#-quick-start)
+- [Features](#-features)
+- [Prerequisites](#-prerequisites)
+- [Installation](#-installation--setup)
+- [Slash Commands](#-slash-commands)
+- [MCP Tools Reference](#-mcp-tools-reference)
+- [Permissions (ALLOW / DENY)](#-granular-permissions-system-allow--deny)
+- [Model & Effort Configuration](#-model--reasoning-effort-configuration)
+- [Telemetry (`/agy-usage`)](#-telemetry--usage-tracking-agy-usage)
+- [Components](#-components)
 
 ---
 
-## 📊 Telemetry & Usage Tracking (`/agy-usage`)
+## ⚡ Quick Start
 
-Antigravity automatically tracks token consumption, context caching efficiency, and context window saturation across all subagent calls:
+**1. Install** (one command):
 
-Run in terminal:
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.ps1 | iex
+```
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.sh | bash
+```
+
+**2. Reload plugins** in your Claude Code session:
+
+```text
+/reload-plugins
+```
+
+**3. Try it:**
+
+```text
+/agy Analiza este proyecto y describí la arquitectura
+```
+
+```text
+/agy-review
+```
+
 ```text
 /agy-usage
 ```
-*(Or `/agy_usage`)*
 
-To reset the session counters:
-```text
-/agy-usage reset
-```
+---
 
-### Metrics Reported:
-- **Active Model Specs:** Context window capacity (1M for Flash, 2M for Pro), maximum output tokens, and reasoning effort.
-- **Session Cumulative Telemetry:** Total delegated calls, input tokens, output tokens, thinking/reasoning tokens, and context caching savings.
-- **Last Task Breakdown:** Tokens consumed, duration, percentage of context window used (`[████████░░░░] 62.4%`), and conversation ID.
-- **API / Quota Health:** Real-time health indicator (`HEALTHY` vs `RATE_LIMITED / QUOTA EXCEEDED`).
+## 🚀 Features
+
+| | Feature | Description |
+|---|---------|-------------|
+| 🤖 | **Autonomous Subagent** | Claude spins up Antigravity to execute complex tasks, multi-step refactors, and test suites |
+| 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (2.5 / 3.7 Pro & Flash) with configurable reasoning effort |
+| 🛡️ | **Granular Permissions** | ALLOW / DENY capabilities, forbidden paths, forbidden commands, and sandbox isolation |
+| ⏱️ | **Robust Timeouts** | Auto-injects `--print-timeout` (15m default, 20m for reviews) to prevent premature drops |
+| 📊 | **Live Telemetry** | Token usage, thinking tokens, context caching savings, and context window saturation |
+| 🔄 | **Multi-Turn Continuity** | `conversation_id` enables back-and-forth iteration with full workspace memory |
+| ⚙️ | **Flexible Config** | Per-prompt, per-project JSON, or environment variables |
+| ⚡ | **Zero Dependencies** | Lightweight stdio MCP server in pure Node.js |
+
+---
+
+## 📋 Prerequisites
+
+| Requirement | Details |
+|-------------|---------|
+| **Node.js** | ≥ 18 (used to run the MCP server) |
+| **Antigravity CLI** | `agy` or `agy.exe` installed and on your `PATH` ([Install guide](https://github.com/google-gemini/antigravity)) |
+| **Claude Code** | Active Claude Code terminal session |
+| **Google API Key** | Configured for Antigravity (`GEMINI_API_KEY` or `agy auth login`) |
+
+---
+
+## 🛠️ Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/agy <prompt>` | Delegate any task to Antigravity (read + write) |
+| `/agy-plan <task>` | Generate an architectural plan (read-only, no file changes) |
+| `/agy-review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
+| `/agy-usage` | Display token telemetry, context saturation, and quota health |
+
+> **Tip:** You can also ask Claude naturally — *"Delegale a agy que revise los cambios del último commit"* — and it will pick the right tool automatically.
+
+---
+
+## 🔧 MCP Tools Reference
+
+Six tools exposed via the MCP server:
+
+| Tool | Mode | Default Timeout | Description |
+|------|------|-----------------|-------------|
+| `agy_run` | read + write | 15m | Execute a full subagent session with optional permission guardrails |
+| `agy_plan` | read-only | 15m | Step-by-step architectural / implementation plan without modifying files |
+| `agy_review` | read-only | 20m | Adversarial code review on git diffs or specific files |
+| `agy_usage` | — | — | Session token telemetry, context window saturation, model limits, quota health |
+| `agy_status` | — | — | Binary path, CLI version, active model/effort defaults, permission policies |
+| `agy_set_config` | — | — | Persist model, effort, timeout, or permission preferences |
+
+### `agy_run` — Full Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | `string` | *required* | Task instructions for Antigravity |
+| `model` | `string` | `"gemini-3.7-flash"` | Gemini model to use |
+| `effort` | `string` | `"high"` | Reasoning effort: `"low"`, `"medium"`, `"high"` |
+| `mode` | `string` | `"accept-edits"` | `"accept-edits"` (read+write) or `"plan"` (read-only) |
+| `permissions` | `object` | — | Granular ALLOW/DENY policies (see below) |
+| `conversation_id` | `string` | — | Resume a previous conversation |
+| `continue_session` | `boolean` | — | Continue the most recent conversation (`-c`) |
+| `timeout_minutes` | `number` | `10` | Max runtime in minutes |
+| `cwd` | `string` | — | Working directory |
+| `dangerously_skip_permissions` | `boolean` | `true` | Run headlessly without interactive prompts |
 
 ---
 
 ## 🛡️ Granular Permissions System (ALLOW / DENY)
 
-The plugin features a comprehensive permission enforcement layer:
-
 ### Permission Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allow` | `string[]` | `["read", "edit", "commands", "network"]` | Capabilities explicitly allowed. |
-| `deny` | `string[]` | `[]` | Capabilities explicitly blocked. Denying `"edit"` forces strict read-only execution (`--mode plan`). Denying `"commands"` forbids all terminal command execution. |
-| `deny_paths` | `string[]` | `[".env*", "**/*.key", "**/*.pem"]` | Paths Antigravity is strictly forbidden from reading, modifying, or referencing. |
-| `deny_commands` | `string[]` | `["git push*", "git reset --hard*", "npm publish*", "rm -rf /*"]` | Shell command patterns strictly prohibited from being run. |
-| `sandbox` | `boolean` | `false` | Enables Antigravity's native terminal sandbox isolation (`--sandbox`). |
+| `allow` | `string[]` | `["read", "edit", "commands", "network"]` | Capabilities explicitly allowed |
+| `deny` | `string[]` | `[]` | Capabilities blocked. Denying `"edit"` forces `--mode plan` |
+| `deny_paths` | `string[]` | `[".env*", "**/*.key", "**/*.pem"]` | Paths forbidden from access |
+| `deny_commands` | `string[]` | `["git push*", "git reset --hard*", "npm publish*", "rm -rf /*"]` | Shell commands prohibited |
+| `sandbox` | `boolean` | `false` | Enables native terminal sandbox (`--sandbox`) |
 
-### 1. In Per-Call Invocations
-Pass custom permissions for a specific task:
+### Per-Call Example
+
 ```json
 {
-  "prompt": "Investigate the authentication bug in src/server/auth.ts and propose fixes.",
+  "prompt": "Investigate the authentication bug in src/server/auth.ts",
   "permissions": {
     "deny": ["edit"],
     "deny_paths": [".env*", "config/secrets.json"],
@@ -85,8 +157,8 @@ Pass custom permissions for a specific task:
 }
 ```
 
-### 2. Persistent Defaults in Config File
-Set default permissions globally or per-project in `.claude/antigravity.json`:
+### Persistent Defaults (`.claude/antigravity.json`)
+
 ```json
 {
   "model": "gemini-3.7-flash",
@@ -95,29 +167,36 @@ Set default permissions globally or per-project in `.claude/antigravity.json`:
   "permissions": {
     "allow": ["read", "edit", "commands"],
     "deny": [],
-    "deny_paths": [".env*", "**/*.key", "**/*.pem", "production.sqlite"],
+    "deny_paths": [".env*", "**/*.key", "**/*.pem"],
     "deny_commands": ["git push*", "npm publish*", "rm -rf*"],
     "sandbox": false
   }
 }
 ```
 
+> **Scope:** Place in `~/.claude/antigravity.json` for global defaults, or `.claude/antigravity.json` in a project root for per-project overrides.
+
 ---
 
 ## ⚙️ Model & Reasoning Effort Configuration
 
 ### 1. Per Call / Prompt
-Specify model or effort directly in your instruction to Claude:
+
+Ask Claude naturally:
+
 > *"Claude, delegale esta tarea a agy usando el modelo `gemini-2.5-pro` y effort `high`"*
 
-- `model`: e.g. `"gemini-3.7-flash"`, `"gemini-2.5-pro"`
-- `effort`: `"low"`, `"medium"`, or `"high"`
+| Parameter | Values |
+|-----------|--------|
+| `model` | `"gemini-3.7-flash"`, `"gemini-2.5-pro"` |
+| `effort` | `"low"`, `"medium"`, `"high"` |
 
 ### 2. Persistent Defaults via Tool
-Ask Claude:
+
 > *"Configurá agy por defecto con modelo gemini-3.7-flash y effort high"*
 
 ### 3. Environment Variables
+
 ```bash
 # Windows PowerShell
 $env:AGY_MODEL = "gemini-3.7-flash"
@@ -132,31 +211,49 @@ export AGY_TIMEOUT_MINUTES="20"
 
 ---
 
-## MCP Tools Reference
+## 📊 Telemetry & Usage Tracking (`/agy-usage`)
 
-### `agy_run`
-Executes an Antigravity subagent session with optional permission guardrails and configurable timeouts.
+Antigravity automatically tracks token consumption, context caching efficiency, and context window saturation across all subagent calls.
 
-### `agy_plan`
-Generates a step-by-step architectural and implementation plan without modifying files (guaranteed read-only mode).
+```text
+/agy-usage
+```
 
-### `agy_review`
-Performs an adversarial code review on git diffs or specific files (guaranteed read-only mode, 20m default timeout).
+To reset session counters:
 
-### `agy_usage`
-Displays session token telemetry (input, output, thinking, cache read), context window saturation, active model limits, and quota health status. Supports `reset: true` to clear counters.
+```text
+/agy-usage reset
+```
 
-### `agy_status`
-Checks binary path, CLI version, active model/effort defaults, active ALLOW/DENY permission policies, and active configuration file.
+### Metrics Reported
 
-### `agy_set_config`
-Saves default model, effort, timeout, or permission preferences persistently.
+| Category | Details |
+|----------|---------|
+| **Model Specs** | Context window (1M Flash / 2M Pro), max output tokens, reasoning effort |
+| **Session Totals** | Delegated calls, input/output/thinking tokens, cache reuse, total duration |
+| **Last Invocation** | Tokens consumed, context saturation bar (`[████████░░░░] 62.4%`), conversation ID |
+| **Quota Health** | `HEALTHY` · `RATE_LIMITED` · `QUOTA_EXCEEDED` |
 
 ---
 
-## Installation & Setup
+## 📦 Components
 
-### Automated (1-Command Install)
+| Component | Path | Description |
+|-----------|------|-------------|
+| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (6 tools) |
+| **Subagent** | `agents/antigravity.md` | Autonomous subagent definition (`antigravity:Antigravity`) |
+| **Skill** | `skills/antigravity/SKILL.md` | Context-aware delegation guidelines |
+| **Commands** | `commands/agy.md` | `/agy <prompt>` |
+| | `commands/agy-plan.md` | `/agy-plan <task>` |
+| | `commands/agy-review.md` | `/agy-review [target]` |
+| | `commands/agy-usage.md` | `/agy-usage` |
+| **Installers** | `install.ps1` / `install.sh` | 1-command install for all platforms |
+
+---
+
+## 🔧 Installation & Setup
+
+### Automated (1-Command)
 
 **Windows (PowerShell):**
 ```powershell
@@ -170,17 +267,22 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 
 ### Manual Install
 
-Clone or copy this repository into `~/.claude/skills/antigravity`:
 ```bash
 git clone https://github.com/KZvilla/claude-plugin-antigravity.git "$HOME/.claude/skills/antigravity"
 ```
 
-To reload plugins in an active Claude Code session:
-```bash
-/reload-plugins
-```
+### Post-Install
 
-To verify the installation:
 ```bash
+# Reload in an active Claude Code session
+/reload-plugins
+
+# Verify installation
 claude plugin details antigravity@skills-dir
 ```
+
+---
+
+## 📄 License
+
+MIT
