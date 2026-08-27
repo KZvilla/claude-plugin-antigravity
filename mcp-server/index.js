@@ -4,7 +4,7 @@
  * Antigravity MCP Server for Claude Code
  * Bridges Claude Code / Claude CLI to the Antigravity CLI (`agy.exe`).
  * Implements MCP stdio JSON-RPC 2.0 protocol with zero external dependencies.
- * Includes granular ALLOW / DENY permission management.
+ * Includes granular ALLOW / DENY permission management and robust timeout handling.
  */
 
 const { spawn, execSync } = require('node:child_process');
@@ -45,6 +45,7 @@ function loadConfig(cwd = process.cwd()) {
   const config = {
     defaultModel: process.env.AGY_MODEL || null,
     defaultEffort: process.env.AGY_EFFORT || 'high',
+    defaultTimeoutMinutes: parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     permissions: {
       allow: ['read', 'edit', 'commands', 'network'],
       deny: [],
@@ -64,6 +65,7 @@ function loadConfig(cwd = process.cwd()) {
       const parsed = JSON.parse(fs.readFileSync(globalPath, 'utf8'));
       if (parsed.model) config.defaultModel = parsed.model;
       if (parsed.effort) config.defaultEffort = parsed.effort;
+      if (parsed.timeout_minutes) config.defaultTimeoutMinutes = parsed.timeout_minutes;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -76,6 +78,7 @@ function loadConfig(cwd = process.cwd()) {
       const parsed = JSON.parse(fs.readFileSync(projectPath, 'utf8'));
       if (parsed.model) config.defaultModel = parsed.model;
       if (parsed.effort) config.defaultEffort = parsed.effort;
+      if (parsed.timeout_minutes) config.defaultTimeoutMinutes = parsed.timeout_minutes;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -104,6 +107,7 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
 
   if (updates.model !== undefined) existing.model = updates.model;
   if (updates.effort !== undefined) existing.effort = updates.effort;
+  if (updates.timeout_minutes !== undefined) existing.timeout_minutes = updates.timeout_minutes;
   if (updates.permissions !== undefined) {
     existing.permissions = {
       ...(existing.permissions || {}),
@@ -119,7 +123,7 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
 const TOOLS = [
   {
     name: 'agy_run',
-    description: 'Execute Antigravity CLI (agy) as an autonomous subagent with optional granular ALLOW / DENY permission policies. Antigravity can edit files, run shell commands, perform deep reasoning, and access workspace tools. Returns structured response with conversation_id.',
+    description: 'Execute Antigravity CLI (agy) as an autonomous subagent with optional granular ALLOW / DENY permission policies and configurable timeouts. Antigravity can edit files, run shell commands, perform deep reasoning, and access workspace tools. Returns structured response with conversation_id.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -185,7 +189,7 @@ const TOOLS = [
         },
         timeout_minutes: {
           type: 'number',
-          description: 'Timeout in minutes before canceling execution. Defaults to 10.'
+          description: 'Timeout in minutes before canceling execution. Defaults to 15 (configured in ~/.claude/antigravity.json).'
         },
         dangerously_skip_permissions: {
           type: 'boolean',
@@ -213,6 +217,10 @@ const TOOLS = [
           type: 'string',
           enum: ['low', 'medium', 'high'],
           description: 'Reasoning effort level. Defaults to "high".'
+        },
+        timeout_minutes: {
+          type: 'number',
+          description: 'Timeout in minutes. Defaults to 15.'
         },
         cwd: {
           type: 'string',
@@ -245,6 +253,14 @@ const TOOLS = [
           enum: ['low', 'medium', 'high'],
           description: 'Reasoning effort level. Defaults to "high".'
         },
+        conversation_id: {
+          type: 'string',
+          description: 'Previous conversation ID to resume/continue an ongoing review thread.'
+        },
+        timeout_minutes: {
+          type: 'number',
+          description: 'Timeout in minutes. Defaults to 15 (can be increased for large repositories/diffs).'
+        },
         cwd: {
           type: 'string',
           description: 'Working directory.'
@@ -255,7 +271,7 @@ const TOOLS = [
   },
   {
     name: 'agy_status',
-    description: 'Check the status, version, active model/effort defaults, ALLOW/DENY permission policies, and binary path of Antigravity CLI.',
+    description: 'Check the status, version, active model/effort/timeout defaults, ALLOW/DENY permission policies, and binary path of Antigravity CLI.',
     inputSchema: {
       type: 'object',
       properties: {}
@@ -263,7 +279,7 @@ const TOOLS = [
   },
   {
     name: 'agy_set_config',
-    description: 'Set default model, reasoning effort, or ALLOW/DENY permission policies for Antigravity subagent sessions (persisted in .claude/antigravity.json).',
+    description: 'Set default model, reasoning effort, default timeout, or ALLOW/DENY permission policies for Antigravity subagent sessions (persisted in .claude/antigravity.json).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -275,6 +291,10 @@ const TOOLS = [
           type: 'string',
           enum: ['low', 'medium', 'high'],
           description: 'Default reasoning effort level.'
+        },
+        timeout_minutes: {
+          type: 'number',
+          description: 'Default timeout in minutes for Antigravity CLI sessions (default: 15).'
         },
         permissions: {
           type: 'object',
@@ -318,17 +338,24 @@ const TOOLS = [
 
 // Helper: Run agy process
 function executeAgy(args, options = {}) {
-  const timeoutMs = (options.timeoutMinutes || 10) * 60 * 1000;
+  const timeoutMinutes = options.timeoutMinutes || 15;
+  const timeoutMs = (timeoutMinutes + 1) * 60 * 1000; // 1-minute buffer after agy's internal timeout
   const cwd = options.cwd || process.cwd();
+
+  // Inject --print-timeout into args if not already present
+  const finalArgs = [...args];
+  if (!finalArgs.includes('--print-timeout')) {
+    finalArgs.unshift('--print-timeout', `${timeoutMinutes}m`);
+  }
 
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
     let killed = false;
 
-    process.stderr.write(`[antigravity-mcp] Spawning: ${AGY_BIN} ${args.map(a => (a.includes(' ') ? `"${a}"` : a)).join(' ')} (cwd: ${cwd})\n`);
+    process.stderr.write(`[antigravity-mcp] Spawning: ${AGY_BIN} ${finalArgs.map(a => (a.includes(' ') ? `"${a}"` : a)).join(' ')} (cwd: ${cwd}, timeout: ${timeoutMinutes}m)\n`);
 
-    const child = spawn(AGY_BIN, args, {
+    const child = spawn(AGY_BIN, finalArgs, {
       cwd,
       shell: false,
       env: { ...process.env }
@@ -339,7 +366,7 @@ function executeAgy(args, options = {}) {
       child.kill('SIGTERM');
       resolve({
         success: false,
-        error: `Antigravity CLI timed out after ${options.timeoutMinutes || 10} minutes`,
+        error: `Antigravity MCP process watchdog timed out after ${timeoutMinutes} minutes`,
         stdout,
         stderr
       });
@@ -368,25 +395,35 @@ function executeAgy(args, options = {}) {
       clearTimeout(timer);
       if (killed) return;
 
-      if (code === 0) {
-        try {
-          const parsed = JSON.parse(stdout.trim());
-          resolve({
-            success: true,
-            data: parsed,
-            rawOutput: stdout
-          });
-        } catch {
-          resolve({
-            success: true,
-            data: { response: stdout },
-            rawOutput: stdout
-          });
-        }
+      let parsed = null;
+      try {
+        parsed = JSON.parse(stdout.trim());
+      } catch {}
+
+      if (code === 0 && (!parsed || parsed.status !== 'ERROR')) {
+        resolve({
+          success: true,
+          data: parsed || { response: stdout },
+          rawOutput: stdout
+        });
       } else {
+        // Structured error response handling
+        let errorMsg = `Antigravity CLI exited with code ${code}.`;
+        if (parsed && parsed.error) {
+          errorMsg = `Antigravity error: "${parsed.error}"${parsed.duration_seconds ? ` after ${parsed.duration_seconds.toFixed(1)}s` : ''}.`;
+          if (parsed.error.includes('timeout')) {
+            errorMsg += `\n\nSuggestion: The task timed out (${timeoutMinutes}m limit). You can retry by increasing 'timeout_minutes' (e.g. 25) or by passing conversation_id: "${parsed.conversation_id}" to continue from where it stopped.`;
+          }
+        } else if (stderr.trim()) {
+          errorMsg += ` Stderr: ${stderr.trim()}`;
+        } else if (stdout.trim()) {
+          errorMsg += ` Output: ${stdout.trim()}`;
+        }
+
         resolve({
           success: false,
-          error: `Antigravity CLI exited with code ${code}. Stderr: ${stderr.trim() || 'none'}. Stdout: ${stdout.trim() || 'none'}`,
+          data: parsed,
+          error: errorMsg,
           stdout,
           stderr
         });
@@ -415,7 +452,7 @@ async function handleToolCall(name, args) {
         content: [
           {
             type: 'text',
-            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default)'}\n- Default Effort: ${config.defaultEffort || 'high'}\n- Permissions Policy:\n  * Allow: [${p.allow.join(', ')}]\n  * Deny: [${p.deny.join(', ') || 'none'}]\n  * Denied Paths: [${p.deny_paths.join(', ')}]\n  * Denied Commands: [${p.deny_commands.join(', ')}]\n  * Sandbox Mode: ${p.sandbox ? 'enabled' : 'disabled'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
+            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default)'}\n- Default Effort: ${config.defaultEffort || 'high'}\n- Default Timeout: ${config.defaultTimeoutMinutes}m\n- Permissions Policy:\n  * Allow: [${p.allow.join(', ')}]\n  * Deny: [${p.deny.join(', ') || 'none'}]\n  * Denied Paths: [${p.deny_paths.join(', ')}]\n  * Denied Commands: [${p.deny_commands.join(', ')}]\n  * Sandbox Mode: ${p.sandbox ? 'enabled' : 'disabled'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
           }
         ]
       };
@@ -426,6 +463,7 @@ async function handleToolCall(name, args) {
       const updates = {};
       if (args.model !== undefined) updates.model = args.model;
       if (args.effort !== undefined) updates.effort = args.effort;
+      if (args.timeout_minutes !== undefined) updates.timeout_minutes = args.timeout_minutes;
       if (args.permissions !== undefined) updates.permissions = args.permissions;
 
       const result = saveConfig(updates, scope, args.cwd);
@@ -433,14 +471,14 @@ async function handleToolCall(name, args) {
         content: [
           {
             type: 'text',
-            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || 'high'}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
+            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || 'high'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
           }
         ]
       };
     }
 
     case 'agy_run': {
-      // Merge effective permissions (per-call override merged over config defaults)
+      // Merge effective permissions
       const callPerms = args.permissions || {};
       const basePerms = config.permissions;
       const effectivePerms = {
@@ -451,14 +489,12 @@ async function handleToolCall(name, args) {
         sandbox: callPerms.sandbox !== undefined ? callPerms.sandbox : (basePerms.sandbox || false)
       };
 
-      // Check if 'edit' is denied
       const canEdit = !effectivePerms.deny.includes('edit') && effectivePerms.allow.includes('edit');
       const canRunCommands = !effectivePerms.deny.includes('commands') && effectivePerms.allow.includes('commands');
 
-      // Determine CLI mode
       let effectiveMode = args.mode || (canEdit ? 'accept-edits' : 'plan');
       if (!canEdit && effectiveMode === 'accept-edits') {
-        effectiveMode = 'plan'; // Hard clamp to plan mode if edit is denied
+        effectiveMode = 'plan';
       }
 
       const cliArgs = ['--output-format', 'json'];
@@ -487,7 +523,7 @@ async function handleToolCall(name, args) {
         cliArgs.push('-c');
       }
 
-      // Construct Guardrail Preamble if permissions or deny rules apply
+      // Security guardrails injection
       let finalPrompt = args.prompt;
       const securityRules = [];
 
@@ -515,20 +551,20 @@ ${args.prompt}`;
 
       cliArgs.push('-p', finalPrompt);
 
+      const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
       const result = await executeAgy(cliArgs, {
         cwd: args.cwd,
-        timeoutMinutes: args.timeout_minutes || 10
+        timeoutMinutes: timeoutMin
       });
 
       if (!result.success) {
+        let errText = `Error executing Antigravity subagent:\n${result.error}`;
+        if (result.data && result.data.conversation_id) {
+          errText += `\n\nSession Conversation ID: \`${result.data.conversation_id}\``;
+        }
         return {
           isError: true,
-          content: [
-            {
-              type: 'text',
-              text: `Error executing Antigravity subagent:\n${result.error}`
-            }
-          ]
+          content: [{ type: 'text', text: errText }]
         };
       }
 
@@ -547,7 +583,7 @@ ${args.prompt}`;
       if (conversationId) {
         formatted += `- Conversation ID: \`${conversationId}\` (pass as \`conversation_id\` to continue this thread)\n`;
       }
-      formatted += `- Duration: ${duration}\n`;
+      formatted += `- Duration: ${duration} (timeout limit: ${timeoutMin}m)\n`;
       if (tokens) {
         formatted += `- Tokens: ${tokens}\n`;
       }
@@ -586,15 +622,20 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
 
       cliArgs.push('-p', planPrompt);
 
+      const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
       const result = await executeAgy(cliArgs, {
         cwd: args.cwd,
-        timeoutMinutes: 10
+        timeoutMinutes: timeoutMin
       });
 
       if (!result.success) {
+        let errText = `Error generating plan with Antigravity:\n${result.error}`;
+        if (result.data && result.data.conversation_id) {
+          errText += `\n\nSession Conversation ID: \`${result.data.conversation_id}\``;
+        }
         return {
           isError: true,
-          content: [{ type: 'text', text: `Error generating plan with Antigravity:\n${result.error}` }]
+          content: [{ type: 'text', text: errText }]
         };
       }
 
@@ -605,7 +646,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
       let formatted = `### Antigravity Implementation Plan\n\n${responseText.trim()}\n\n---\n`;
       formatted += `Effort: \`${effectiveEffort}\``;
       if (effectiveModel) formatted += ` | Model: \`${effectiveModel}\``;
-      formatted += ` | Mode: \`plan\` (read-only enforced)`;
+      formatted += ` | Mode: \`plan\` (read-only enforced) | Timeout: \`${timeoutMin}m\``;
       if (conversationId) {
         formatted += `\nConversation ID: \`${conversationId}\` (use \`agy_run\` with this ID to begin execution)`;
       }
@@ -621,12 +662,12 @@ Target to review:
 ${args.review_target}
 
 ${args.guidelines ? `Guidelines and Rules to verify:\n${args.guidelines}\n` : ''}
-Review the code changes or files with high rigor. Focus on:
+Review the code changes or files with high rigor and precision. Focus on high-impact findings:
 1. Architectural integrity, contracts, and regressions
 2. Security & privacy issues
 3. Performance and edge cases
 4. Accessibility (WCAG) and error handling
-Provide specific findings with file paths, line numbers, issue descriptions, and concrete recommendations.`;
+Provide specific findings with file paths, line numbers, issue descriptions, and concrete recommendations. Prioritize actionable findings over exhaustive repetition.`;
 
       const effectiveEffort = args.effort || config.defaultEffort || 'high';
       const effectiveModel = args.model || config.defaultModel;
@@ -642,25 +683,40 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
         cliArgs.push('--model', effectiveModel);
       }
 
+      if (args.conversation_id) {
+        cliArgs.push('--conversation', args.conversation_id);
+      }
+
       cliArgs.push('-p', reviewPrompt);
 
+      const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 20; // 20 min default for reviews
       const result = await executeAgy(cliArgs, {
         cwd: args.cwd,
-        timeoutMinutes: 10
+        timeoutMinutes: timeoutMin
       });
 
       if (!result.success) {
+        let errText = `Error reviewing with Antigravity:\n${result.error}`;
+        if (result.data && result.data.conversation_id) {
+          errText += `\n\nSession Conversation ID: \`${result.data.conversation_id}\` (you can resume this review thread by passing this ID).`;
+        }
         return {
           isError: true,
-          content: [{ type: 'text', text: `Error reviewing with Antigravity:\n${result.error}` }]
+          content: [{ type: 'text', text: errText }]
         };
       }
 
       const resData = result.data || {};
       const responseText = resData.response || result.rawOutput || '';
+      const conversationId = resData.conversation_id || '';
+
+      let formatted = `### Antigravity Code Review (Effort: ${effectiveEffort}${effectiveModel ? `, Model: ${effectiveModel}` : ''}, Mode: read-only)\n\n${responseText.trim()}\n\n---\n`;
+      if (conversationId) {
+        formatted += `Conversation ID: \`${conversationId}\` (pass as \`conversation_id\` to follow up on this review)`;
+      }
 
       return {
-        content: [{ type: 'text', text: `### Antigravity Code Review (Effort: ${effectiveEffort}${effectiveModel ? `, Model: ${effectiveModel}` : ''}, Mode: read-only)\n\n${responseText.trim()}` }]
+        content: [{ type: 'text', text: formatted }]
       };
     }
 
@@ -720,7 +776,7 @@ rl.on('line', async (line) => {
             },
             serverInfo: {
               name: 'antigravity-mcp',
-              version: '1.2.0'
+              version: '1.3.0'
             }
           }
         });
