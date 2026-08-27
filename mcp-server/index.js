@@ -133,7 +133,7 @@ function loadUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -229,7 +229,7 @@ function resetUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -441,6 +441,50 @@ const TOOLS = [
     }
   },
   {
+    name: 'agy_audit',
+    description: 'Run a skeptical, evidence-based adversarial audit via Antigravity. Two modes: (1) "implementation" — verify an implementation against a plan/spec/ticket, (2) "plan" — verify a proposed plan against the real codebase. Uses structured severity rubric (BLOCKER/MAJOR/MINOR/NOTE) and deterministic verdicts (FAIL/PASS WITH RESERVATIONS/PASS). Much more rigorous and heavyweight than agy_review. Default timeout: 25 minutes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          description: 'What to audit: git diff, file paths, branch name, PR description, or a plan/RFC text to check against the codebase.'
+        },
+        audit_mode: {
+          type: 'string',
+          enum: ['implementation', 'plan'],
+          description: 'Audit mode: "implementation" = verify code against a plan/spec (Mode 1), "plan" = verify a proposed plan against the real project (Mode 2). Defaults to "implementation".'
+        },
+        plan: {
+          type: 'string',
+          description: 'The plan, spec, ticket, or acceptance criteria text to audit against. Required for "implementation" mode. In "plan" mode, the target itself is the plan being audited.'
+        },
+        model: {
+          type: 'string',
+          description: 'Model override (e.g. "gemini-2.5-pro" recommended for deep audits).'
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'Reasoning effort level. Defaults to "high".'
+        },
+        conversation_id: {
+          type: 'string',
+          description: 'Previous conversation ID to resume/continue an ongoing audit thread.'
+        },
+        timeout_minutes: {
+          type: 'number',
+          description: 'Timeout in minutes. Defaults to 25 (adversarial audits are deep and heavyweight).'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Working directory.'
+        }
+      },
+      required: ['target']
+    }
+  },
+  {
     name: 'agy_usage',
     description: 'Display model metrics, context window capacity, token consumption (input, output, thinking, cache read), and quota health for Antigravity subagent sessions.',
     inputSchema: {
@@ -524,6 +568,126 @@ const TOOLS = [
     }
   }
 ];
+
+// Adversarial Review System Prompt — embedded from skills/adversarial-review/SKILL.md
+const ADVERSARIAL_REVIEW_PROMPT = `You are an Adversarial Review Auditor. Your stance is skeptical: the work has not earned approval until its claims are supported by concrete evidence from the relevant source of truth.
+
+## Modes
+
+There are two modes. Use the one specified by the caller.
+
+- **Mode 1 — Implementation vs. Plan**: you are given a plan/ticket/spec and an agent's output (diff, PR, commit, or already-written code). The question is: does the implementation satisfy what the plan required, no more and no less?
+- **Mode 2 — Plan vs. Real Project**: you are given a proposed plan or design that has not yet been implemented. The question is: does the plan fit the flows, business rules, data model, tests, and conventions that already exist in the project, or is it reinventing something, contradicting a domain invariant, bypassing an established flow, or solving a larger problem than the project actually has?
+
+## Principles
+
+- Auditor stance, not collaborator stance. Verify pass/fail and document why. Do not dilute findings with praise sandwiches.
+- Approval must be earned. Start from: "This has not yet demonstrated that it should be approved."
+- Never accept "this looks reasonable" without checking the source of truth.
+- Every finding cites concrete evidence: file:line, diff hunk, plan requirement, test name, schema object, migration, existing module, or repository symbol.
+- A criticism without evidence is not a finding. Remove it, or classify it as a limited NOTE when the uncertainty itself matters.
+- Be concise. Go directly to the findings. If something passes, say so briefly and move on.
+- Distinguish violations from preferences. "Does not implement R3" is a finding. "I would have designed it differently" is not, unless it conflicts with an actual project convention or creates a concrete risk.
+- Do not invent problems. A short, evidence-based PASS is valid.
+- Do not infer runtime success from code shape alone. Separate static inspection from executed validation.
+- Do not confuse missing evidence with a confirmed defect. Use "Not verifiable" when the available material cannot prove the claim.
+
+## Severity Rubric
+
+### BLOCKER
+A defect that should prevent approval or merge because it: fails a mandatory requirement; introduces a security vulnerability, authorization bypass, data loss, corruption, or irreversible state; breaks a domain invariant or critical existing flow; makes the change undeployable or causes a critical runtime failure; requires a fundamental redesign.
+
+### MAJOR
+A material problem that normally prevents approval because it: implements important behavior incorrectly or incompletely; omits significant validation, error handling, migration behavior, or required test coverage; introduces an unjustified deviation from the plan or established architecture; duplicates or bypasses important existing business logic; creates substantial operational, maintenance, compatibility, or reliability risk.
+
+### MINOR
+A real but limited issue that: affects a secondary edge case or non-critical path; creates a small maintainability, consistency, or test-quality problem; can be corrected locally without changing the design; does not invalidate the primary requirements.
+
+### NOTE
+Use for: plan ambiguities; assumptions that materially affect the review; missing context or evidence; risks worth confirming but not proven defects; requirements that pass narrowly or rely on an undocumented constraint.
+
+## Verdict Rules
+
+- **FAIL**: one or more BLOCKER findings; or one or more in-scope MAJOR findings that materially affect correctness, safety, required behavior, compatibility, or project fit; or a critical requirement is "Not met".
+- **PASS WITH RESERVATIONS**: no BLOCKER findings; no unresolved in-scope MAJOR finding that invalidates the work; one or more MINOR findings, material NOTES, plan ambiguities, or important "Not verifiable" requirements remain; or validation is materially incomplete.
+- **PASS**: no BLOCKER, MAJOR, or MINOR findings; no material unresolved NOTE; all in-scope requirements are "Met"; critical behavior is supported by sufficient evidence.
+
+## Process — Mode 1: Implementation vs. Plan
+
+1. Rebuild the plan as an atomic checklist (R1, R2, ...).
+2. Establish review scope and note unavailable material.
+3. Map every requirement to the actual implementation.
+4. Classify every requirement: Met / Partial / Not met / Not verifiable.
+5. Look for unannounced deviations.
+6. Check project fit (auth, validation, transactions, logging, error-handling flows).
+7. Inspect tests by requirement.
+8. Execute feasible validation (tests, type checks, linters, builds).
+9. Check required edge cases (permissions, invalid input, missing state, duplicates, retries, partial failures, concurrency, rollback, compatibility, migration safety).
+10. Assign severity and verdict using the rubric.
+
+## Process — Mode 2: Plan vs. Real Project
+
+1. Do not judge the plan before investigating the repository. Search actively for similar or equivalent flows.
+2. Reconstruct the existing system behavior: entry points, data flow, state transitions, ownership boundaries, side effects, failure handling.
+3. Contrast each material plan element with repository evidence. Cite concrete files, lines, symbols, tests.
+4. Look for concrete contradictions: reimplementation, domain invariant violations, flow bypasses, schema conflicts, unsafe migrations, naming/layering conflicts.
+5. Check whether the plan addresses the real integration points.
+6. Evaluate testability and validation.
+7. Explicitly evaluate over-engineering: treat disproportionate complexity as a finding. Cite the simpler existing mechanism.
+8. Assign severity and verdict.
+
+## Over-engineering signals (Mode 2)
+
+- Abstractions built for one use case without evidence of a second consumer.
+- Unrequested generality solving a broader class of problems than the project has.
+- New dependencies/frameworks when the project already has an established mechanism.
+- Solution size disproportionate to the requirement.
+- Configurability nobody requested. Plugin systems or rule engines for a small fixed set of cases.
+- Premature extraction. Parallel data models or duplicate sources of truth.
+
+## Output Format
+
+\`\`\`md
+## Verdict: PASS | FAIL | PASS WITH RESERVATIONS
+
+[One or two sentences giving the direct overall conclusion and the most important reason.]
+
+## Findings
+
+### BLOCKER
+- [Rn / file:line / existing rule] — description, evidence, why it is a blocker
+
+### MAJOR
+- ...
+
+### MINOR
+- ...
+
+### NOTE
+- ...
+
+## Plan coverage
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| R1 | Met / Partial / Not met / Not verifiable | file:line, test, command result, or missing evidence |
+
+## Validation
+- Inspected: [...]
+- Executed — passed: \\\`command\\\`
+- Executed — failed: \\\`command\\\` — relevant failure
+- Not executable: reason
+
+## Over-engineering
+- [plan element / file:line / existing mechanism] — why the complexity is unsupported
+\`\`\`
+
+Section rules: Mode 1 includes Plan coverage. Mode 2 includes Over-engineering. Include Validation when relevant. Omit empty severity subsections. If no findings, write "No evidence-based findings." Do not add praise, filler, or unrelated recommendations.
+
+## Style
+
+Direct, skeptical, and factual. Be hostile toward unsupported claims and defects, not toward the person. Every finding must cite concrete evidence. Do not use praise sandwiches.
+`;
 
 // Helper: Run agy process
 function executeAgy(args, options = {}) {
@@ -654,7 +818,7 @@ async function handleToolCall(name, args) {
       out += `- Quota / API Health: **${usageData.quota_status}**\n\n`;
 
       out += `**📈 Cumulative Session Usage:**\n`;
-      out += `- Total Delegated Calls: **${s.total_calls}** (run: ${s.calls_by_tool.run || 0}, plan: ${s.calls_by_tool.plan || 0}, review: ${s.calls_by_tool.review || 0})\n`;
+      out += `- Total Delegated Calls: **${s.total_calls}** (run: ${s.calls_by_tool.run || 0}, plan: ${s.calls_by_tool.plan || 0}, review: ${s.calls_by_tool.review || 0}, audit: ${s.calls_by_tool.audit || 0})\n`;
       out += `- Input Tokens: \`${formatTokens(s.input_tokens)}\`\n`;
       out += `- Output Tokens: \`${formatTokens(s.output_tokens)}\`\n`;
       out += `- Thinking / Reasoning Tokens: \`${formatTokens(s.thinking_tokens)}\`\n`;
@@ -919,6 +1083,85 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
       };
     }
 
+    case 'agy_audit': {
+      const auditMode = args.audit_mode || 'implementation';
+      const modeLabel = auditMode === 'plan' ? 'Mode 2 — Plan vs. Real Project' : 'Mode 1 — Implementation vs. Plan';
+
+      let auditPrompt = `${ADVERSARIAL_REVIEW_PROMPT}\n\n---\n\n[AUDIT TASK]\n\nYou are operating in **${modeLabel}**.\n\n`;
+
+      if (auditMode === 'implementation') {
+        if (args.plan) {
+          auditPrompt += `## Plan / Spec / Acceptance Criteria\n\n${args.plan}\n\n`;
+        } else {
+          auditPrompt += `## Plan / Spec\n\n(No explicit plan provided. Infer requirements from the code changes, commit messages, and any available documentation. Flag this as a review limitation.)\n\n`;
+        }
+        auditPrompt += `## Implementation to Audit\n\n${args.target}\n\n`;
+        auditPrompt += `Perform the full Mode 1 process: rebuild the plan as an atomic checklist, map each requirement to the implementation, classify coverage, look for deviations, check project fit, inspect and execute tests, then assign severity and verdict.\n`;
+      } else {
+        auditPrompt += `## Proposed Plan / Design to Audit Against the Real Codebase\n\n${args.target}\n\n`;
+        auditPrompt += `Perform the full Mode 2 process: investigate the repository FIRST before judging. Search for existing flows, reconstruct current behavior, contrast with the plan, check for contradictions, evaluate integration points, evaluate testability, explicitly check for over-engineering, then assign severity and verdict.\n`;
+      }
+
+      const effectiveEffort = args.effort || config.defaultEffort || 'high';
+      const effectiveModel = args.model || config.defaultModel;
+
+      const cliArgs = [
+        '--output-format', 'json',
+        '--dangerously-skip-permissions',
+        '--mode', 'plan',
+        '--effort', effectiveEffort
+      ];
+
+      if (effectiveModel) {
+        cliArgs.push('--model', effectiveModel);
+      }
+
+      if (args.conversation_id) {
+        cliArgs.push('--conversation', args.conversation_id);
+      }
+
+      cliArgs.push('-p', auditPrompt);
+
+      const timeoutMin = args.timeout_minutes || 25;
+      const result = await executeAgy(cliArgs, {
+        cwd: args.cwd,
+        timeoutMinutes: timeoutMin
+      });
+
+      const resData = result.data || {};
+      const conversationId = resData.conversation_id || args.conversation_id || '';
+      const duration = resData.duration_seconds || 0;
+
+      if (resData.usage) {
+        recordUsage('audit', effectiveModel, effectiveEffort, conversationId, duration, resData.usage, !result.success, result.error || '');
+      }
+
+      if (!result.success) {
+        let errText = `Error running adversarial audit with Antigravity:\n${result.error}`;
+        if (conversationId) {
+          errText += `\n\nSession Conversation ID: \`${conversationId}\` (you can resume this audit thread by passing this ID).`;
+        }
+        return {
+          isError: true,
+          content: [{ type: 'text', text: errText }]
+        };
+      }
+
+      const responseText = resData.response || result.rawOutput || '';
+
+      let formatted = `### 🔍 Antigravity Adversarial Audit (${modeLabel})\n\n${responseText.trim()}\n\n---\n`;
+      formatted += `Effort: \`${effectiveEffort}\``;
+      if (effectiveModel) formatted += ` | Model: \`${effectiveModel}\``;
+      formatted += ` | Mode: \`read-only\` | Timeout: \`${timeoutMin}m\``;
+      if (conversationId) {
+        formatted += `\nConversation ID: \`${conversationId}\` (pass as \`conversation_id\` to follow up on this audit)`;
+      }
+
+      return {
+        content: [{ type: 'text', text: formatted }]
+      };
+    }
+
     case 'agy_review': {
       const reviewPrompt = `You are acting as an Adversarial Code Review Subagent.
 Target to review:
@@ -1045,7 +1288,7 @@ rl.on('line', async (line) => {
             },
             serverInfo: {
               name: 'antigravity-mcp',
-              version: '1.4.0'
+              version: '1.5.0'
             }
           }
         });
