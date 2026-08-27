@@ -146,19 +146,19 @@ Saves default model, effort, or permission preferences persistently.
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/<tu-usuario>/claude-plugin-antigravity/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.ps1 | iex
 ```
 
 **Linux / macOS (Bash):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<tu-usuario>/claude-plugin-antigravity/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.sh | bash
 ```
 
 ### Manual Install
 
 Clone or copy this repository into `~/.claude/skills/antigravity`:
 ```bash
-git clone https://github.com/<tu-usuario>/claude-plugin-antigravity.git "$HOME/.claude/skills/antigravity"
+git clone https://github.com/KZvilla/claude-plugin-antigravity.git "$HOME/.claude/skills/antigravity"
 ```
 
 To reload plugins in an active Claude Code session:
