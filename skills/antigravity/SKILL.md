@@ -1,7 +1,7 @@
 ---
 name: antigravity
-description: Use this skill when delegating tasks to Google Antigravity CLI (agy), running Antigravity as an autonomous subagent, requesting architectural planning with Gemini reasoning, performing second-opinion code reviews, or when the user mentions "ask agy", "run in agy", "delegate to agy", "antigravity plan", or "cross-check with agy".
-version: 1.0.0
+description: Use this skill when delegating tasks to Google Antigravity CLI (agy), running Antigravity as an autonomous subagent, requesting architectural planning with Gemini reasoning, performing second-opinion code reviews, configuring ALLOW/DENY permissions, or when the user mentions "ask agy", "run in agy", "delegate to agy", "antigravity plan", or "cross-check with agy".
+version: 1.2.0
 ---
 
 # Antigravity Subagent Skill
@@ -32,10 +32,25 @@ Run an autonomous Antigravity session.
 ```json
 {
   "prompt": "Implement the missing test cases in src/lib/__tests__/date-contract.test.ts. Run 'npm test' to verify and fix any failures.",
+  "model": "gemini-3.7-flash",
   "effort": "high",
+  "permissions": {
+    "allow": ["read", "edit", "commands"],
+    "deny": ["network"],
+    "deny_paths": [".env*", "**/*.key"],
+    "deny_commands": ["git push*", "npm publish*"],
+    "sandbox": false
+  },
   "dangerously_skip_permissions": true
 }
 ```
+
+**Granular Permissions Policy:**
+- `allow`: Capabilities permitted (`read`, `edit`, `commands`, `network`).
+- `deny`: Capabilities forbidden (e.g. `deny: ["edit"]` clamps execution to read-only mode).
+- `deny_paths`: File/directory patterns that Antigravity is strictly forbidden from accessing or editing.
+- `deny_commands`: Command patterns that Antigravity is strictly forbidden from executing.
+- `sandbox`: Enables Antigravity's terminal sandbox restrictions (`--sandbox`).
 
 **Multi-Turn Threading:**
 `agy_run` returns a `conversation_id`. To continue the same thread in a follow-up step:
@@ -47,17 +62,18 @@ Run an autonomous Antigravity session.
 ```
 
 ### 2. `mcp__antigravity__agy_plan`
-Produce a comprehensive implementation plan without making edits.
+Produce a comprehensive implementation plan without making edits (guaranteed read-only).
 
 ```json
 {
-  "task": "Migrate the legacy button classes to the new Radix UI button component across src/components/finance.",
+  "task": "Migrate legacy button classes to Radix UI across src/components/finance.",
+  "model": "gemini-2.5-pro",
   "effort": "high"
 }
 ```
 
 ### 3. `mcp__antigravity__agy_review`
-Perform a thorough code review of recent changes.
+Perform a thorough code review of recent changes (guaranteed read-only).
 
 ```json
 {
@@ -67,7 +83,22 @@ Perform a thorough code review of recent changes.
 ```
 
 ### 4. `mcp__antigravity__agy_status`
-Quick health check to confirm Antigravity CLI path and version.
+Check CLI path, version, active model/effort defaults, and active ALLOW/DENY permission policies.
+
+### 5. `mcp__antigravity__agy_set_config`
+Persist defaults for model, effort, or ALLOW/DENY policies in `~/.claude/antigravity.json` or `.claude/antigravity.json`.
+
+```json
+{
+  "model": "gemini-3.7-flash",
+  "effort": "high",
+  "permissions": {
+    "deny_paths": [".env*", "**/*.key", "**/*.pem"],
+    "deny_commands": ["git push*", "npm publish*"]
+  },
+  "scope": "project"
+}
+```
 
 ## Collaboration Workflow
 
@@ -78,15 +109,15 @@ sequenceDiagram
     participant MCP as Antigravity MCP Server
     participant AGY as agy CLI (Terminal)
 
-    User->>Claude: "Let's implement feature X with agy as subagent"
+    User->>Claude: "Implement feature X with agy as subagent (read-only plan first)"
     Claude->>MCP: agy_plan(task: "Feature X")
-    MCP->>AGY: agy -p "Plan Feature X" --effort high
+    MCP->>AGY: agy -p "Plan Feature X" --mode plan --effort high
     AGY-->>MCP: Returns Plan + conversation_id
     MCP-->>Claude: Plan + conversation_id
     Claude->>User: Reviews plan with user
-    User->>Claude: "Looks good, proceed"
-    Claude->>MCP: agy_run(prompt: "Execute plan", conversation_id)
-    MCP->>AGY: agy -p "Execute plan" --conversation <id>
+    User->>Claude: "Looks good, execute with agy (deny git push, protect .env)"
+    Claude->>MCP: agy_run(prompt: "Execute plan", conversation_id, permissions)
+    MCP->>AGY: agy -p "Execute plan" --conversation <id> [Guardrails Enforced]
     AGY-->>MCP: Returns execution result
     MCP-->>Claude: Completed changes
     Claude->>MCP: agy_review(review_target: "git diff")

@@ -10,11 +10,11 @@ With this plugin, Claude Code can delegate deep reasoning, architectural plannin
 
 - 🤖 **Autonomous Subagent**: Claude can spin up Antigravity (`agy.exe`) to execute complex tasks, multi-step refactors, and test suites.
 - 🧠 **Dual Model Intelligence**: Combines Anthropic's Claude with Google's Gemini models (Gemini 2.5 / 3.7 Pro & Flash) with configurable reasoning effort (`low`, `medium`, `high`).
+- 🛡️ **Granular ALLOW / DENY Permissions**: Define exact capabilities, forbidden file paths (e.g. `.env*`, `*.key`), forbidden commands (e.g. `git push*`, `npm publish*`), and sandbox isolation.
 - 🔄 **Multi-Turn Continuity**: Sessions capture `conversation_id`, enabling back-and-forth iteration where Antigravity remembers all previous conversation turns and workspace context.
-- ⚙️ **Flexible Configuration**: Set model and effort dynamically per prompt, persistently in JSON config files, or via environment variables.
+- ⚙️ **Flexible Configuration**: Set model, effort, and permissions dynamically per prompt, persistently in JSON config files, or via environment variables.
 - ⚡ **Zero External Dependencies**: Lightweight stdio MCP server implemented directly in standard Node.js.
 - 🛠️ **Slash Commands**: Quick terminal commands (`/agy`, `/agy-plan`, `/agy-review`).
-- 🛡️ **Safe Headless Execution**: Configured with `--dangerously-skip-permissions` and configurable timeouts to run headlessly without getting stuck on interactive prompts.
 
 ---
 
@@ -32,37 +32,71 @@ With this plugin, Claude Code can delegate deep reasoning, architectural plannin
 
 ---
 
-## ⚙️ Model & Reasoning Effort Configuration
+## 🛡️ Granular Permissions System (ALLOW / DENY)
 
-You can customize which Gemini model and reasoning effort Antigravity uses at three different levels:
+The plugin features a comprehensive permission enforcement layer:
+
+### Permission Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allow` | `string[]` | `["read", "edit", "commands", "network"]` | Capabilities explicitly allowed. |
+| `deny` | `string[]` | `[]` | Capabilities explicitly blocked. Denying `"edit"` forces strict read-only execution (`--mode plan`). Denying `"commands"` forbids all terminal command execution. |
+| `deny_paths` | `string[]` | `[".env*", "**/*.key", "**/*.pem"]` | Paths Antigravity is strictly forbidden from reading, modifying, or referencing. |
+| `deny_commands` | `string[]` | `["git push*", "git reset --hard*", "npm publish*", "rm -rf /*"]` | Shell command patterns strictly prohibited from being run. |
+| `sandbox` | `boolean` | `false` | Enables Antigravity's native terminal sandbox isolation (`--sandbox`). |
+
+### 1. In Per-Call Invocations
+Pass custom permissions for a specific task:
+```json
+{
+  "prompt": "Investigate the authentication bug in src/server/auth.ts and propose fixes.",
+  "permissions": {
+    "deny": ["edit"],
+    "deny_paths": [".env*", "config/secrets.json"],
+    "sandbox": true
+  }
+}
+```
+
+### 2. Persistent Defaults in Config File
+Set default permissions globally or per-project in `.claude/antigravity.json`:
+```json
+{
+  "model": "gemini-3.7-flash",
+  "effort": "high",
+  "permissions": {
+    "allow": ["read", "edit", "commands"],
+    "deny": [],
+    "deny_paths": [".env*", "**/*.key", "**/*.pem", "production.sqlite"],
+    "deny_commands": ["git push*", "npm publish*", "rm -rf*"],
+    "sandbox": false
+  }
+}
+```
+
+### 3. Updating via Tool
+Ask Claude:
+> *"Claude, agregá a los paths denegados de agy el archivo `secrets.json` y denegá los comandos `git push`"*
+
+Claude will invoke `agy_set_config` to update your configuration.
+
+---
+
+## ⚙️ Model & Reasoning Effort Configuration
 
 ### 1. Per Call / Prompt
 Specify model or effort directly in your instruction to Claude:
 > *"Claude, delegale esta tarea a agy usando el modelo `gemini-2.5-pro` y effort `high`"*
 
-Claude passes these parameters directly to the underlying tool:
 - `model`: e.g. `"gemini-3.7-flash"`, `"gemini-2.5-pro"`
 - `effort`: `"low"`, `"medium"`, or `"high"`
 
 ### 2. Persistent Defaults via Tool
-Ask Claude to save your preferences:
+Ask Claude:
 > *"Configurá agy por defecto con modelo gemini-3.7-flash y effort high"*
 
-Claude will execute `agy_set_config` to persist the setting.
-
-### 3. Persistent Defaults via JSON File
-Create or edit:
-- **Global (all sessions):** `~/.claude/antigravity.json`
-- **Project-specific:** `.claude/antigravity.json`
-
-```json
-{
-  "model": "gemini-3.7-flash",
-  "effort": "high"
-}
-```
-
-### 4. Environment Variables
+### 3. Environment Variables
 ```bash
 # Windows PowerShell
 $env:AGY_MODEL = "gemini-3.7-flash"
@@ -78,12 +112,13 @@ export AGY_EFFORT="high"
 ## MCP Tools Reference
 
 ### `agy_run`
-Executes an Antigravity subagent session.
+Executes an Antigravity subagent session with optional permission guardrails.
 
 **Parameters:**
 - `prompt` (string, required): The task, instructions, or question.
-- `model` (string, optional): Specific model override (e.g. `gemini-3.7-flash`, `gemini-2.5-pro`). Falls back to configured default.
-- `effort` (`"low"` | `"medium"` | `"high"`, optional): Reasoning effort level. Defaults to configured default (usually `"high"`).
+- `model` (string, optional): Specific model override.
+- `effort` (`"low"` | `"medium"` | `"high"`, optional): Reasoning effort level.
+- `permissions` (object, optional): Granular ALLOW/DENY policies (`allow`, `deny`, `deny_paths`, `deny_commands`, `sandbox`).
 - `conversation_id` (string, optional): ID of previous conversation to resume context across turns.
 - `continue_session` (boolean, optional): Continue most recent conversation (`-c`).
 - `mode` (`"accept-edits"` | `"plan"`, default: `"accept-edits"`): Execution mode.
@@ -92,41 +127,16 @@ Executes an Antigravity subagent session.
 - `cwd` (string, optional): Working directory.
 
 ### `agy_plan`
-Generates a step-by-step architectural and implementation plan without modifying files.
-
-**Parameters:**
-- `task` (string, required): The feature or problem to plan.
-- `model` (string, optional): Specific model override.
-- `effort` (`"low"` | `"medium"` | `"high"`, optional): Reasoning effort level.
-- `cwd` (string, optional).
+Generates a step-by-step architectural and implementation plan without modifying files (guaranteed read-only mode).
 
 ### `agy_review`
-Performs an adversarial code review on git diffs or specific files.
-
-**Parameters:**
-- `review_target` (string, required): Target to review (e.g. `"git diff HEAD~1"`, `"src/routes/__root.tsx"`).
-- `model` (string, optional): Specific model override.
-- `effort` (`"low"` | `"medium"` | `"high"`, optional): Reasoning effort level.
-- `guidelines` (string, optional): Specific rules or standards to enforce.
+Performs an adversarial code review on git diffs or specific files (guaranteed read-only mode).
 
 ### `agy_status`
-Checks binary path, CLI version, active model/effort defaults, and active configuration file.
+Checks binary path, CLI version, active model/effort defaults, active ALLOW/DENY permission policies, and active configuration file.
 
 ### `agy_set_config`
-Saves default model or effort preferences persistently.
-
-**Parameters:**
-- `model` (string, optional): Default model name.
-- `effort` (`"low"` | `"medium"` | `"high"`, optional): Default effort level.
-- `scope` (`"global"` | `"project"`, default: `"global"`): Config file target.
-
----
-
-## Slash Commands
-
-- `/agy <prompt>`: Delegate a task directly to Antigravity and view the results.
-- `/agy-plan <task>`: Ask Antigravity to analyze the workspace and produce an implementation plan.
-- `/agy-review [target]`: Run an adversarial review of recent git changes.
+Saves default model, effort, or permission preferences persistently.
 
 ---
 

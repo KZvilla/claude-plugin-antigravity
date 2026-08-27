@@ -4,6 +4,7 @@
  * Antigravity MCP Server for Claude Code
  * Bridges Claude Code / Claude CLI to the Antigravity CLI (`agy.exe`).
  * Implements MCP stdio JSON-RPC 2.0 protocol with zero external dependencies.
+ * Includes granular ALLOW / DENY permission management.
  */
 
 const { spawn, execSync } = require('node:child_process');
@@ -39,11 +40,18 @@ function resolveAgyBin() {
 
 const AGY_BIN = resolveAgyBin();
 
-// Configuration Management (defaults for model and effort)
+// Configuration & Permission Management
 function loadConfig(cwd = process.cwd()) {
   const config = {
     defaultModel: process.env.AGY_MODEL || null,
     defaultEffort: process.env.AGY_EFFORT || 'high',
+    permissions: {
+      allow: ['read', 'edit', 'commands', 'network'],
+      deny: [],
+      deny_paths: ['.env*', '**/*.key', '**/*.pem'],
+      deny_commands: ['git push*', 'git reset --hard*', 'npm publish*', 'rm -rf /*'],
+      sandbox: false
+    },
     configFile: null
   };
 
@@ -56,6 +64,9 @@ function loadConfig(cwd = process.cwd()) {
       const parsed = JSON.parse(fs.readFileSync(globalPath, 'utf8'));
       if (parsed.model) config.defaultModel = parsed.model;
       if (parsed.effort) config.defaultEffort = parsed.effort;
+      if (parsed.permissions) {
+        config.permissions = { ...config.permissions, ...parsed.permissions };
+      }
       config.configFile = globalPath;
     } catch {}
   }
@@ -65,6 +76,9 @@ function loadConfig(cwd = process.cwd()) {
       const parsed = JSON.parse(fs.readFileSync(projectPath, 'utf8'));
       if (parsed.model) config.defaultModel = parsed.model;
       if (parsed.effort) config.defaultEffort = parsed.effort;
+      if (parsed.permissions) {
+        config.permissions = { ...config.permissions, ...parsed.permissions };
+      }
       config.configFile = projectPath;
     } catch {}
   }
@@ -90,6 +104,12 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
 
   if (updates.model !== undefined) existing.model = updates.model;
   if (updates.effort !== undefined) existing.effort = updates.effort;
+  if (updates.permissions !== undefined) {
+    existing.permissions = {
+      ...(existing.permissions || {}),
+      ...updates.permissions
+    };
+  }
 
   fs.writeFileSync(targetFile, JSON.stringify(existing, null, 2), 'utf8');
   return { targetFile, config: existing };
@@ -99,7 +119,7 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
 const TOOLS = [
   {
     name: 'agy_run',
-    description: 'Execute the Antigravity CLI (agy) as an autonomous subagent. Antigravity can edit files, run shell commands, perform deep reasoning, and access workspace tools. Returns structured response with conversation_id for multi-turn workflows.',
+    description: 'Execute Antigravity CLI (agy) as an autonomous subagent with optional granular ALLOW / DENY permission policies. Antigravity can edit files, run shell commands, perform deep reasoning, and access workspace tools. Returns structured response with conversation_id.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -129,6 +149,36 @@ const TOOLS = [
           enum: ['accept-edits', 'plan'],
           description: 'Agent execution mode: "accept-edits" (default, can edit code) or "plan" (pure planning/analysis).'
         },
+        permissions: {
+          type: 'object',
+          description: 'Granular ALLOW and DENY permission policies for this subagent execution.',
+          properties: {
+            allow: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Explicitly allowed capabilities: "read", "edit", "commands", "network".'
+            },
+            deny: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Explicitly denied capabilities (e.g. "edit" for read-only, "commands" to forbid shell execution).'
+            },
+            deny_paths: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Path patterns forbidden from being read or modified (e.g. [".env*", "**/*.key"]).'
+            },
+            deny_commands: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Command patterns forbidden from being executed (e.g. ["git push*", "npm publish*"]).'
+            },
+            sandbox: {
+              type: 'boolean',
+              description: 'Enable Antigravity terminal sandbox restrictions (--sandbox).'
+            }
+          }
+        },
         cwd: {
           type: 'string',
           description: 'Working directory for the session. Defaults to Claude\'s current working directory.'
@@ -147,7 +197,7 @@ const TOOLS = [
   },
   {
     name: 'agy_plan',
-    description: 'Ask Antigravity to analyze the codebase and generate an architectural or implementation plan without executing modifications.',
+    description: 'Ask Antigravity to analyze the codebase and generate an architectural or implementation plan without executing modifications (enforces read-only policy).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -174,7 +224,7 @@ const TOOLS = [
   },
   {
     name: 'agy_review',
-    description: 'Ask Antigravity to perform an adversarial or complementary code review of recent changes, diffs, or specific files against guidelines and best practices.',
+    description: 'Ask Antigravity to perform an adversarial or complementary code review of recent changes, diffs, or specific files against guidelines and best practices (enforces read-only policy).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -205,7 +255,7 @@ const TOOLS = [
   },
   {
     name: 'agy_status',
-    description: 'Check the status, version, active model/effort defaults, and binary path of Antigravity CLI.',
+    description: 'Check the status, version, active model/effort defaults, ALLOW/DENY permission policies, and binary path of Antigravity CLI.',
     inputSchema: {
       type: 'object',
       properties: {}
@@ -213,7 +263,7 @@ const TOOLS = [
   },
   {
     name: 'agy_set_config',
-    description: 'Set default model or reasoning effort for Antigravity subagent sessions (persisted in .claude/antigravity.json).',
+    description: 'Set default model, reasoning effort, or ALLOW/DENY permission policies for Antigravity subagent sessions (persisted in .claude/antigravity.json).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -225,6 +275,36 @@ const TOOLS = [
           type: 'string',
           enum: ['low', 'medium', 'high'],
           description: 'Default reasoning effort level.'
+        },
+        permissions: {
+          type: 'object',
+          description: 'Default ALLOW/DENY permissions policy.',
+          properties: {
+            allow: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Allowed capabilities: "read", "edit", "commands", "network".'
+            },
+            deny: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Denied capabilities (e.g. "edit", "commands", "network").'
+            },
+            deny_paths: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Path patterns to forbid (e.g. [".env*", "**/*.key"]).'
+            },
+            deny_commands: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Command patterns to forbid (e.g. ["git push*", "npm publish*"]).'
+            },
+            sandbox: {
+              type: 'boolean',
+              description: 'Enable terminal sandbox (--sandbox).'
+            }
+          }
         },
         scope: {
           type: 'string',
@@ -330,11 +410,12 @@ async function handleToolCall(name, args) {
         } catch {}
       }
 
+      const p = config.permissions;
       return {
         content: [
           {
             type: 'text',
-            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default)'}\n- Default Effort: ${config.defaultEffort || 'high'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
+            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default)'}\n- Default Effort: ${config.defaultEffort || 'high'}\n- Permissions Policy:\n  * Allow: [${p.allow.join(', ')}]\n  * Deny: [${p.deny.join(', ') || 'none'}]\n  * Denied Paths: [${p.deny_paths.join(', ')}]\n  * Denied Commands: [${p.deny_commands.join(', ')}]\n  * Sandbox Mode: ${p.sandbox ? 'enabled' : 'disabled'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
           }
         ]
       };
@@ -345,27 +426,51 @@ async function handleToolCall(name, args) {
       const updates = {};
       if (args.model !== undefined) updates.model = args.model;
       if (args.effort !== undefined) updates.effort = args.effort;
+      if (args.permissions !== undefined) updates.permissions = args.permissions;
 
       const result = saveConfig(updates, scope, args.cwd);
       return {
         content: [
           {
             type: 'text',
-            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || 'high'}`
+            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || 'high'}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
           }
         ]
       };
     }
 
     case 'agy_run': {
+      // Merge effective permissions (per-call override merged over config defaults)
+      const callPerms = args.permissions || {};
+      const basePerms = config.permissions;
+      const effectivePerms = {
+        allow: callPerms.allow || basePerms.allow || ['read', 'edit', 'commands', 'network'],
+        deny: callPerms.deny || basePerms.deny || [],
+        deny_paths: callPerms.deny_paths || basePerms.deny_paths || [],
+        deny_commands: callPerms.deny_commands || basePerms.deny_commands || [],
+        sandbox: callPerms.sandbox !== undefined ? callPerms.sandbox : (basePerms.sandbox || false)
+      };
+
+      // Check if 'edit' is denied
+      const canEdit = !effectivePerms.deny.includes('edit') && effectivePerms.allow.includes('edit');
+      const canRunCommands = !effectivePerms.deny.includes('commands') && effectivePerms.allow.includes('commands');
+
+      // Determine CLI mode
+      let effectiveMode = args.mode || (canEdit ? 'accept-edits' : 'plan');
+      if (!canEdit && effectiveMode === 'accept-edits') {
+        effectiveMode = 'plan'; // Hard clamp to plan mode if edit is denied
+      }
+
       const cliArgs = ['--output-format', 'json'];
 
       if (args.dangerously_skip_permissions !== false) {
         cliArgs.push('--dangerously-skip-permissions');
       }
 
-      if (args.mode) {
-        cliArgs.push('--mode', args.mode);
+      cliArgs.push('--mode', effectiveMode);
+
+      if (effectivePerms.sandbox) {
+        cliArgs.push('--sandbox');
       }
 
       const effectiveEffort = args.effort || config.defaultEffort || 'high';
@@ -382,7 +487,33 @@ async function handleToolCall(name, args) {
         cliArgs.push('-c');
       }
 
-      cliArgs.push('-p', args.prompt);
+      // Construct Guardrail Preamble if permissions or deny rules apply
+      let finalPrompt = args.prompt;
+      const securityRules = [];
+
+      if (!canEdit) {
+        securityRules.push('- EDIT PERMISSION DENIED: You are operating in STRICT READ-ONLY mode. Do not write or edit any files.');
+      }
+      if (!canRunCommands) {
+        securityRules.push('- COMMAND EXECUTION DENIED: Do not run or propose any shell/terminal commands.');
+      }
+      if (effectivePerms.deny_paths.length > 0) {
+        securityRules.push(`- FORBIDDEN PATHS: You MUST NEVER access, read, write, or mention contents of these path patterns: ${effectivePerms.deny_paths.join(', ')}`);
+      }
+      if (effectivePerms.deny_commands.length > 0) {
+        securityRules.push(`- FORBIDDEN COMMANDS: You MUST NEVER execute commands matching: ${effectivePerms.deny_commands.join(', ')}`);
+      }
+
+      if (securityRules.length > 0) {
+        finalPrompt = `[SECURITY & PERMISSION GUARDRAILS ENFORCED BY USER POLICY]
+${securityRules.join('\n')}
+If any requested action violates these rules, refuse that specific action and explain the restriction.
+
+[TASK INSTRUCTIONS]
+${args.prompt}`;
+      }
+
+      cliArgs.push('-p', finalPrompt);
 
       const result = await executeAgy(cliArgs, {
         cwd: args.cwd,
@@ -409,10 +540,10 @@ async function handleToolCall(name, args) {
 
       let formatted = `${responseText.trim()}\n\n---\n`;
       formatted += `**Antigravity Execution Details:**\n`;
-      if (effectiveModel) {
-        formatted += `- Model: \`${effectiveModel}\`\n`;
-      }
+      if (effectiveModel) formatted += `- Model: \`${effectiveModel}\`\n`;
       formatted += `- Effort: \`${effectiveEffort}\`\n`;
+      formatted += `- Mode: \`${effectiveMode}\` (${canEdit ? 'read/write' : 'read-only'})\n`;
+      formatted += `- Permissions Enforced: allow=[${effectivePerms.allow.join(', ')}], deny=[${effectivePerms.deny.join(', ') || 'none'}], sandbox=${effectivePerms.sandbox}\n`;
       if (conversationId) {
         formatted += `- Conversation ID: \`${conversationId}\` (pass as \`conversation_id\` to continue this thread)\n`;
       }
@@ -445,6 +576,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
       const cliArgs = [
         '--output-format', 'json',
         '--dangerously-skip-permissions',
+        '--mode', 'plan',
         '--effort', effectiveEffort
       ];
 
@@ -473,6 +605,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
       let formatted = `### Antigravity Implementation Plan\n\n${responseText.trim()}\n\n---\n`;
       formatted += `Effort: \`${effectiveEffort}\``;
       if (effectiveModel) formatted += ` | Model: \`${effectiveModel}\``;
+      formatted += ` | Mode: \`plan\` (read-only enforced)`;
       if (conversationId) {
         formatted += `\nConversation ID: \`${conversationId}\` (use \`agy_run\` with this ID to begin execution)`;
       }
@@ -501,6 +634,7 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       const cliArgs = [
         '--output-format', 'json',
         '--dangerously-skip-permissions',
+        '--mode', 'plan',
         '--effort', effectiveEffort
       ];
 
@@ -526,7 +660,7 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       const responseText = resData.response || result.rawOutput || '';
 
       return {
-        content: [{ type: 'text', text: `### Antigravity Code Review (Effort: ${effectiveEffort}${effectiveModel ? `, Model: ${effectiveModel}` : ''})\n\n${responseText.trim()}` }]
+        content: [{ type: 'text', text: `### Antigravity Code Review (Effort: ${effectiveEffort}${effectiveModel ? `, Model: ${effectiveModel}` : ''}, Mode: read-only)\n\n${responseText.trim()}` }]
       };
     }
 
@@ -586,7 +720,7 @@ rl.on('line', async (line) => {
             },
             serverInfo: {
               name: 'antigravity-mcp',
-              version: '1.1.0'
+              version: '1.2.0'
             }
           }
         });
