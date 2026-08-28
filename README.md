@@ -1,6 +1,6 @@
 # Antigravity Claude Code Plugin
 
-![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-green)
 ![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
@@ -8,7 +8,7 @@
 
 A Claude Code plugin that integrates **Google Antigravity CLI (`agy`)** as an autonomous subagent and pair-programming partner.
 
-Delegate deep reasoning, architectural planning, TDD implementation, and adversarial code reviews to Antigravity — running directly in your terminal, orchestrated by Claude.
+Delegate deep reasoning, architectural planning, TDD implementation, adversarial code reviews, session documentation, and cited web research to Antigravity — running directly in your terminal, orchestrated by Claude.
 
 ---
 
@@ -20,6 +20,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, and adversa
 - [Installation](#-installation--setup)
 - [Slash Commands](#-slash-commands)
 - [MCP Tools Reference](#-mcp-tools-reference)
+- [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-agy-summary)
 - [Permissions (ALLOW / DENY)](#-granular-permissions-system-allow--deny)
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
 - [Telemetry (`/agy-usage`)](#-telemetry--usage-tracking-agy-usage)
@@ -58,6 +59,14 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 ```
 
 ```text
+/agy-summary
+```
+
+```text
+/agy-research "Latest patterns for Claude Code plugins in 2026"
+```
+
+```text
 /agy-usage
 ```
 
@@ -69,8 +78,10 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 |---|---------|-------------|
 | 🤖 | **Autonomous Subagent** | Claude spins up Antigravity to execute complex tasks, multi-step refactors, and test suites |
 | 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (2.5 / 3.7 Pro & Flash) with configurable reasoning effort |
+| 📋 | **Anti-Compaction Session Summary** | Analyzes raw JSONL session logs with Gemini (1M-2M context) to generate persistent, structured Markdown docs before context degrades |
+| 🌐 | **Cited Web Research** | Leverages Antigravity's native web search and synthesis capabilities that Claude Code lacks out of the box |
 | 🛡️ | **Granular Permissions** | ALLOW / DENY capabilities, forbidden paths, forbidden commands, and sandbox isolation |
-| ⏱️ | **Robust Timeouts** | Auto-injects `--print-timeout` (15m default, 20m for reviews) to prevent premature drops |
+| ⏱️ | **Robust Timeouts** | Auto-injects `--print-timeout` (15m default, 20m for reviews, 25m for audits) to prevent premature drops |
 | 📊 | **Live Telemetry** | Token usage, thinking tokens, context caching savings, and context window saturation |
 | 🔄 | **Multi-Turn Continuity** | `conversation_id` enables back-and-forth iteration with full workspace memory |
 | ⚙️ | **Flexible Config** | Per-prompt, per-project JSON, or environment variables |
@@ -96,21 +107,26 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 | `/agy <prompt>` | Delegate any task to Antigravity (read + write) |
 | `/agy-plan <task>` | Generate an architectural plan (read-only, no file changes) |
 | `/agy-review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
+| `/agy-audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
+| `/agy-summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
+| `/agy-research <topic>` | Conduct deep web research with cited sources and structured insights |
 | `/agy-usage` | Display token telemetry, context saturation, and quota health |
 
-> **Tip:** You can also ask Claude naturally — *"Delegale a agy que revise los cambios del último commit"* — and it will pick the right tool automatically.
+> **Tip:** You can also ask Claude naturally — *"Delegale a agy que resuma esta sesión"* o *"Hacé un research web con agy sobre X"* — and it will pick the right tool automatically.
 
 ---
 
 ## 🔧 MCP Tools Reference
 
-Six tools exposed via the MCP server:
+Seven tools exposed via the MCP server:
 
 | Tool | Mode | Default Timeout | Description |
 |------|------|-----------------|-------------|
 | `agy_run` | read + write | 15m | Execute a full subagent session with optional permission guardrails |
 | `agy_plan` | read-only | 15m | Step-by-step architectural / implementation plan without modifying files |
 | `agy_review` | read-only | 20m | Adversarial code review on git diffs or specific files |
+| `agy_audit` | read-only | 25m | Rigorous adversarial audit with severity rubric (BLOCKER, MAJOR, MINOR) |
+| `agy_session_summary` | read-only | 15m | Parse session JSONL and generate structured summary doc with Gemini |
 | `agy_usage` | — | — | Session token telemetry, context window saturation, model limits, quota health |
 | `agy_status` | — | — | Binary path, CLI version, active model/effort defaults, permission policies |
 | `agy_set_config` | — | — | Persist model, effort, timeout, or permission preferences |
@@ -236,16 +252,52 @@ To reset session counters:
 
 ---
 
+## 📋 Session Summary & Anti-Compaction (`/agy-summary`)
+
+Claude Code's automatic context compaction can be lossy — intermediate decisions, edge cases, and reasoning get dropped as sessions grow. 
+
+Antigravity solves this by reading the raw session JSONL log from `~/.claude/projects/`, pre-processing and stripping noise in Node.js, and feeding the structured transcript to **Gemini's 1M-2M token context window** to generate a persistent Markdown summary with YAML frontmatter.
+
+```text
+/agy-summary
+```
+
+You can also target specific areas:
+- `/agy-summary decisions` — focus on architectural rationale and choices
+- `/agy-summary changes` — focus on modified files and code diffs
+- `/agy-summary debugging` — focus on errors, root causes, and fixes
+
+Summaries are automatically saved to `~/.claude/session-summaries/<YYYY-MM-DD>-<session-id>.md`.
+
+---
+
+## 🌐 Deep Web Research (`/agy-research`)
+
+Delegate deep web research and live doc searches directly to Antigravity, which leverages Gemini's native search tools and Vertex AI:
+
+```text
+/agy-research "Best practices for Claude Code hooks and lifecycle events 2026"
+```
+
+Returns a structured report with an Executive Summary, Key Findings, Cited Source URLs, and direct relevance to your current project.
+
+---
+
 ## 📦 Components
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (6 tools) |
+| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (8 tools) |
 | **Subagent** | `agents/antigravity.md` | Autonomous subagent definition (`antigravity:Antigravity`) |
-| **Skill** | `skills/antigravity/SKILL.md` | Context-aware delegation guidelines |
+| **Skills** | `skills/antigravity/SKILL.md` | Context-aware delegation guidelines |
+| | `skills/adversarial-review/SKILL.md` | Skeptical, evidence-based audit guidelines |
+| | `skills/session-summary/SKILL.md` | Session summary & anti-compaction skill |
 | **Commands** | `commands/agy.md` | `/agy <prompt>` |
 | | `commands/agy-plan.md` | `/agy-plan <task>` |
 | | `commands/agy-review.md` | `/agy-review [target]` |
+| | `commands/agy-audit.md` | `/agy-audit [target]` |
+| | `commands/agy-summary.md` | `/agy-summary [focus]` |
+| | `commands/agy-research.md` | `/agy-research <topic>` |
 | | `commands/agy-usage.md` | `/agy-usage` |
 | **Installers** | `install.ps1` / `install.sh` | 1-command install for all platforms |
 

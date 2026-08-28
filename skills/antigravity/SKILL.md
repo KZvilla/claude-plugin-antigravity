@@ -1,7 +1,7 @@
 ---
 name: antigravity
-description: Use this skill when delegating tasks to Google Antigravity CLI (agy), running Antigravity as an autonomous subagent, requesting architectural planning with Gemini reasoning, performing second-opinion code reviews, configuring ALLOW/DENY permissions, or when the user mentions "ask agy", "run in agy", "delegate to agy", "antigravity plan", or "cross-check with agy".
-version: 0.2.0
+description: Use this skill when delegating tasks to Google Antigravity CLI (agy), running Antigravity as an autonomous subagent, requesting architectural planning with Gemini reasoning, performing second-opinion code reviews, configuring ALLOW/DENY permissions, generating structured session summaries, delegating deep web research, or when the user mentions "ask agy", "run in agy", "delegate to agy", "antigravity plan", or "cross-check with agy".
+version: 0.3.0
 ---
 
 # Antigravity Subagent Skill
@@ -23,6 +23,8 @@ Delegate tasks to Antigravity when:
 2. **Autonomous Implementation / TDD**: You want a self-contained feature, refactoring, or test suite implemented end-to-end (`agy_run`).
 3. **Adversarial Code Review / Sanity Check**: After modifying code, ask Antigravity to review the diff against project guidelines (`agy_review`).
 4. **Second Opinion on Tricky Bugs**: When troubleshooting a puzzling bug or flaky test, delegate an investigation to Antigravity with a fresh perspective.
+5. **Session Documentation & Anti-Compaction**: When the conversation gets long or at the end of a session, generate a structured markdown summary (`agy_session_summary`).
+6. **Deep Web Research**: When comprehensive live information with cited sources is required (`/agy-research`).
 
 ## Tool Reference
 
@@ -102,6 +104,19 @@ Persist defaults for model, effort, or ALLOW/DENY policies in `~/.claude/antigra
   "scope": "project"
 }
 ```
+
+### 7. `mcp__antigravity__agy_session_summary`
+Read Claude Code's session JSONL log, preprocess turns to filter noise, and generate a structured markdown summary using Gemini. Solves context compaction degradation.
+
+```json
+{
+  "focus": "full",
+  "model": "gemini-3.7-flash",
+  "effort": "high"
+}
+```
+Available focuses: `"full"`, `"decisions"`, `"changes"`, `"debugging"`. Summaries are saved to `~/.claude/session-summaries/<date>-<session-id>.md`.
+
 
 ## Collaboration Workflow
 

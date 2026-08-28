@@ -7,7 +7,7 @@
  * Includes granular ALLOW / DENY permissions, robust timeout handling, and telemetry / usage metrics.
  */
 
-const { spawn, execSync } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const readline = require('node:readline');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -17,10 +17,10 @@ function resolveAgyBin() {
   const isWin = process.platform === 'win32';
   const binName = isWin ? 'agy.exe' : 'agy';
 
-  // 1. Try PATH
+  // 1. Try PATH (using execFileSync without shell interpolation)
   try {
-    const cmd = isWin ? `where.exe ${binName}` : `which ${binName}`;
-    const found = execSync(cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim().split(/\r?\n/)[0];
+    const file = isWin ? 'where.exe' : 'which';
+    const found = execFileSync(file, [binName], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim().split(/\r?\n/)[0];
     if (found && fs.existsSync(found)) {
       return found;
     }
@@ -133,7 +133,7 @@ function loadUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, summary: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -229,7 +229,7 @@ function resetUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, summary: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -566,6 +566,45 @@ const TOOLS = [
         }
       }
     }
+  },
+  {
+    name: 'agy_session_summary',
+    description: 'Read a Claude Code session log (JSONL) and generate a structured summary document via Gemini. Solves context compaction loss by creating persistent, high-quality session documentation with decisions, changes, problems, and continuation context. The summary is saved as a markdown file for future reference.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: {
+          type: 'string',
+          description: 'UUID of the Claude Code session to summarize. If omitted, uses the most recent session for the current project.'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project working directory. Used to locate the correct session log directory under ~/.claude/projects/.'
+        },
+        output_path: {
+          type: 'string',
+          description: 'Custom file path for the summary. Defaults to .claude/session-summaries/<date>-<session-id-short>.md'
+        },
+        focus: {
+          type: 'string',
+          enum: ['full', 'decisions', 'changes', 'debugging'],
+          description: 'Summary focus area. "full" (default) covers everything. "decisions" emphasizes architectural/design choices. "changes" focuses on files modified. "debugging" highlights problems and resolutions.'
+        },
+        model: {
+          type: 'string',
+          description: 'Model override for summarization (e.g. "gemini-2.5-pro" for very large sessions). Falls back to configured default.'
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'Reasoning effort for summarization. Defaults to "high".'
+        },
+        timeout_minutes: {
+          type: 'number',
+          description: 'Timeout in minutes. Defaults to 15.'
+        }
+      }
+    }
   }
 ];
 
@@ -689,6 +728,281 @@ Section rules: Mode 1 includes Plan coverage. Mode 2 includes Over-engineering. 
 Direct, skeptical, and factual. Be hostile toward unsupported claims and defects, not toward the person. Every finding must cite concrete evidence. Do not use praise sandwiches.
 `;
 
+// Session Log Discovery & Pre-processing
+function getProjectLogDir(cwd) {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  const projectsDir = path.join(homeDir, '.claude', 'projects');
+  if (!fs.existsSync(projectsDir)) return null;
+
+  // Claude Code encodes project paths as directory names: /foo/bar → -foo-bar (unix), c:\foo\bar → c--foo-bar (win)
+  const normalizedCwd = (cwd || process.cwd()).replace(/\\/g, '/');
+  const entries = fs.readdirSync(projectsDir);
+
+  // Strategy 1: Try direct encoding match
+  const encoded = normalizedCwd.replace(/^\//, '').replace(/:/g, '').replace(/\//g, '-');
+  const winEncoded = (cwd || process.cwd()).replace(/:/g, '').replace(/\\/g, '-').replace(/\//g, '-');
+
+  for (const entry of entries) {
+    const lower = entry.toLowerCase();
+    if (lower === encoded.toLowerCase() || lower === winEncoded.toLowerCase()) {
+      const full = path.join(projectsDir, entry);
+      if (fs.statSync(full).isDirectory()) return full;
+    }
+  }
+
+  // Strategy 2: Fuzzy — check if the cwd basename appears in any project dir
+  const cwdBase = path.basename(cwd || process.cwd()).toLowerCase();
+  for (const entry of entries) {
+    if (entry.toLowerCase().includes(cwdBase)) {
+      const full = path.join(projectsDir, entry);
+      if (fs.statSync(full).isDirectory()) return full;
+    }
+  }
+
+  return null;
+}
+
+function findSessionFile(logDir, sessionId) {
+  if (!logDir || !fs.existsSync(logDir)) return null;
+
+  if (sessionId) {
+    // P1 Security: Sanitize sessionId to strictly prevent path traversal (alphanumeric, dashes, underscores only)
+    const safeId = path.basename(sessionId).replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!safeId) return null;
+    const target = path.join(logDir, `${safeId}.jsonl`);
+    const resolvedTarget = path.resolve(target);
+    const resolvedLogDir = path.resolve(logDir);
+    if (!resolvedTarget.startsWith(resolvedLogDir)) return null;
+    return fs.existsSync(resolvedTarget) ? resolvedTarget : null;
+  }
+
+  // Find most recent .jsonl file by modification time
+  const files = fs.readdirSync(logDir)
+    .filter(f => f.endsWith('.jsonl'))
+    .map(f => ({
+      name: f,
+      path: path.join(logDir, f),
+      mtime: fs.statSync(path.join(logDir, f)).mtimeMs
+    }))
+    .sort((a, b) => b.mtime - a.mtime);
+
+  return files.length > 0 ? files[0].path : null;
+}
+
+function preprocessSessionLog(filePath, maxChars = 500000) {
+  const content = fs.readFileSync(filePath, 'utf8');
+  const lines = content.split('\n').filter(l => l.trim());
+
+  const turns = [];
+  let sessionMeta = { cwd: null, branch: null, version: null, startTime: null, endTime: null };
+
+  for (const line of lines) {
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    // Skip queue operations (noise)
+    if (obj.type === 'queue-operation') continue;
+
+    // Extract session metadata from first user message
+    if (obj.cwd && !sessionMeta.cwd) sessionMeta.cwd = obj.cwd;
+    if (obj.gitBranch && !sessionMeta.branch) sessionMeta.branch = obj.gitBranch;
+    if (obj.version && !sessionMeta.version) sessionMeta.version = obj.version;
+    if (obj.timestamp) {
+      if (!sessionMeta.startTime) sessionMeta.startTime = obj.timestamp;
+      sessionMeta.endTime = obj.timestamp;
+    }
+
+    // Skip meta/system messages
+    if (obj.isMeta) continue;
+
+    // Process based on type
+    if (obj.type === 'user' && obj.message) {
+      const content = typeof obj.message.content === 'string'
+        ? obj.message.content
+        : (Array.isArray(obj.message.content)
+          ? obj.message.content.map(c => c.text || c.type || '').join(' ')
+          : '');
+      if (content.trim()) {
+        turns.push({ role: 'user', content: content.trim(), ts: obj.timestamp });
+      }
+    } else if (obj.type === 'assistant' && obj.message) {
+      const content = typeof obj.message.content === 'string'
+        ? obj.message.content
+        : (Array.isArray(obj.message.content)
+          ? obj.message.content
+            .filter(c => c.type === 'text')
+            .map(c => c.text || '')
+            .join('\n')
+          : '');
+      if (content.trim()) {
+        turns.push({ role: 'assistant', content: content.trim(), ts: obj.timestamp });
+      }
+
+      // Also extract tool_use blocks as condensed references
+      if (Array.isArray(obj.message.content)) {
+        for (const block of obj.message.content) {
+          if (block.type === 'tool_use') {
+            const toolName = block.name || 'unknown_tool';
+            const inputPreview = block.input
+              ? JSON.stringify(block.input).slice(0, 200)
+              : '';
+            turns.push({
+              role: 'tool_call',
+              content: `[Tool: ${toolName}] ${inputPreview}`,
+              ts: obj.timestamp
+            });
+          }
+        }
+      }
+    } else if (obj.type === 'tool_result' && obj.message) {
+      // Condense tool results to first 300 chars
+      const content = typeof obj.message.content === 'string'
+        ? obj.message.content
+        : (Array.isArray(obj.message.content)
+          ? obj.message.content.map(c => c.text || '').join(' ')
+          : '');
+      if (content.trim()) {
+        const truncated = content.trim().slice(0, 300);
+        turns.push({
+          role: 'tool_result',
+          content: `[Result] ${truncated}${content.length > 300 ? '...' : ''}`,
+          ts: obj.timestamp
+        });
+      }
+    }
+  }
+
+  // Build the pre-processed transcript text
+  let transcript = '';
+  const totalTurns = turns.length;
+
+  // If the full transcript is too large, keep first 10 + last turns that fit
+  const headerTurns = turns.slice(0, 10);
+  const remainingTurns = turns.slice(10);
+
+  for (const turn of headerTurns) {
+    transcript += `[${turn.role.toUpperCase()}]${turn.ts ? ` (${turn.ts})` : ''}\n${turn.content}\n\n`;
+  }
+
+  // Add remaining turns from newest first until we hit the limit
+  let tailTranscript = '';
+  for (let i = remainingTurns.length - 1; i >= 0; i--) {
+    const turn = remainingTurns[i];
+    const entry = `[${turn.role.toUpperCase()}]${turn.ts ? ` (${turn.ts})` : ''}\n${turn.content}\n\n`;
+    if (transcript.length + entry.length + tailTranscript.length > maxChars) {
+      transcript += `\n[... ${i + 1} earlier turns truncated for size ...]\n\n`;
+      break;
+    }
+    tailTranscript = entry + tailTranscript;
+  }
+  transcript += tailTranscript;
+
+  return { transcript, sessionMeta, totalTurns, filePath };
+}
+
+function getSummaryPrompt(focus = 'full') {
+  const focusInstructions = {
+    full: 'Cover all sections thoroughly and equally.',
+    decisions: 'Emphasize the "Decisions Made" section. Go deeper on rationale, alternatives considered, and trade-offs.',
+    changes: 'Emphasize the "Changes Made" section. List every file with detailed change descriptions.',
+    debugging: 'Emphasize the "Problems Found and Resolutions" section. Detail each bug, error, or blocker with root cause analysis.'
+  };
+
+  return `You are a Session Documentation Specialist. Analyze the following transcript of a Claude Code development session and generate a structured summary document.
+
+## Required Sections (in this exact order):
+
+### 1. Executive Summary
+- One sentence describing the main objective of the session
+- Duration and key timestamps
+
+### 2. Decisions Made
+- Numbered list of each technical or design decision
+- For each: context → decision → justification
+
+### 3. Changes Made
+- Files created, modified, or deleted
+- For each file: what changed and why
+- If tests were run: results
+
+### 4. Problems Found and Resolutions
+- Bugs, errors, or blockers encountered during the session
+- How they were resolved (or if they remain pending)
+
+### 5. Current State and Next Steps
+- What was working at the end of the session
+- Explicit pending tasks
+- Dependencies or blockers for continuation
+
+### 6. Context for Continuation
+- The minimum information an agent or human needs to resume work where it was left off
+- Relevant environment variables, branches, or configurations
+
+## Focus: ${focusInstructions[focus] || focusInstructions.full}
+
+## Rules:
+- DO NOT invent information not present in the transcript
+- Cite specific files when mentioning them
+- If something is unclear, mark it as "[unclear in transcript]"
+- Be concise: the document should not exceed 500 lines
+- Write in the same language the user used in the session (if the session is in Spanish, write in Spanish)`;
+}
+
+function saveSummary(content, sessionId, sessionMeta, outputPath, cwd = process.cwd()) {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  const today = new Date().toISOString().slice(0, 10);
+  const safeId = (sessionId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 8);
+
+  let targetPath;
+  if (outputPath) {
+    const resolved = path.resolve(cwd, outputPath);
+    const allowedRoots = [
+      path.resolve(cwd),
+      path.resolve(homeDir, '.claude')
+    ];
+    const isSafe = allowedRoots.some(root => resolved === root || resolved.startsWith(root + path.sep));
+    if (!isSafe) {
+      throw new Error(`Security Violation: output_path must reside within project root or ~/.claude (attempted: ${outputPath})`);
+    }
+    targetPath = resolved;
+  } else {
+    const summaryDir = path.join(homeDir, '.claude', 'session-summaries');
+    if (!fs.existsSync(summaryDir)) {
+      fs.mkdirSync(summaryDir, { recursive: true });
+    }
+    targetPath = path.join(summaryDir, `${today}-${safeId}.md`);
+  }
+
+  // Build frontmatter
+  const frontmatter = [
+    '---',
+    `session_id: "${sessionId || 'unknown'}"`,
+    `project: "${(sessionMeta.cwd || 'unknown').replace(/\\/g, '/')}"`,
+    `branch: "${sessionMeta.branch || 'unknown'}"`,
+    `date: "${today}"`,
+    `start_time: "${sessionMeta.startTime || 'unknown'}"`,
+    `end_time: "${sessionMeta.endTime || 'unknown'}"`,
+    `summarized_by: "antigravity-mcp"`,
+    `claude_version: "${sessionMeta.version || 'unknown'}"`,
+    '---',
+    ''
+  ].join('\n');
+
+  const fullContent = frontmatter + content;
+
+  const targetDir = path.dirname(targetPath);
+  if (!fs.existsSync(targetDir)) {
+    fs.mkdirSync(targetDir, { recursive: true });
+  }
+
+  fs.writeFileSync(targetPath, fullContent, 'utf8');
+  return targetPath;
+}
+
 // Helper: Run agy process
 function executeAgy(args, options = {}) {
   const timeoutMinutes = options.timeoutMinutes || 15;
@@ -705,7 +1019,17 @@ function executeAgy(args, options = {}) {
     let stderr = '';
     let killed = false;
 
-    process.stderr.write(`[antigravity-mcp] Spawning: ${AGY_BIN} ${finalArgs.map(a => (a.includes(' ') ? `"${a}"` : a)).join(' ')} (cwd: ${cwd}, timeout: ${timeoutMinutes}m)\n`);
+    const safeArgsForLogging = [];
+    for (let i = 0; i < finalArgs.length; i++) {
+      if (finalArgs[i] === '-p' && i + 1 < finalArgs.length) {
+        safeArgsForLogging.push('-p', '"[PROMPT REDACTED]"');
+        i++;
+      } else {
+        safeArgsForLogging.push(finalArgs[i].includes(' ') ? `"${finalArgs[i]}"` : finalArgs[i]);
+      }
+    }
+
+    process.stderr.write(`[antigravity-mcp] Spawning: ${AGY_BIN} ${safeArgsForLogging.join(' ')} (cwd: ${cwd}, timeout: ${timeoutMinutes}m)\n`);
 
     const child = spawn(AGY_BIN, finalArgs, {
       cwd,
@@ -818,7 +1142,7 @@ async function handleToolCall(name, args) {
       out += `- Quota / API Health: **${usageData.quota_status}**\n\n`;
 
       out += `**📈 Cumulative Session Usage:**\n`;
-      out += `- Total Delegated Calls: **${s.total_calls}** (run: ${s.calls_by_tool.run || 0}, plan: ${s.calls_by_tool.plan || 0}, review: ${s.calls_by_tool.review || 0}, audit: ${s.calls_by_tool.audit || 0})\n`;
+      out += `- Total Delegated Calls: **${s.total_calls}** (run: ${s.calls_by_tool.run || 0}, plan: ${s.calls_by_tool.plan || 0}, review: ${s.calls_by_tool.review || 0}, audit: ${s.calls_by_tool.audit || 0}, summary: ${s.calls_by_tool.summary || 0})\n`;
       out += `- Input Tokens: \`${formatTokens(s.input_tokens)}\`\n`;
       out += `- Output Tokens: \`${formatTokens(s.output_tokens)}\`\n`;
       out += `- Thinking / Reasoning Tokens: \`${formatTokens(s.thinking_tokens)}\`\n`;
@@ -856,10 +1180,10 @@ async function handleToolCall(name, args) {
     case 'agy_status': {
       let version = 'unknown';
       try {
-        version = execSync(`"${AGY_BIN}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+        version = execFileSync(AGY_BIN, ['--version'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
       } catch {
         try {
-          version = execSync(`"${AGY_BIN}" help`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).split('\n')[0].trim();
+          version = execFileSync(AGY_BIN, ['help'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).split('\n')[0].trim();
         } catch {}
       }
 
@@ -1225,6 +1549,155 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       let formatted = `### Antigravity Code Review (Effort: ${effectiveEffort}${effectiveModel ? `, Model: ${effectiveModel}` : ''}, Mode: read-only)\n\n${responseText.trim()}\n\n---\n`;
       if (conversationId) {
         formatted += `Conversation ID: \`${conversationId}\` (pass as \`conversation_id\` to follow up on this review)`;
+      }
+
+      return {
+        content: [{ type: 'text', text: formatted }]
+      };
+    }
+
+    case 'agy_session_summary': {
+      const cwd = args.cwd || process.cwd();
+
+      // 1. Discover the session log directory
+      const logDir = getProjectLogDir(cwd);
+      if (!logDir) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `Could not find Claude Code session logs for project: ${cwd}\n\nExpected location: ~/.claude/projects/<encoded-project-path>/\nMake sure you're running this from within a project that has active Claude Code sessions.`
+          }]
+        };
+      }
+
+      // 2. Find the specific session file
+      const sessionFile = findSessionFile(logDir, args.session_id);
+      if (!sessionFile) {
+        const hint = args.session_id
+          ? `Session ID "${args.session_id}" not found in ${logDir}`
+          : `No .jsonl session files found in ${logDir}`;
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `Could not find session log file.\n${hint}\n\nAvailable sessions:\n${
+              fs.readdirSync(logDir)
+                .filter(f => f.endsWith('.jsonl'))
+                .slice(0, 10)
+                .map(f => `  - ${f.replace('.jsonl', '')}`)
+                .join('\n') || '  (none)'
+            }`
+          }]
+        };
+      }
+
+      // 3. Extract session ID from filename
+      const sessionId = path.basename(sessionFile, '.jsonl');
+      const fileSize = fs.statSync(sessionFile).size;
+
+      process.stderr.write(`[antigravity-mcp] Session summary: processing ${sessionFile} (${(fileSize / 1024).toFixed(1)}KB)\n`);
+
+      // 4. Pre-process the JSONL
+      let processed;
+      try {
+        processed = preprocessSessionLog(sessionFile);
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `Error reading session log: ${err.message}\n\nFile: ${sessionFile} (${(fileSize / 1024).toFixed(1)}KB)`
+          }]
+        };
+      }
+
+      if (!processed.transcript || processed.totalTurns === 0) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `Session log appears empty or contains no processable turns.\n\nFile: ${sessionFile}\nTotal lines parsed: ${processed.totalTurns}`
+          }]
+        };
+      }
+
+      process.stderr.write(`[antigravity-mcp] Pre-processed: ${processed.totalTurns} turns, ${(processed.transcript.length / 1024).toFixed(1)}KB transcript\n`);
+
+      // 5. Build the summarization prompt
+      const focus = args.focus || 'full';
+      const summarySystemPrompt = getSummaryPrompt(focus);
+      const fullPrompt = `${summarySystemPrompt}\n\n---\n\n## Session Metadata\n- Project: ${processed.sessionMeta.cwd || cwd}\n- Branch: ${processed.sessionMeta.branch || 'unknown'}\n- Claude Version: ${processed.sessionMeta.version || 'unknown'}\n- Session Start: ${processed.sessionMeta.startTime || 'unknown'}\n- Session End: ${processed.sessionMeta.endTime || 'unknown'}\n- Total Turns: ${processed.totalTurns}\n- Log File Size: ${(fileSize / 1024).toFixed(1)}KB\n\n---\n\n## Session Transcript\n\n${processed.transcript}`;
+
+      // 6. Delegate to agy for summarization
+      const effectiveEffort = args.effort || config.defaultEffort || 'high';
+      const effectiveModel = args.model || config.defaultModel;
+
+      const cliArgs = [
+        '--output-format', 'json',
+        '--dangerously-skip-permissions',
+        '--mode', 'plan',
+        '--effort', effectiveEffort
+      ];
+
+      if (effectiveModel) {
+        cliArgs.push('--model', effectiveModel);
+      }
+
+      cliArgs.push('-p', fullPrompt);
+
+      const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
+      const result = await executeAgy(cliArgs, {
+        cwd,
+        timeoutMinutes: timeoutMin
+      });
+
+      const resData = result.data || {};
+      const conversationId = resData.conversation_id || '';
+      const duration = resData.duration_seconds || 0;
+
+      if (resData.usage) {
+        recordUsage('summary', effectiveModel, effectiveEffort, conversationId, duration, resData.usage, !result.success, result.error || '');
+      }
+
+      if (!result.success) {
+        let errText = `Error generating session summary with Antigravity:\n${result.error}`;
+        if (conversationId) {
+          errText += `\n\nConversation ID: \`${conversationId}\``;
+        }
+        return {
+          isError: true,
+          content: [{ type: 'text', text: errText }]
+        };
+      }
+
+      // 7. Save the summary document
+      const responseText = resData.response || result.rawOutput || '';
+      let savedPath;
+      try {
+        savedPath = saveSummary(responseText, sessionId, processed.sessionMeta, args.output_path, cwd);
+      } catch (err) {
+        // Summary generated but couldn't save — still return it
+        return {
+          content: [{
+            type: 'text',
+            text: `### 📋 Session Summary\n\n${responseText.trim()}\n\n---\n⚠️ Could not save summary file: ${err.message}\n\nSession: \`${sessionId}\` | Turns: ${processed.totalTurns} | Focus: ${focus}`
+          }]
+        };
+      }
+
+      // 8. Return the summary
+      let formatted = `### 📋 Session Summary\n\n${responseText.trim()}\n\n---\n`;
+      formatted += `**Summary Details:**\n`;
+      formatted += `- Session: \`${sessionId}\`\n`;
+      formatted += `- Source: \`${sessionFile}\` (${(fileSize / 1024).toFixed(1)}KB)\n`;
+      formatted += `- Turns Processed: ${processed.totalTurns}\n`;
+      formatted += `- Focus: \`${focus}\`\n`;
+      formatted += `- Saved to: \`${savedPath}\`\n`;
+      if (effectiveModel) formatted += `- Model: \`${effectiveModel}\`\n`;
+      formatted += `- Duration: ${duration ? `${duration.toFixed(1)}s` : 'unknown'}\n`;
+      if (conversationId) {
+        formatted += `- Conversation ID: \`${conversationId}\`\n`;
       }
 
       return {

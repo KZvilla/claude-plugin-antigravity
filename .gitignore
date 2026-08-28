@@ -4,3 +4,19 @@ node_modules/
 Thumbs.db
 SESSION-SUMMARY.md
 *.local.md
+
+# Security & Secrets (Standard §11.1)
+.env
+.env.*
+*.key
+*.pem
+*.cert
+*.crt
+*.pfx
+*.p12
+
+# Local configs & telemetry
+.claude/antigravity.json
+antigravity.json
+antigravity-usage.json
+antigravity-sessions.json
