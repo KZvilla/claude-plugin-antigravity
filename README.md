@@ -32,13 +32,13 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 
 **1. Install** (one command):
 
+**Windows (PowerShell):**
 ```powershell
-# Windows PowerShell
 irm https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.ps1 | iex
 ```
 
+**Linux / macOS (Bash):**
 ```bash
-# Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.sh | bash
 ```
 
@@ -213,13 +213,15 @@ Ask Claude naturally:
 
 ### 3. Environment Variables
 
-```bash
-# Windows PowerShell
+**Windows (PowerShell):**
+```powershell
 $env:AGY_MODEL = "gemini-3.7-flash"
 $env:AGY_EFFORT = "high"
 $env:AGY_TIMEOUT_MINUTES = "20"
+```
 
-# Bash / Zsh
+**Linux / macOS (Bash / Zsh):**
+```bash
 export AGY_MODEL="gemini-3.7-flash"
 export AGY_EFFORT="high"
 export AGY_TIMEOUT_MINUTES="20"
@@ -325,11 +327,13 @@ git clone https://github.com/KZvilla/claude-plugin-antigravity.git "$HOME/.claud
 
 ### Post-Install
 
-```bash
-# Reload in an active Claude Code session
+In an active Claude Code session:
+```text
 /reload-plugins
+```
 
-# Verify installation
+Verify installation in your terminal:
+```bash
 claude plugin details antigravity@skills-dir
 ```
 
