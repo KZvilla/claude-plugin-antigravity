@@ -324,6 +324,15 @@ The plugin detects available voices installed in your local Voicebox (`http://12
 
 If Voicebox is offline or unreachable, the plugin returns a friendly diagnostic notification without failing your development session.
 
+### 🎭 Enriquecer la Personalidad desde Voicebox (Sin tocar código)
+
+La naturalidad y el estilo de la narración en personaje se adaptan automáticamente según cómo completes la ficha de cada voz en la interfaz de Voicebox:
+
+- **`description`**: Describe la identidad, acento o tono (ej: *"Comediante uruguayo de internet con voz rasposa"* o *"Locutor profesional español"*).
+- **`personality`**: Define modismos, actitud y muletillas (ej: *"Humor bizarro e irreverente, usa modismos como '¡Sapeee!', 'más bien loquita', festejando con euforia si los tests pasaron"*).
+
+Gemini (`agy`) lee estos campos dinámicamente en tiempo real desde la API de Voicebox. Al activar el modo personaje (con `/agy-narrate <voz> personality` o pidiéndoselo a Claude), el guión adoptará ese personaje manteniendo siempre la veracidad técnica sobre los archivos y tests del proyecto.
+
 ---
 
 ## 🌐 Deep Web Research (`/agy-research`)

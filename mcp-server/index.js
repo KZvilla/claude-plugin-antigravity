@@ -654,6 +654,10 @@ const TOOLS = [
           type: 'string',
           enum: ['low', 'medium', 'high'],
           description: 'Reasoning effort level for narration script generation. Defaults to "low" for near-instant speech generation.'
+        },
+        personality: {
+          type: 'boolean',
+          description: 'When true, adopts the persona and personality configured on the Voicebox profile (from profile.description and profile.personality). Defaults to false (neutral professional tone).'
         }
       }
     }
@@ -1384,9 +1388,10 @@ function extractLastCheckpoint(filePath) {
   };
 }
 
-function getNarrationPrompt(checkpoint, targetLang, profileName) {
+function getNarrationPrompt(checkpoint, targetLang, profile, enablePersonality = false) {
   const langName = targetLang === 'en' ? 'English' : 'Spanish';
   const langCode = targetLang === 'en' ? 'en' : 'es';
+  const profileName = (profile && profile.name) || 'Voice Assistant';
 
   let testSummary = 'No tests executed in this checkpoint.';
   if (checkpoint.overallTestStatus === 'PASSED') {
@@ -1399,8 +1404,20 @@ function getNarrationPrompt(checkpoint, targetLang, profileName) {
     ? checkpoint.filesModified.map(f => path.basename(f)).slice(0, 5).join(', ')
     : 'no files explicitly modified';
 
+  let personaSection = '';
+  if (enablePersonality && profile) {
+    personaSection = `\n## Speaker Persona (Derived from Voicebox Profile):
+- Name: "${profile.name}"
+- Description: "${profile.description || 'Voice Assistant'}"
+- Personality Prompt: "${profile.personality || 'Natural and expressive'}"
+
+Persona Instructions:
+Adopt the authentic tone, humor, vocabulary, cadence, and characteristic mannerisms of the specified speaker persona naturally, but remain strictly accurate regarding the technical checkpoint facts (files modified and test results).`;
+  }
+
   return `You are a voice assistant narrator creating a spoken status update for a software engineer.
 Generate a concise, natural, and conversational spoken narration (exactly 2 to 3 sentences) in ${langName} (${langCode}) to be spoken by Voicebox TTS (profile: ${profileName}).
+${personaSection}
 
 ## Checkpoint Context:
 - User's Goal: "${checkpoint.userGoal.slice(0, 300)}"
@@ -2189,7 +2206,8 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       }
 
       // 5. Generate conversational spoken narration script via agy (Gemini)
-      const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile.name);
+      const enablePersonality = Boolean(args.personality);
+      const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile, enablePersonality);
       const effectiveEffort = args.effort || 'low';
       const effectiveModel = args.model || config.defaultModel;
 
@@ -2269,6 +2287,7 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       out += `**Detalles de la emisión:**\n`;
       out += `- **Perfil de voz**: \`${chosenProfile.name}\` (${chosenProfile.voice_type || 'cloned'})${fallbackNotice}\n`;
       out += `- **Idioma**: \`${langLabel} (${targetLang})\`\n`;
+      out += `- **Modo de Personalidad**: ${enablePersonality ? `🎭 En personaje (\`${chosenProfile.personality || chosenProfile.description || 'expresivo'}\`)` : '👔 Neutral / Profesional'}\n`;
       out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
       if (speakRes && speakRes.id) {
         out += `- **Voicebox Generation ID**: \`${speakRes.id}\`\n`;
