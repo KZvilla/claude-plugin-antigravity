@@ -20,6 +20,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Installation](#-installation--setup)
 - [Slash Commands](#-slash-commands)
 - [MCP Tools Reference](#-mcp-tools-reference)
+- [Voice Checkpoint Narration](#-voice-checkpoint-narration-agy-narrate)
 - [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-agy-summary)
 - [Permissions (ALLOW / DENY)](#-granular-permissions-system-allow--deny)
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
@@ -63,6 +64,10 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 ```
 
 ```text
+/agy-narrate
+```
+
+```text
 /agy-research "Latest patterns for Claude Code plugins in 2026"
 ```
 
@@ -78,6 +83,7 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 |---|---------|-------------|
 | 🤖 | **Autonomous Subagent** | Claude spins up Antigravity to execute complex tasks, multi-step refactors, and test suites |
 | 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (2.5 / 3.7 Pro & Flash) with configurable reasoning effort |
+| 🎙️ | **Voice Checkpoint Narration** | Zero-Claude-token spoken status updates via Voicebox TTS with automatic profile fallback |
 | 📋 | **Anti-Compaction Session Summary** | Analyzes raw JSONL session logs with Gemini (1M-2M context) to generate persistent, structured Markdown docs before context degrades |
 | 🌐 | **Cited Web Research** | Leverages Antigravity's native web search and synthesis capabilities that Claude Code lacks out of the box |
 | 🛡️ | **Granular Permissions** | ALLOW / DENY capabilities, forbidden paths, forbidden commands, and sandbox isolation |
@@ -109,16 +115,18 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 | `/agy-review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
 | `/agy-audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
 | `/agy-summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
+| `/agy-narrate [voice/lang]` | Narrate spoken voice summary of the latest task/checkpoint via Voicebox TTS (`emily`, `diego`, `es`, `en`) |
+| `/agy-narrate-voices [lang]` | List all installed Voicebox voice profiles, languages, roles, and service health |
 | `/agy-research <topic>` | Conduct deep web research with cited sources and structured insights |
 | `/agy-usage` | Display token telemetry, context saturation, and quota health |
 
-> **Tip:** You can also ask Claude naturally — *"Delegale a agy que resuma esta sesión"* o *"Hacé un research web con agy sobre X"* — and it will pick the right tool automatically.
+> **Tip:** You can also ask Claude naturally — *"Delegale a agy que resuma esta sesión"*, *"¿Qué voces tengo disponibles?"* o *"Cuando termines, ejecuta la narración con Diego"* — and it will pick the right tool automatically.
 
 ---
 
 ## 🔧 MCP Tools Reference
 
-Seven tools exposed via the MCP server:
+Ten tools exposed via the MCP server:
 
 | Tool | Mode | Default Timeout | Description |
 |------|------|-----------------|-------------|
@@ -127,6 +135,8 @@ Seven tools exposed via the MCP server:
 | `agy_review` | read-only | 20m | Adversarial code review on git diffs or specific files |
 | `agy_audit` | read-only | 25m | Rigorous adversarial audit with severity rubric (BLOCKER, MAJOR, MINOR) |
 | `agy_session_summary` | read-only | 15m | Parse session JSONL and generate structured summary doc with Gemini |
+| `agy_narrate` | audio TTS | 3m | Spoken audio update of latest checkpoint via Voicebox (zero Claude tokens) |
+| `agy_narrate_voices` | read-only | — | List installed Voicebox voice profiles, languages, roles, and GPU health |
 | `agy_usage` | — | — | Session token telemetry, context window saturation, model limits, quota health |
 | `agy_status` | — | — | Binary path, CLI version, active model/effort defaults, permission policies |
 | `agy_set_config` | — | — | Persist model, effort, timeout, or permission preferences |
@@ -273,6 +283,49 @@ Summaries are automatically saved to `~/.claude/session-summaries/<YYYY-MM-DD>-<
 
 ---
 
+## 🎙️ Voice Checkpoint Narration (`/agy-narrate`)
+
+Narrate a spoken audio status update upon completing a task or checkpoint via **Voicebox Text-To-Speech (TTS)**.
+
+### Zero-Claude-Token Architecture
+Claude **does not** generate or summarize the text in its context window. Instead:
+1. Claude simply invokes `/agy-narrate` (or the `agy_narrate` tool).
+2. The plugin locates Claude Code's session log (`.jsonl`), extracts the latest task checkpoint (user goal, modified files, and final test execution status).
+3. The plugin invokes Gemini CLI (`agy`) with `--effort low` to draft a concise 2-3 sentence conversational spoken script in ~1-2 seconds (using Gemini quota, **0 Claude tokens**).
+4. The plugin sends the text directly to Voicebox HTTP (`POST /speak`), playing the audio out loud on your speakers.
+
+### Usage
+
+```text
+/agy-narrate
+```
+
+With specific voice or language preference:
+```text
+/agy-narrate emily       # English narration with Emily voice
+/agy-narrate diego       # Spanish narration with Diego Alvarez voice
+/agy-narrate en          # English narration (defaults to Emily)
+/agy-narrate es          # Spanish narration (defaults to Diego Alvarez)
+```
+
+Or ask Claude conversationally:
+> *"Cuando termines de implementar las pruebas, ejecuta la narración con Diego"*
+> *"Narra el último checkpoint con Emily en inglés"*
+
+### Voicebox Detection & Automatic Fallback Hierarchy
+The plugin detects available voices installed in your local Voicebox (`http://127.0.0.1:17493` by default):
+
+- **Spanish (`es`)**:
+  - Preferred: `Diego Alvarez`
+  - Fallback: `Isabel` $\rightarrow$ `Ono Anna` $\rightarrow$ First installed Spanish profile
+- **English (`en`)**:
+  - Preferred: `Emily`
+  - Fallback: `Aria` $\rightarrow$ `Aiden` $\rightarrow$ First installed English profile
+
+If Voicebox is offline or unreachable, the plugin returns a friendly diagnostic notification without failing your development session.
+
+---
+
 ## 🌐 Deep Web Research (`/agy-research`)
 
 Delegate deep web research and live doc searches directly to Antigravity, which leverages Gemini's native search tools and Vertex AI:
@@ -289,7 +342,7 @@ Returns a structured report with an Executive Summary, Key Findings, Cited Sourc
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (8 tools) |
+| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (10 tools) |
 | **Subagent** | `agents/antigravity.md` | Autonomous subagent definition (`antigravity:Antigravity`) |
 | **Skills** | `skills/antigravity/SKILL.md` | Context-aware delegation guidelines |
 | | `skills/adversarial-review/SKILL.md` | Skeptical, evidence-based audit guidelines |
@@ -299,6 +352,8 @@ Returns a structured report with an Executive Summary, Key Findings, Cited Sourc
 | | `commands/agy-review.md` | `/agy-review [target]` |
 | | `commands/agy-audit.md` | `/agy-audit [target]` |
 | | `commands/agy-summary.md` | `/agy-summary [focus]` |
+| | `commands/agy-narrate.md` | `/agy-narrate [voice/lang]` |
+| | `commands/agy-narrate-voices.md` | `/agy-narrate-voices [lang]` |
 | | `commands/agy-research.md` | `/agy-research <topic>` |
 | | `commands/agy-usage.md` | `/agy-usage` |
 | **Installers** | `install.ps1` / `install.sh` | 1-command install for all platforms |

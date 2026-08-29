@@ -11,6 +11,7 @@ const { spawn, execFileSync } = require('node:child_process');
 const readline = require('node:readline');
 const path = require('node:path');
 const fs = require('node:fs');
+const http = require('node:http');
 
 // Resolve agy binary location
 function resolveAgyBin() {
@@ -46,6 +47,8 @@ function loadConfig(cwd = process.cwd()) {
     defaultModel: process.env.AGY_MODEL || null,
     defaultEffort: process.env.AGY_EFFORT || 'high',
     defaultTimeoutMinutes: parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
+    voiceboxUrl: process.env.VOICEBOX_URL || null,
+    voiceboxPort: parseInt(process.env.VOICEBOX_PORT, 10) || null,
     permissions: {
       allow: ['read', 'edit', 'commands', 'network'],
       deny: [],
@@ -66,6 +69,8 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.model) config.defaultModel = parsed.model;
       if (parsed.effort) config.defaultEffort = parsed.effort;
       if (parsed.timeout_minutes) config.defaultTimeoutMinutes = parsed.timeout_minutes;
+      if (parsed.voicebox_url) config.voiceboxUrl = parsed.voicebox_url;
+      if (parsed.voicebox_port) config.voiceboxPort = parsed.voicebox_port;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -79,6 +84,8 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.model) config.defaultModel = parsed.model;
       if (parsed.effort) config.defaultEffort = parsed.effort;
       if (parsed.timeout_minutes) config.defaultTimeoutMinutes = parsed.timeout_minutes;
+      if (parsed.voicebox_url) config.voiceboxUrl = parsed.voicebox_url;
+      if (parsed.voicebox_port) config.voiceboxPort = parsed.voicebox_port;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -108,6 +115,8 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
   if (updates.model !== undefined) existing.model = updates.model;
   if (updates.effort !== undefined) existing.effort = updates.effort;
   if (updates.timeout_minutes !== undefined) existing.timeout_minutes = updates.timeout_minutes;
+  if (updates.voicebox_url !== undefined) existing.voicebox_url = updates.voicebox_url;
+  if (updates.voicebox_port !== undefined) existing.voicebox_port = updates.voicebox_port;
   if (updates.permissions !== undefined) {
     existing.permissions = {
       ...(existing.permissions || {}),
@@ -133,7 +142,7 @@ function loadUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, summary: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, summary: 0, narrate: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -229,7 +238,7 @@ function resetUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, summary: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, summary: 0, narrate: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -602,6 +611,71 @@ const TOOLS = [
         timeout_minutes: {
           type: 'number',
           description: 'Timeout in minutes. Defaults to 15.'
+        }
+      }
+    }
+  },
+  {
+    name: 'agy_narrate',
+    description: 'Narrate a voice summary of the latest completed checkpoint or task via Voicebox Text-To-Speech. Zero-Claude-token architecture: extracts checkpoint details directly from Claude Code session logs, generates a concise 2-3 sentence conversational update using Gemini (agy), and plays audio locally on your speakers via Voicebox.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        voice: {
+          type: 'string',
+          description: 'Voice profile name or keyword (e.g. "Emily", "Diego Alvarez", "Isabel", "Aria", "Aiden"). Defaults to "Emily" for English and "Diego Alvarez" for Spanish.'
+        },
+        language: {
+          type: 'string',
+          enum: ['en', 'es'],
+          description: 'Spoken language ("es" or "en"). Automatically inferred from voice name if omitted.'
+        },
+        voicebox_url: {
+          type: 'string',
+          description: 'Custom Voicebox HTTP endpoint URL (defaults to configured URL or http://127.0.0.1:17493).'
+        },
+        voicebox_port: {
+          type: 'number',
+          description: 'Custom Voicebox port number if running on a non-default port.'
+        },
+        session_id: {
+          type: 'string',
+          description: 'Optional Claude Code session ID to summarize. Defaults to the current/most recent session.'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project working directory.'
+        },
+        model: {
+          type: 'string',
+          description: 'Model override for Gemini narration generation (defaults to fast gemini-3.7-flash).'
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'Reasoning effort level for narration script generation. Defaults to "low" for near-instant speech generation.'
+        }
+      }
+    }
+  },
+  {
+    name: 'agy_narrate_voices',
+    description: 'List and inspect available voice profiles in local Voicebox with their language, voice type (cloned vs preset), personality status, and default/fallback role assignments in Antigravity.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        language: {
+          type: 'string',
+          enum: ['all', 'es', 'en'],
+          description: 'Filter profiles by language ("es", "en", or "all"). Defaults to "all".'
+        },
+        voicebox_url: {
+          type: 'string',
+          description: 'Custom Voicebox HTTP endpoint URL (defaults to configured URL or http://127.0.0.1:17493).'
+        },
+        voicebox_port: {
+          type: 'number',
+          description: 'Custom Voicebox port number if running on a non-default port.'
         }
       }
     }
@@ -1001,6 +1075,347 @@ function saveSummary(content, sessionId, sessionMeta, outputPath, cwd = process.
 
   fs.writeFileSync(targetPath, fullContent, 'utf8');
   return targetPath;
+}
+
+// Voicebox HTTP Client & Checkpoint Helpers
+function httpRequest(urlStr, options = {}, postData = null) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(urlStr);
+    const reqOptions = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 80,
+      path: parsedUrl.pathname + (parsedUrl.search || ''),
+      method: options.method || (postData ? 'POST' : 'GET'),
+      headers: {
+        'X-Voicebox-Client-Id': 'claude-code',
+        ...(options.headers || {})
+      },
+      timeout: options.timeout || 3500
+    };
+
+    const req = http.request(reqOptions, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        resolve({
+          statusCode: res.statusCode,
+          headers: res.headers,
+          body: data
+        });
+      });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`Connection timed out after ${options.timeout || 3500}ms`));
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    if (postData) {
+      const payload = typeof postData === 'string' ? postData : JSON.stringify(postData);
+      req.write(payload);
+    }
+    req.end();
+  });
+}
+
+function resolveVoiceboxUrl(args = {}, config = {}) {
+  if (args.voicebox_url) return args.voicebox_url.replace(/\/+$/, '');
+  if (config.voiceboxUrl) return config.voiceboxUrl.replace(/\/+$/, '');
+  if (process.env.VOICEBOX_URL) return process.env.VOICEBOX_URL.replace(/\/+$/, '');
+
+  const port = args.voicebox_port || config.voiceboxPort || process.env.VOICEBOX_PORT || 17493;
+  return `http://127.0.0.1:${port}`;
+}
+
+async function checkVoiceboxHealth(baseUrl) {
+  try {
+    const res = await httpRequest(`${baseUrl}/health`, { timeout: 3000 });
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      let info = {};
+      try { info = JSON.parse(res.body); } catch {}
+      return { ok: true, info };
+    }
+    return { ok: false, error: `Voicebox health endpoint returned HTTP ${res.statusCode}: ${res.body.slice(0, 150)}` };
+  } catch (err) {
+    return { ok: false, error: `Cannot reach Voicebox at ${baseUrl} (${err.message})` };
+  }
+}
+
+async function getVoiceboxProfiles(baseUrl) {
+  const res = await httpRequest(`${baseUrl}/profiles`, { timeout: 4000 });
+  if (res.statusCode >= 200 && res.statusCode < 300) {
+    return JSON.parse(res.body);
+  }
+  throw new Error(`Failed to fetch Voicebox profiles: HTTP ${res.statusCode}`);
+}
+
+function resolveVoiceProfile(profiles, requestedVoice, requestedLang) {
+  if (!Array.isArray(profiles) || profiles.length === 0) {
+    throw new Error('No voice profiles found in Voicebox.');
+  }
+
+  const voiceStr = (requestedVoice || '').trim().toLowerCase();
+  let lang = (requestedLang || '').trim().toLowerCase();
+  if (lang.startsWith('en')) lang = 'en';
+  else if (lang.startsWith('es')) lang = 'es';
+  else if (lang) lang = '';
+
+  // 1. Exact or partial match by profile name first (inherits profile language dynamically)
+  if (voiceStr) {
+    const exact = profiles.find(p => p.name.toLowerCase() === voiceStr);
+    if (exact) {
+      const pLang = (exact.language || '').toLowerCase().slice(0, 2);
+      const effectiveLang = lang || (['en', 'es'].includes(pLang) ? pLang : 'es');
+      return { profile: exact, isFallback: false, reason: 'exact_name_match', language: effectiveLang };
+    }
+    const partial = profiles.find(p => p.name.toLowerCase().includes(voiceStr));
+    if (partial) {
+      const pLang = (partial.language || '').toLowerCase().slice(0, 2);
+      const effectiveLang = lang || (['en', 'es'].includes(pLang) ? pLang : 'es');
+      return { profile: partial, isFallback: false, reason: 'partial_name_match', language: effectiveLang };
+    }
+  }
+
+  // 2. Detect language from voice keyword if not matched and no explicit language
+  if (voiceStr && !lang) {
+    if (['emily', 'aria', 'aiden'].some(k => voiceStr.includes(k))) {
+      lang = 'en';
+    } else if (['diego', 'alvarez', 'isabel', 'anna', 'ono'].some(k => voiceStr.includes(k))) {
+      lang = 'es';
+    }
+  }
+
+  if (!lang) lang = 'es';
+
+  // 3. Fallbacks
+  if (lang === 'en') {
+    const emily = profiles.find(p => p.name.toLowerCase() === 'emily');
+    if (emily && (!voiceStr || voiceStr.includes('emily'))) {
+      return { profile: emily, isFallback: false, reason: 'default_english_voice', language: 'en' };
+    }
+    const aria = profiles.find(p => p.name.toLowerCase() === 'aria');
+    if (aria) return { profile: aria, isFallback: true, reason: 'fallback_english_aria', language: 'en' };
+
+    const aiden = profiles.find(p => p.name.toLowerCase() === 'aiden');
+    if (aiden) return { profile: aiden, isFallback: true, reason: 'fallback_english_aiden', language: 'en' };
+
+    const anyEn = profiles.find(p => (p.language || '').toLowerCase().startsWith('en'));
+    if (anyEn) return { profile: anyEn, isFallback: true, reason: 'fallback_any_english', language: 'en' };
+  } else {
+    const diego = profiles.find(p => p.name.toLowerCase().includes('diego'));
+    if (diego && (!voiceStr || voiceStr.includes('diego'))) {
+      return { profile: diego, isFallback: false, reason: 'default_spanish_voice', language: 'es' };
+    }
+    const isabel = profiles.find(p => p.name.toLowerCase() === 'isabel');
+    if (isabel) return { profile: isabel, isFallback: true, reason: 'fallback_spanish_isabel', language: 'es' };
+
+    const anna = profiles.find(p => p.name.toLowerCase().includes('anna') || p.name.toLowerCase().includes('ono'));
+    if (anna) return { profile: anna, isFallback: true, reason: 'fallback_spanish_anna', language: 'es' };
+
+    const anyEs = profiles.find(p => (p.language || '').toLowerCase().startsWith('es'));
+    if (anyEs) return { profile: anyEs, isFallback: true, reason: 'fallback_any_spanish', language: 'es' };
+  }
+
+  return { profile: profiles[0], isFallback: true, reason: 'fallback_first_available', language: lang };
+}
+
+async function sendVoiceboxSpeak(baseUrl, text, profileName, language) {
+  const postData = {
+    text,
+    profile: profileName,
+    language
+  };
+  const res = await httpRequest(`${baseUrl}/speak`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 10000
+  }, postData);
+
+  if (res.statusCode >= 200 && res.statusCode < 300) {
+    try {
+      return JSON.parse(res.body);
+    } catch {
+      return { status: 'generating', raw: res.body };
+    }
+  }
+  throw new Error(`Voicebox /speak returned HTTP ${res.statusCode}: ${res.body}`);
+}
+
+function extractLastCheckpoint(filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Session log file not found: ${filePath}`);
+  }
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  const lines = content.split('\n').filter(l => l.trim());
+
+  function isRealUserMessage(obj) {
+    if (obj.type !== 'user' || obj.isMeta) return false;
+    const c = obj.message?.content;
+    if (!c) return false;
+    if (Array.isArray(c)) {
+      if (c.some(item => item.type === 'tool_result')) return false;
+      return c.some(item => item.type === 'text' && item.text && item.text.trim());
+    }
+    return typeof c === 'string' && c.trim().length > 0;
+  }
+
+  function getUserText(obj) {
+    const c = obj.message?.content;
+    if (typeof c === 'string') return c.trim();
+    if (Array.isArray(c)) {
+      return c.filter(item => item.type === 'text').map(item => item.text || '').join(' ').trim();
+    }
+    return '';
+  }
+
+  const userMessages = [];
+  for (let i = 0; i < lines.length; i++) {
+    try {
+      const obj = JSON.parse(lines[i]);
+      if (isRealUserMessage(obj)) {
+        userMessages.push({ lineIndex: i, text: getUserText(obj), ts: obj.timestamp });
+      }
+    } catch {}
+  }
+
+  if (userMessages.length === 0) {
+    return {
+      userGoal: 'General development task',
+      filesModified: [],
+      commandsCount: 0,
+      testExecutions: [],
+      overallTestStatus: 'NO_TESTS',
+      assistantNotes: ''
+    };
+  }
+
+  let targetUserMsg = userMessages[userMessages.length - 1];
+  const isOnlyNarrationCommand = targetUserMsg.text.startsWith('/agy-narrate') ||
+    (targetUserMsg.text.length < 50 && (targetUserMsg.text.toLowerCase().includes('narra') || targetUserMsg.text.toLowerCase().includes('narrat')));
+
+  if (isOnlyNarrationCommand && userMessages.length > 1) {
+    targetUserMsg = userMessages[userMessages.length - 2];
+  }
+
+  const startLineIndex = targetUserMsg.lineIndex;
+  const checkpointLines = lines.slice(startLineIndex);
+
+  const filesModified = new Set();
+  const commandsRun = [];
+  const toolResults = new Map();
+  let latestAssistantText = '';
+
+  for (const line of checkpointLines) {
+    let obj;
+    try { obj = JSON.parse(line); } catch { continue; }
+
+    if (obj.type === 'assistant' && obj.message?.content) {
+      for (const item of obj.message.content) {
+        if (item.type === 'tool_use') {
+          const name = item.name || '';
+          const inp = item.input || {};
+
+          if (['Edit', 'Write', 'NotebookEdit'].includes(name) && inp.file_path) {
+            filesModified.add(inp.file_path);
+          } else if (['write_to_file', 'replace_file_content'].includes(name) && inp.TargetFile) {
+            filesModified.add(inp.TargetFile);
+          }
+
+          if (name === 'Bash' || name === 'run_command') {
+            const cmd = inp.command || inp.CommandLine || '';
+            if (cmd) {
+              commandsRun.push({ id: item.id, command: cmd, ts: obj.timestamp });
+            }
+          }
+        } else if (item.type === 'text' && item.text && item.text.trim()) {
+          if (!item.text.includes('agy_narrate')) {
+            latestAssistantText = item.text.trim();
+          }
+        }
+      }
+    } else if (obj.type === 'user' && obj.message?.content) {
+      if (Array.isArray(obj.message.content)) {
+        for (const item of obj.message.content) {
+          if (item.type === 'tool_result' && item.tool_use_id) {
+            toolResults.set(item.tool_use_id, {
+              isError: Boolean(item.is_error),
+              content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const testKeywords = ['test', 'pytest', 'jest', 'vitest', 'cargo test', 'go test', 'npm test', 'npx test', 'ctest'];
+  const testExecutions = [];
+  for (const cmd of commandsRun) {
+    const lower = cmd.command.toLowerCase();
+    const isTest = testKeywords.some(kw => lower.includes(kw));
+    if (isTest) {
+      const res = toolResults.get(cmd.id);
+      const isFailed = res ? (res.isError || res.content.toLowerCase().includes('failed') || res.content.toLowerCase().includes('failing')) : false;
+      testExecutions.push({
+        command: cmd.command.slice(0, 120),
+        passed: res ? !isFailed : null,
+        outputSnippet: res ? res.content.slice(0, 200) : ''
+      });
+    }
+  }
+
+  let overallTestStatus = 'NO_TESTS';
+  if (testExecutions.length > 0) {
+    const lastTest = testExecutions[testExecutions.length - 1];
+    overallTestStatus = lastTest.passed === true ? 'PASSED' : (lastTest.passed === false ? 'FAILED' : 'PENDING');
+  }
+
+  return {
+    userGoal: targetUserMsg.text,
+    filesModified: Array.from(filesModified),
+    commandsCount: commandsRun.length,
+    testExecutions,
+    overallTestStatus,
+    assistantNotes: latestAssistantText.slice(0, 500)
+  };
+}
+
+function getNarrationPrompt(checkpoint, targetLang, profileName) {
+  const langName = targetLang === 'en' ? 'English' : 'Spanish';
+  const langCode = targetLang === 'en' ? 'en' : 'es';
+
+  let testSummary = 'No tests executed in this checkpoint.';
+  if (checkpoint.overallTestStatus === 'PASSED') {
+    testSummary = 'Tests were executed and PASSED successfully.';
+  } else if (checkpoint.overallTestStatus === 'FAILED') {
+    testSummary = 'Tests were executed and FAILED.';
+  }
+
+  const filesList = checkpoint.filesModified.length > 0
+    ? checkpoint.filesModified.map(f => path.basename(f)).slice(0, 5).join(', ')
+    : 'no files explicitly modified';
+
+  return `You are a voice assistant narrator creating a spoken status update for a software engineer.
+Generate a concise, natural, and conversational spoken narration (exactly 2 to 3 sentences) in ${langName} (${langCode}) to be spoken by Voicebox TTS (profile: ${profileName}).
+
+## Checkpoint Context:
+- User's Goal: "${checkpoint.userGoal.slice(0, 300)}"
+- Key Files Changed: ${filesList}
+- Tests Status: ${testSummary}
+- Assistant Context: "${checkpoint.assistantNotes.slice(0, 300) || 'Task completed'}"
+
+## Critical Audio Narration Rules:
+- Language MUST be ${langName}.
+- Keep it natural, conversational, and direct (between 25 and 45 words).
+- State clearly what was done, mention key component/file if relevant, and state the test outcome.
+- ABSOLUTELY NO MARKDOWN: no asterisks, no bullet points, no code blocks, no backticks, no brackets.
+- Do NOT spell symbols like "/", "\\", "_", or file extensions repeatedly unless natural (e.g. say "en el archivo de rutas" or "en index punto jota ese").
+- Do NOT include introductory filler like "Here is the summary" or quotation marks.
+- Output ONLY the plain text that will be spoken aloud.`;
 }
 
 // Helper: Run agy process
@@ -1702,6 +2117,249 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
 
       return {
         content: [{ type: 'text', text: formatted }]
+      };
+    }
+
+    case 'agy_narrate': {
+      const cwd = args.cwd || process.cwd();
+      const voiceboxUrl = resolveVoiceboxUrl(args, config);
+
+      // 1. Verify Voicebox connectivity
+      const health = await checkVoiceboxHealth(voiceboxUrl);
+      if (!health.ok) {
+        return {
+          content: [{
+            type: 'text',
+            text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}\n\n*Asegúrate de iniciar la aplicación Voicebox en tu equipo (o especifica un puerto/URL personalizado si corre en otra dirección).*`
+          }]
+        };
+      }
+
+      // 2. Fetch available voice profiles
+      let profiles = [];
+      try {
+        profiles = await getVoiceboxProfiles(voiceboxUrl);
+      } catch (err) {
+        return {
+          content: [{
+            type: 'text',
+            text: `⚠️ Error al consultar los perfiles de voz de Voicebox: ${err.message}`
+          }]
+        };
+      }
+
+      // 3. Resolve profile & language (with Emily / Diego Alvarez defaults & fallbacks)
+      let voiceResolution;
+      try {
+        voiceResolution = resolveVoiceProfile(profiles, args.voice, args.language);
+      } catch (err) {
+        return {
+          content: [{
+            type: 'text',
+            text: `⚠️ Error resolviendo el perfil de voz: ${err.message}`
+          }]
+        };
+      }
+
+      const chosenProfile = voiceResolution.profile;
+      const targetLang = voiceResolution.language;
+
+      // 4. Locate session log & extract last checkpoint
+      const logDir = getProjectLogDir(cwd);
+      let sessionFile = null;
+      if (logDir) {
+        sessionFile = findSessionFile(logDir, args.session_id);
+      }
+
+      let checkpoint = {
+        userGoal: 'Tarea de desarrollo completada',
+        filesModified: [],
+        commandsCount: 0,
+        testExecutions: [],
+        overallTestStatus: 'NO_TESTS',
+        assistantNotes: ''
+      };
+
+      if (sessionFile) {
+        try {
+          checkpoint = extractLastCheckpoint(sessionFile);
+        } catch (err) {
+          process.stderr.write(`[antigravity-mcp] Error extracting checkpoint: ${err.message}\n`);
+        }
+      }
+
+      // 5. Generate conversational spoken narration script via agy (Gemini)
+      const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile.name);
+      const effectiveEffort = args.effort || 'low';
+      const effectiveModel = args.model || config.defaultModel;
+
+      const cliArgs = [
+        '--output-format', 'json',
+        '--dangerously-skip-permissions',
+        '--mode', 'plan',
+        '--effort', effectiveEffort
+      ];
+
+      if (effectiveModel) {
+        cliArgs.push('--model', effectiveModel);
+      }
+
+      cliArgs.push('-p', narratePrompt);
+
+      const agyRes = await executeAgy(cliArgs, {
+        cwd,
+        timeoutMinutes: 3
+      });
+
+      const resData = agyRes.data || {};
+      const conversationId = resData.conversation_id || '';
+      const duration = resData.duration_seconds || 0;
+
+      if (resData.usage) {
+        recordUsage('narrate', effectiveModel, effectiveEffort, conversationId, duration, resData.usage, !agyRes.success, agyRes.error || '');
+      }
+
+      if (!agyRes.success) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `Error generando el guión de narración con Antigravity:\n${agyRes.error}`
+          }]
+        };
+      }
+
+      // Clean spoken text: remove quotes, markdown, asterisks, brackets
+      let spokenText = (resData.response || agyRes.rawOutput || '').trim();
+      spokenText = spokenText
+        .replace(/^["'“”«»]+|["'“”«»]+$/g, '')
+        .replace(/[*#`_~]/g, '')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .replace(/\n+/g, ' ')
+        .trim();
+
+      if (!spokenText) {
+        spokenText = targetLang === 'en'
+          ? 'The latest task has completed successfully.'
+          : 'La última tarea se ha completado exitosamente.';
+      }
+
+      // 6. Send to Voicebox TTS
+      let speakRes;
+      try {
+        speakRes = await sendVoiceboxSpeak(voiceboxUrl, spokenText, chosenProfile.name, targetLang);
+      } catch (err) {
+        return {
+          content: [{
+            type: 'text',
+            text: `⚠️ **Guión generado pero falló la emisión en Voicebox:**\n\n"${spokenText}"\n\nError: ${err.message}`
+          }]
+        };
+      }
+
+      // 7. Format structured output for Claude
+      const langLabel = targetLang === 'es' ? 'Español' : 'Inglés';
+      const fallbackNotice = voiceResolution.isFallback
+        ? ` *(Fallback: ${voiceResolution.reason})*`
+        : ' *(Voz preferida)*';
+
+      let out = `### 🎙️ Narración de Voz Emitida (Voicebox)\n\n`;
+      out += `**Texto narrado:**\n`;
+      out += `> "${spokenText}"\n\n`;
+      out += `**Detalles de la emisión:**\n`;
+      out += `- **Perfil de voz**: \`${chosenProfile.name}\` (${chosenProfile.voice_type || 'cloned'})${fallbackNotice}\n`;
+      out += `- **Idioma**: \`${langLabel} (${targetLang})\`\n`;
+      out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
+      if (speakRes && speakRes.id) {
+        out += `- **Voicebox Generation ID**: \`${speakRes.id}\`\n`;
+      }
+      out += `\n**Contexto del Checkpoint detectado:**\n`;
+      out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
+      out += `- **Estado de Tests**: \`${checkpoint.overallTestStatus}\`\n`;
+      if (checkpoint.filesModified.length > 0) {
+        out += `- **Archivos identificados**: ${checkpoint.filesModified.map(f => `\`${path.basename(f)}\``).slice(0, 5).join(', ')}${checkpoint.filesModified.length > 5 ? ` (+${checkpoint.filesModified.length - 5} más)` : ''}\n`;
+      }
+      if (duration) {
+        out += `- **Tiempo de generación (Gemini)**: ${duration.toFixed(1)}s\n`;
+      }
+
+      return {
+        content: [{ type: 'text', text: out }]
+      };
+    }
+
+    case 'agy_narrate_voices': {
+      const voiceboxUrl = resolveVoiceboxUrl(args, config);
+
+      // 1. Verify Voicebox health
+      const health = await checkVoiceboxHealth(voiceboxUrl);
+      if (!health.ok) {
+        return {
+          content: [{
+            type: 'text',
+            text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}\n\n*Asegúrate de que la aplicación Voicebox esté iniciada en tu equipo (o especifica un puerto/URL personalizado si corre en otra dirección).*`
+          }]
+        };
+      }
+
+      // 2. Fetch available profiles
+      let profiles = [];
+      try {
+        profiles = await getVoiceboxProfiles(voiceboxUrl);
+      } catch (err) {
+        return {
+          content: [{
+            type: 'text',
+            text: `⚠️ Error al consultar los perfiles de voz de Voicebox: ${err.message}`
+          }]
+        };
+      }
+
+      // 3. Filter if requested
+      const langFilter = (args.language || 'all').toLowerCase();
+      const filtered = langFilter === 'all'
+        ? profiles
+        : profiles.filter(p => (p.language || '').toLowerCase().startsWith(langFilter));
+
+      // 4. Role tagger helper
+      function getRoleTag(name, lang) {
+        const n = (name || '').toLowerCase();
+        const l = (lang || '').toLowerCase();
+        if (n.includes('diego')) return '⭐ **Default Español**';
+        if (n.includes('emily')) return '⭐ **Default English**';
+        if (n.includes('isabel')) return '🔄 Fallback Español (P1)';
+        if (n.includes('anna') || n.includes('ono')) return '🔄 Fallback Español (P2)';
+        if (n.includes('aria')) return '🔄 Fallback English (P1)';
+        if (n.includes('aiden')) return '🔄 Fallback English (P2)';
+        if (l.startsWith('es')) return 'Disponible (es)';
+        if (l.startsWith('en')) return 'Disponible (en)';
+        return 'Disponible';
+      }
+
+      // 5. Build presentation
+      const hInfo = health.info || {};
+      let out = `### 🎙️ Perfiles de Voz en Voicebox\n\n`;
+      out += `**Estado del servicio:**\n`;
+      out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
+      if (hInfo.gpu_type) out += `- **Aceleración**: \`${hInfo.gpu_type}\` (${hInfo.backend_variant || 'cuda'})\n`;
+      if (hInfo.model_size) out += `- **Modelo TTS**: \`${hInfo.model_size}\` (${hInfo.model_loaded ? 'Cargado en memoria' : 'Descargado'})\n`;
+      out += `- **Total de perfiles instalados**: ${profiles.length}${langFilter !== 'all' ? ` (${filtered.length} mostrando filtro: \`${langFilter}\`)` : ''}\n\n`;
+
+      out += `| Perfil | Idioma | Tipo | Rol en Antigravity | Personalidad |\n`;
+      out += `|---|---|---|---|---|\n`;
+
+      for (const p of filtered) {
+        const role = getRoleTag(p.name, p.language);
+        const pers = p.personality ? '✅ Sí' : '—';
+        out += `| **${p.name}** | \`${p.language || '?'}\` | ${p.voice_type || 'cloned'} | ${role} | ${pers} |\n`;
+      }
+
+      out += `\n> **Cómo usar una voz específica:**\n`;
+      out += `> - Comando: \`/agy-narrate <nombre>\` (ej: \`/agy-narrate aria\` o \`/agy-narrate "Mi voz"\`)\n`;
+      out += `> - Con Claude: *"Narra el último checkpoint con [nombre de voz]"*\n`;
+
+      return {
+        content: [{ type: 'text', text: out }]
       };
     }
 
