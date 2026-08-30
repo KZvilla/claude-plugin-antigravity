@@ -26,6 +26,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
 - [Telemetry (`/agy-usage`)](#-telemetry--usage-tracking-agy-usage)
 - [Components](#-components)
+- [Documentation Hub (`docs/`)](docs/README.md)
 
 ---
 
@@ -400,6 +401,17 @@ Verify installation in your terminal:
 ```bash
 claude plugin details antigravity@skills-dir
 ```
+
+---
+
+## 📚 Documentation Hub
+
+Explore the in-depth technical documentation in the [`docs/`](docs/README.md) directory:
+
+- **[Architecture](docs/architecture/README.md):** MCP server design, stdio transport, permissions, and security.
+- **[Integrations](docs/integrations/README.md):** External bridges such as the [Telegram Bridge](docs/integrations/telegram-bridge.md) ($0 cost, CGNAT-ready).
+- **[Future Implementations](docs/future-implementations/README.md):** Upcoming roadmap features like the [Real-Time Voice Mode](docs/future-implementations/voice-chat-architecture.md).
+- **[Old Implementations / History](docs/old-implementations/README.md):** Historical milestone logs like the [Foundational Session Summary](docs/old-implementations/session-summary-2026-08-27.md).
 
 ---
 

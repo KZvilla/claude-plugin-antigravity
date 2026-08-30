@@ -4,6 +4,8 @@ node_modules/
 Thumbs.db
 SESSION-SUMMARY.md
 *.local.md
+docs/*
+docs/
 
 # Security & Secrets (Standard §11.1)
 .env
