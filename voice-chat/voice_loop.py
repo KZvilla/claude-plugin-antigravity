@@ -49,7 +49,7 @@ except ImportError as err:
 from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
     resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
-    get_model_status, resolve_engine_and_model
+    get_model_status, resolve_engine_and_model, tts_model_name, unload_model, stt_full_model_name
 )
 
 SAMPLE_RATE = 16000
@@ -177,6 +177,11 @@ def main():
                               "Por defecto usa el default_engine del perfil elegido.")
     parser.add_argument("--model-size", default=None, help='Forzar tamano de modelo (ej. "1.7B", "0.6B") - solo aplica a motores Qwen.')
     parser.add_argument("--list-engines", action="store_true", help="Lista motores/modelos TTS descargados y sale")
+    parser.add_argument("--stt-model", default="turbo", choices=["base", "small", "medium", "large", "turbo"],
+                         help='Tamano de modelo Whisper para /transcribe. Nombres cortos, no "whisper-*" '
+                              '(esa convencion es solo de /models/status). Sin esto, Voicebox caia en "base" por default silencioso.')
+    parser.add_argument("--unload-on-exit", action="store_true",
+                         help="Al cerrar, descargar de memoria (no del disco) el modelo TTS y el STT usados en esta sesion.")
     args = parser.parse_args()
 
     if args.list_devices:
@@ -208,14 +213,34 @@ def main():
     model_status = get_model_status()
     engine, model_size = resolve_engine_and_model(profile, model_status, args.engine, args.model_size)
     print(f"[voice-loop] Motor TTS: {engine}" + (f" ({model_size})" if model_size else ""))
+    print(f"[voice-loop] Modelo STT: {args.stt_model}")
 
-    print("[voice-loop] Iniciando sesion agy_voice_stream (con pre-warm de Voicebox en paralelo)...")
-    start_text = mcp.call_tool("agy_voice_stream", {
-        "action": "start", "effort": args.effort, "mode": "plan",
-        "prewarm_voicebox": True, "voicebox_model_size": "1.7B"
-    })
+    # /models/load solo carga el modelo TTS "Qwen" (su propio schema no acepta
+    # un engine) -- precalentarlo cuando el perfil resolvio a Kokoro/otro motor
+    # cargaria el modelo equivocado. Kokoro (~300MB) es rapido de por si, no
+    # necesita pre-warm.
+    is_qwen_engine = engine in ("qwen", "qwen_custom_voice")
+
+    print("[voice-loop] Iniciando sesion agy_voice_stream" +
+          (" (con pre-warm de Voicebox en paralelo)" if is_qwen_engine else "") + "...")
+    start_args = {"action": "start", "effort": args.effort, "mode": "plan", "prewarm_voicebox": is_qwen_engine}
+    if is_qwen_engine:
+        start_args["voicebox_model_size"] = model_size or "1.7B"
+    start_text = mcp.call_tool("agy_voice_stream", start_args)
     stream_id = start_text.split("stream_id: `")[1].split("`")[0]
-    print(f"[voice-loop] Sesion lista: {stream_id}\n")
+    print(f"[voice-loop] Sesion lista: {stream_id}")
+
+    # Pre-warm de STT: sin esto, la PRIMERA transcripcion real paga el costo de
+    # cargar el modelo Whisper (visto en vivo: "Whisper model base is being
+    # downloaded/loaded, please wait"). No bloqueante, igual que el prewarm TTS.
+    def _prewarm_stt():
+        try:
+            silent_wav = float32_to_wav_bytes(np.zeros(int(0.3 * SAMPLE_RATE), dtype=np.float32))
+            transcribe_wav_bytes(silent_wav, language=args.language, model=args.stt_model)
+        except Exception as err:
+            print(f"  ⚠️ Pre-warm de STT ({args.stt_model}) fallo: {err}")
+    threading.Thread(target=_prewarm_stt, daemon=True).start()
+    print()
 
     player = AudioPlayer()
     executor = ThreadPoolExecutor(max_workers=2)
@@ -248,7 +273,7 @@ def main():
             print(f"  [debug] utterance recibida: {len(audio_samples)/SAMPLE_RATE:.2f}s, token={my_token}")
             try:
                 wav_bytes = float32_to_wav_bytes(audio_samples)
-                text = transcribe_wav_bytes(wav_bytes, language=args.language)
+                text = transcribe_wav_bytes(wav_bytes, language=args.language, model=args.stt_model)
             except Exception as err:
                 print(f"  ⚠️ Error transcribiendo: {err}")
                 continue
@@ -301,6 +326,11 @@ def main():
             pass
         mcp.close()
         executor.shutdown(wait=False)
+
+        if args.unload_on_exit:
+            print("[voice-loop] Descargando modelos de memoria...")
+            unload_model(tts_model_name(engine, model_size))
+            unload_model(stt_full_model_name(args.stt_model))
 
 
 if __name__ == "__main__":

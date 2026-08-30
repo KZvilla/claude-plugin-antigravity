@@ -229,19 +229,61 @@ def voicebox_cancel(generation_id):
         pass
 
 
-def transcribe_wav_bytes(wav_bytes, language=None):
+def transcribe_wav_bytes(wav_bytes, language=None, model=None):
     boundary = "----voiceloopboundary"
-    body = (
+    parts = [(
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
         f"Content-Type: audio/wav\r\n\r\n"
-    ).encode("utf-8") + wav_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    ).encode("utf-8") + wav_bytes]
+    # language/model existian como parametros pero nunca se mandaban en el
+    # multipart -- Voicebox siempre caia a su propio default silencioso
+    # (whisper-base, el mas debil de los que hay descargados).
+    for field_name, value in (("language", language), ("model", model)):
+        if value:
+            parts.append((
+                f"\r\n--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n{value}'
+            ).encode("utf-8"))
+    body = b"".join(parts) + f"\r\n--{boundary}--\r\n".encode("utf-8")
     res = voicebox_request(
         "/transcribe", method="POST", raw_body=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         timeout=60
     )
     return res.get("text", "").strip()
+
+
+def tts_model_name(engine, model_size):
+    """Traduce (engine, model_size) al model_name que usa /models/status y
+    /models/{model_name}/unload. Best-effort para los motores que no versionan
+    por tamano (no hay forma generica de derivarlo del schema de Voicebox)."""
+    if engine == "qwen":
+        return f"qwen-tts-{model_size or '1.7B'}"
+    if engine == "qwen_custom_voice":
+        return f"qwen-custom-voice-{model_size or '1.7B'}"
+    if engine == "chatterbox":
+        return "chatterbox-tts"
+    if engine == "chatterbox_turbo":
+        return "chatterbox-turbo"
+    return engine  # kokoro, luxtts: el nombre del engine coincide con model_name
+
+
+def stt_full_model_name(short_name):
+    """/transcribe usa nombres cortos ("turbo", "base"...) pero /models/status y
+    /models/{model_name}/unload usan el nombre completo ("whisper-turbo",
+    "whisper-base"...) - dos convenciones distintas para el mismo modelo,
+    confirmado en vivo contra ambos endpoints."""
+    return f"whisper-{short_name}"
+
+
+def unload_model(model_name):
+    try:
+        voicebox_request(f"/models/{model_name}/unload", method="POST", payload={})
+        return True
+    except Exception as err:
+        print(f"  ⚠️ No se pudo descargar el modelo {model_name}: {err}")
+        return False
 
 
 class AudioPlayer:
