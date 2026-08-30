@@ -402,6 +402,22 @@ Verify installation in your terminal:
 claude plugin details antigravity@skills-dir
 ```
 
+### 🔐 Telegram Bridge Setup (Manual — Never Automated)
+
+The Telegram tools (`telegram_notify`, `telegram_ask`, `telegram_send_voice`, and `agy_narrate`'s `send_telegram` option) need your own bot token and chat ID in a `.env` file. **This is intentionally not part of `install.ps1`/`install.sh`** — an installer that silently created or copied credentials for you would be a much worse security default than asking you to do it once, yourself.
+
+1. Get a bot token from [@BotFather](https://t.me/BotFather) on Telegram.
+2. Get your numeric user ID from [@userinfobot](https://t.me/userinfobot).
+3. Copy the example file and fill in both values:
+   ```bash
+   cp telegram-bridge/.env.example .env
+   ```
+   (edit `TELEGRAM_BOT_TOKEN` and `ALLOWED_USER_IDS` in the new `.env`)
+
+**Important if you installed via the script above:** `.env` is git-ignored on purpose, so it is never cloned or copied into `~/.claude/skills/antigravity` (or wherever `install.ps1`/`install.sh` placed the plugin) — the installer only fetches what's tracked in git. Create `.env` directly at the **installed** plugin root (`~/.claude/skills/antigravity/.env`), not just in a separate local dev checkout, or outbound Telegram delivery will silently look unconfigured from the live plugin even though it works fine in a manual test run elsewhere.
+
+The bidirectional bot (`telegram-bridge/bot.js`, started with `npm run start` inside `telegram-bridge/`) is only needed if you want to message the bot *from* your phone to kick off `agy` tasks or answer `telegram_ask` prompts — outbound notifications and voice notes work without it.
+
 ---
 
 ## 📚 Documentation Hub
