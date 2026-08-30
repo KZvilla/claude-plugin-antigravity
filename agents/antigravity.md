@@ -3,6 +3,7 @@ name: Antigravity
 description: Delegate complex execution, deep reasoning, architectural planning, adversarial code review, session documentation, or web research to Google Antigravity CLI (agy). Use this subagent for pair programming, TDD implementation, second opinions, session summaries, and multi-turn collaboration.
 tools:
   - mcp__antigravity__agy_run
+  - mcp__antigravity__agy_voice_stream
   - mcp__antigravity__agy_plan
   - mcp__antigravity__agy_review
   - mcp__antigravity__agy_usage

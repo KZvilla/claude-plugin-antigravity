@@ -12,6 +12,7 @@ const readline = require('node:readline');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
+const { SentenceChunker } = require('./lib/sentence-chunker');
 
 // Resolve agy binary location
 function resolveAgyBin() {
@@ -613,6 +614,71 @@ const TOOLS = [
           description: 'Timeout in minutes. Defaults to 15.'
         }
       }
+    }
+  },
+  {
+    name: 'agy_voice_stream',
+    description: 'Manage a persistent, streaming `agy.exe` process for low-latency conversational use ("Modo Charla"). Unlike agy_run, which blocks until the entire response is generated and then exits, this keeps one long-lived agy process alive across many turns and exposes incremental text_delta events for polling, avoiding per-turn cold starts and enabling sentence-level TTS pipelining. Actions: "start" (spawn the persistent process, optionally pre-warming Voicebox TTS in parallel), "send" (write one user turn to the running process), "drain" (retrieve and clear buffered stream events since the last drain — poll this in a loop while a turn is in flight), "status" (inspect a session without consuming its events), "stop" (terminate the process).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['start', 'send', 'drain', 'status', 'stop'],
+          description: 'Operation to perform on the voice stream session.'
+        },
+        stream_id: {
+          type: 'string',
+          description: 'Session ID returned by "start". Required for "send", "drain", "status", and "stop".'
+        },
+        text: {
+          type: 'string',
+          description: 'User turn text to send to agy. Required for "send".'
+        },
+        model: {
+          type: 'string',
+          description: 'Model override for "start" (e.g. "gemini-3.7-flash", "gemini-2.5-flash").'
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'Reasoning effort for "start". Defaults to "low" (optimized for conversational latency, unlike agy_run\'s "high" default).'
+        },
+        mode: {
+          type: 'string',
+          enum: ['accept-edits', 'plan'],
+          description: 'Agent execution mode for "start". Defaults to "plan" — voice chat is conversational by default, not a coding session.'
+        },
+        conversation_id: {
+          type: 'string',
+          description: 'Resume a previous agy conversation on "start" instead of beginning a new one.'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Working directory for "start". Defaults to Claude\'s current working directory.'
+        },
+        dangerously_skip_permissions: {
+          type: 'boolean',
+          description: 'Auto-approve tool permissions on "start" without interactive prompting. Defaults to true (required for headless voice sessions).'
+        },
+        prewarm_voicebox: {
+          type: 'boolean',
+          description: 'On "start", also fire a non-blocking POST /models/load to Voicebox so the TTS model is already in VRAM before the first spoken reply. Defaults to true.'
+        },
+        voicebox_model_size: {
+          type: 'string',
+          description: 'TTS model size to pre-warm in Voicebox (e.g. "1.7B", "0.6B"). Defaults to "1.7B".'
+        },
+        voicebox_url: {
+          type: 'string',
+          description: 'Custom Voicebox HTTP endpoint URL for pre-warming.'
+        },
+        voicebox_port: {
+          type: 'number',
+          description: 'Custom Voicebox port for pre-warming.'
+        }
+      },
+      required: ['action']
     }
   },
   {
@@ -1232,6 +1298,23 @@ async function getVoiceboxProfiles(baseUrl) {
   throw new Error(`Failed to fetch Voicebox profiles: HTTP ${res.statusCode}`);
 }
 
+// Fase 1 (Modo Charla): pre-warm the TTS model into VRAM before opening the mic,
+// so the first spoken reply doesn't pay the 3-8s cold-load-from-disk cost.
+async function voiceboxModelsLoad(baseUrl, modelSize) {
+  const qs = modelSize ? `?model_size=${encodeURIComponent(modelSize)}` : '';
+  try {
+    const res = await httpRequest(`${baseUrl}/models/load${qs}`, { method: 'POST', timeout: 15000 });
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      let data = {};
+      try { data = JSON.parse(res.body); } catch { data = { raw: res.body }; }
+      return { ok: true, data };
+    }
+    return { ok: false, error: `Voicebox /models/load returned HTTP ${res.statusCode}: ${res.body.slice(0, 200)}` };
+  } catch (err) {
+    return { ok: false, error: `Cannot reach Voicebox /models/load at ${baseUrl} (${err.message})` };
+  }
+}
+
 function resolveVoiceProfile(profiles, requestedVoice, requestedLang) {
   if (!Array.isArray(profiles) || profiles.length === 0) {
     throw new Error('No voice profiles found in Voicebox.');
@@ -1695,6 +1778,121 @@ function executeAgy(args, options = {}) {
   });
 }
 
+// Fase 2 (Modo Charla): persistent `agy.exe` stream sessions.
+// Distinct from executeAgy() on purpose — that helper blocks until child.on('close'),
+// which defeats the point of a low-latency conversational loop (see docs/future-implementations/voice-chat-architecture.md, section 3.1).
+// A session here keeps one agy.exe process alive across many turns via
+// `--input-format stream-json --output-format stream-json`, avoiding per-turn cold starts.
+//
+// Verified stdin schema (2026-08-30, live probing — not documented in `agy --help`):
+//   {"event":"user","message":{"content":"<user turn text>"}}
+// agy replies with NDJSON on stdout: one `init` (first line only), then per turn a
+// `step_update` (step_type: "agent_response", state: "ACTIVE" while streaming, "DONE" when
+// that step finishes) carrying `text_delta`, then a `result` event closing the turn.
+const voiceStreamSessions = new Map();
+
+function createVoiceStreamSession(options = {}) {
+  const streamId = `vs_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const cwd = options.cwd || process.cwd();
+
+  const cliArgs = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
+  cliArgs.push('--effort', options.effort || 'low');
+  if (options.model) cliArgs.push('--model', options.model);
+  if (options.mode) cliArgs.push('--mode', options.mode);
+  if (options.conversation_id) cliArgs.push('--conversation', options.conversation_id);
+  if (options.dangerously_skip_permissions !== false) cliArgs.push('--dangerously-skip-permissions');
+
+  process.stderr.write(`[antigravity-mcp] Starting voice stream session ${streamId}: ${AGY_BIN} ${cliArgs.join(' ')} (cwd: ${cwd})\n`);
+
+  const child = spawn(AGY_BIN, cliArgs, {
+    cwd,
+    shell: false,
+    env: { ...process.env }
+  });
+
+  const session = {
+    id: streamId,
+    child,
+    cwd,
+    model: options.model || null,
+    effort: options.effort || 'low',
+    conversationId: options.conversation_id || null,
+    status: 'starting',
+    events: [],
+    cursor: 0,
+    // Fase 3: groups text_delta fragments into complete sentences for the TTS queue.
+    chunker: new SentenceChunker(),
+    stderrTail: [],
+    exitCode: null,
+    createdAt: Date.now(),
+    lastActivity: Date.now()
+  };
+
+  const rlOut = readline.createInterface({ input: child.stdout, terminal: false });
+  rlOut.on('line', (line) => {
+    if (!line.trim()) return;
+    session.lastActivity = Date.now();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      session.events.push({ event: 'parse_error', raw: line, ts: Date.now() });
+      return;
+    }
+
+    if (parsed.event === 'init') {
+      session.conversationId = parsed.conversation_id || session.conversationId;
+      session.status = 'ready';
+    }
+
+    parsed._ts = Date.now();
+    session.events.push(parsed);
+  });
+
+  child.stderr.on('data', (chunk) => {
+    const text = chunk.toString('utf8');
+    session.stderrTail.push(text);
+    if (session.stderrTail.length > 20) session.stderrTail.shift();
+    process.stderr.write(`[agy voice-stream ${streamId} stderr] ${text}`);
+  });
+
+  child.on('error', (err) => {
+    session.status = 'error';
+    session.events.push({ event: 'process_error', error: err.message, ts: Date.now() });
+  });
+
+  child.on('close', (code) => {
+    session.status = 'stopped';
+    session.exitCode = code;
+    session.events.push({ event: 'process_closed', code, ts: Date.now() });
+  });
+
+  voiceStreamSessions.set(streamId, session);
+  return session;
+}
+
+function sendVoiceStreamTurn(session, text) {
+  if (session.status === 'stopped' || session.status === 'error') {
+    throw new Error(`Voice stream session ${session.id} is not running (status: ${session.status}).`);
+  }
+  const line = JSON.stringify({ event: 'user', message: { content: text } }) + '\n';
+  session.child.stdin.write(line);
+  session.lastActivity = Date.now();
+}
+
+function drainVoiceStreamEvents(session) {
+  const drained = session.events.slice(session.cursor);
+  session.cursor = session.events.length;
+  return drained;
+}
+
+function stopVoiceStreamSession(session) {
+  try { session.child.stdin.end(); } catch {}
+  try { session.child.kill('SIGTERM'); } catch {}
+  session.status = 'stopped';
+}
+
 // Helper: Invoke Telegram Bridge for outbound notifications and human-in-the-loop decisions
 function invokeTelegramBridge(command, payload = {}) {
   return new Promise((resolve) => {
@@ -1980,6 +2178,141 @@ ${args.prompt}`;
           }
         ]
       };
+    }
+
+    case 'agy_voice_stream': {
+      const action = args.action;
+
+      if (action === 'start') {
+        const effectiveModel = args.model || config.defaultModel;
+        const effectiveEffort = args.effort || 'low';
+        const effectiveMode = args.mode || 'plan';
+
+        const session = createVoiceStreamSession({
+          cwd: args.cwd,
+          model: effectiveModel,
+          effort: effectiveEffort,
+          mode: effectiveMode,
+          conversation_id: args.conversation_id,
+          dangerously_skip_permissions: args.dangerously_skip_permissions
+        });
+
+        let prewarmNote = '';
+        if (args.prewarm_voicebox !== false) {
+          const voiceboxUrl = resolveVoiceboxUrl(args, config);
+          const modelSize = args.voicebox_model_size || '1.7B';
+          voiceboxModelsLoad(voiceboxUrl, modelSize)
+            .then((r) => {
+              if (!r.ok) {
+                process.stderr.write(`[antigravity-mcp] Voicebox pre-warm failed for session ${session.id}: ${r.error}\n`);
+              }
+            })
+            .catch((err) => {
+              process.stderr.write(`[antigravity-mcp] Voicebox pre-warm error for session ${session.id}: ${err.message}\n`);
+            });
+          prewarmNote = `\n- Voicebox pre-warm: requested \`POST ${voiceboxUrl}/models/load?model_size=${modelSize}\` (non-blocking)`;
+        }
+
+        // Give the process a short window to emit its `init` event so conversation_id
+        // is available immediately, without making session start wait on a full turn.
+        const deadline = Date.now() + 3000;
+        while (session.status === 'starting' && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Voice stream session started.\n- stream_id: \`${session.id}\`\n- conversation_id: \`${session.conversationId || 'pending'}\`\n- Model: \`${effectiveModel || 'default'}\` | Effort: \`${effectiveEffort}\` | Mode: \`${effectiveMode}\`\n- Status: \`${session.status}\`${prewarmNote}\n\nUse \`action: "send"\` with this stream_id to send a turn, then poll \`action: "drain"\` to read incremental text_delta events as they arrive.`
+          }]
+        };
+      }
+
+      const session = voiceStreamSessions.get(args.stream_id);
+      if (!session) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `No voice stream session found with stream_id "${args.stream_id}". Call action: "start" first.` }]
+        };
+      }
+
+      if (action === 'send') {
+        if (!args.text) {
+          return { isError: true, content: [{ type: 'text', text: '"text" is required for action "send".' }] };
+        }
+        try {
+          sendVoiceStreamTurn(session, args.text);
+        } catch (err) {
+          return { isError: true, content: [{ type: 'text', text: err.message }] };
+        }
+        return {
+          content: [{ type: 'text', text: `Turn sent to session \`${session.id}\`. Poll \`action: "drain"\` to receive text_delta events as they stream in.` }]
+        };
+      }
+
+      if (action === 'drain') {
+        const events = drainVoiceStreamEvents(session);
+        const deltas = events
+          .filter(e => e.event === 'step_update' && e.step_update && e.step_update.step_type === 'agent_response' && e.step_update.text_delta)
+          .map(e => ({ state: e.step_update.state, text_delta: e.step_update.text_delta }));
+        const resultEvent = events.find(e => e.event === 'result');
+
+        // Fase 3: feed each delta through the per-session Sentence Chunker so the
+        // caller gets TTS-ready sentences, not just raw text fragments. On turn
+        // completion, flush whatever's left buffered (e.g. short replies like "OK"
+        // that never reach the minimum word count on their own).
+        let sentences = [];
+        for (const d of deltas) {
+          sentences = sentences.concat(session.chunker.push(d.text_delta));
+        }
+        if (resultEvent) {
+          sentences = sentences.concat(session.chunker.flush());
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              stream_id: session.id,
+              status: session.status,
+              conversation_id: session.conversationId,
+              turn_complete: !!resultEvent,
+              sentences,
+              deltas,
+              result: resultEvent ? resultEvent.result : null,
+              raw_event_count: events.length
+            }, null, 2)
+          }]
+        };
+      }
+
+      if (action === 'status') {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              stream_id: session.id,
+              status: session.status,
+              conversation_id: session.conversationId,
+              model: session.model,
+              effort: session.effort,
+              pid: session.child.pid,
+              buffered_undrained_events: session.events.length - session.cursor,
+              created_at: new Date(session.createdAt).toISOString(),
+              last_activity: new Date(session.lastActivity).toISOString(),
+              exit_code: session.exitCode
+            }, null, 2)
+          }]
+        };
+      }
+
+      if (action === 'stop') {
+        stopVoiceStreamSession(session);
+        voiceStreamSessions.delete(session.id);
+        return { content: [{ type: 'text', text: `Voice stream session \`${session.id}\` stopped.` }] };
+      }
+
+      return { isError: true, content: [{ type: 'text', text: `Unknown action "${action}" for agy_voice_stream.` }] };
     }
 
     case 'agy_plan': {
