@@ -23,7 +23,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,

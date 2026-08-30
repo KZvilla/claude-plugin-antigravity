@@ -30,7 +30,11 @@ import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+# Sin esto, print() queda en un buffer interno que solo se vuelca al salir
+# limpio del proceso -- si el proceso se mata a la fuerza (taskkill, un
+# background task cortado), todo el log se pierde y queda un archivo vacio.
 
 try:
     import numpy as np
@@ -68,10 +72,16 @@ class VadListener:
     on_speech_start() de inmediato (para barge-in real). Cuando detecta el FIN
     (silencio sostenido), llama on_utterance(audio_float32_samples)."""
 
-    def __init__(self, device, threshold, min_silence_ms, on_speech_start, on_utterance):
+    def __init__(self, device, threshold, min_silence_ms, min_speech_ms, on_speech_start, on_utterance):
         self.device = device
         self.threshold = threshold
         self.min_silence_frames = max(1, round(min_silence_ms / (BLOCK_SIZE / SAMPLE_RATE * 1000)))
+        # Sin esto, UN solo frame de 32ms cruzando el umbral (un clic, una tos,
+        # ruido breve) disparaba una utterance completa -- exactamente el sintoma
+        # reportado en vivo: turnos random disparandose solos con contenido
+        # desconectado. Requiere cruzar el umbral de forma sostenida antes de
+        # comprometerse a "esta hablando".
+        self.min_speech_frames = max(1, round(min_speech_ms / (BLOCK_SIZE / SAMPLE_RATE * 1000)))
         self.on_speech_start = on_speech_start
         self.on_utterance = on_utterance
 
@@ -101,9 +111,11 @@ class VadListener:
 
     def _consume_loop(self):
         speaking = False
+        speech_run = 0
         silence_run = 0
-        utterance_chunks = []
-        # ~10 bloques (~320ms) de pre-roll para no perder la primera silaba
+        # ~10 bloques (~320ms) de pre-roll para no perder la primera silaba;
+        # tambien contiene, sin buffer aparte, los frames que todavia estan
+        # "candidateandose" a ser el inicio de una utterance (ver mas abajo).
         preroll = []
         preroll_max = 10
 
@@ -121,23 +133,31 @@ class VadListener:
                     preroll.pop(0)
 
             if prob >= self.threshold:
-                if not speaking:
-                    speaking = True
-                    utterance_chunks = list(preroll)
-                    self.on_speech_start()
-                utterance_chunks.append(block)
-                silence_run = 0
-            elif speaking:
-                utterance_chunks.append(block)
-                silence_run += 1
-                if silence_run >= self.min_silence_frames:
-                    speaking = False
+                if speaking:
+                    utterance_chunks.append(block)
                     silence_run = 0
-                    audio = np.concatenate(utterance_chunks) if utterance_chunks else np.array([], dtype="float32")
-                    utterance_chunks = []
-                    preroll = []
-                    if len(audio) / SAMPLE_RATE >= 0.3:  # descarta ruidos ultra-cortos
-                        self.on_utterance(audio)
+                else:
+                    speech_run += 1
+                    if speech_run >= self.min_speech_frames:
+                        # Cruce sostenido, no un pico aislado: recien ahora es
+                        # una utterance real.
+                        speaking = True
+                        speech_run = 0
+                        utterance_chunks = list(preroll)
+                        self.on_speech_start()
+            else:
+                speech_run = 0  # el pico no se sostuvo, era ruido/click
+                if speaking:
+                    utterance_chunks.append(block)
+                    silence_run += 1
+                    if silence_run >= self.min_silence_frames:
+                        speaking = False
+                        silence_run = 0
+                        audio = np.concatenate(utterance_chunks) if utterance_chunks else np.array([], dtype="float32")
+                        utterance_chunks = []
+                        preroll = []
+                        if len(audio) / SAMPLE_RATE >= 0.3:  # descarta restos ultra-cortos
+                            self.on_utterance(audio)
 
 
 def main():
@@ -148,6 +168,8 @@ def main():
     parser.add_argument("--device", default=None, help="Indice o nombre (parcial) del dispositivo de entrada")
     parser.add_argument("--vad-threshold", type=float, default=0.5)
     parser.add_argument("--min-silence-ms", type=int, default=600, help="Silencio para cerrar una utterance")
+    parser.add_argument("--min-speech-ms", type=int, default=150,
+                         help="Cruce sostenido del umbral antes de arrancar una utterance (filtra clicks/tos)")
     parser.add_argument("--list-devices", action="store_true", help="Lista dispositivos de audio y sale")
     args = parser.parse_args()
 
@@ -237,6 +259,7 @@ def main():
 
     listener = VadListener(
         device=device, threshold=args.vad_threshold, min_silence_ms=args.min_silence_ms,
+        min_speech_ms=args.min_speech_ms,
         on_speech_start=on_speech_start, on_utterance=on_utterance
     )
     listener.start()
