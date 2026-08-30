@@ -27,7 +27,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
-    resolve_voice_profile, synthesize_sentence, voicebox_cancel
+    resolve_voice_profile, synthesize_sentence, voicebox_cancel,
+    get_model_status, resolve_engine_and_model
 )
 
 
@@ -36,6 +37,10 @@ def main():
     parser.add_argument("--voice", default=None, help='Perfil de voz (ej. "Diego Alvarez")')
     parser.add_argument("--language", default="es", choices=["es", "en"])
     parser.add_argument("--effort", default="low", choices=["low", "medium", "high"])
+    parser.add_argument("--engine", default=None,
+                         help="Forzar motor TTS (qwen, qwen_custom_voice, kokoro, luxtts, chatterbox, chatterbox_turbo, tada). "
+                              "Por defecto usa el default_engine del perfil elegido.")
+    parser.add_argument("--model-size", default=None, help='Forzar tamano de modelo (ej. "1.7B", "0.6B") - solo aplica a motores Qwen.')
     args = parser.parse_args()
 
     print("[voice-loop] Conectando al servidor MCP real (mcp-server/index.js)...")
@@ -44,6 +49,12 @@ def main():
     print(f"[voice-loop] Resolviendo perfil de voz en Voicebox (preferido: {args.voice or 'default'})...")
     profile = resolve_voice_profile(args.voice, args.language)
     print(f"[voice-loop] Perfil elegido: {profile['name']}")
+
+    # No asumir "qwen"/"1.7B": cada perfil declara su propio default_engine y lo
+    # que esta realmente descargado varia por maquina - se consulta en vivo.
+    model_status = get_model_status()
+    engine, model_size = resolve_engine_and_model(profile, model_status, args.engine, args.model_size)
+    print(f"[voice-loop] Motor TTS: {engine}" + (f" ({model_size})" if model_size else ""))
 
     print("[voice-loop] Iniciando sesion agy_voice_stream (con pre-warm de Voicebox en paralelo)...")
     start_text = mcp.call_tool("agy_voice_stream", {
@@ -85,7 +96,7 @@ def main():
                 turn_complete = drain["turn_complete"]
                 for sentence in drain["sentences"]:
                     print(f"Agy> {sentence}")
-                    future = executor.submit(synthesize_sentence, sentence, profile, args.language)
+                    future = executor.submit(synthesize_sentence, sentence, profile, args.language, engine, model_size)
                     sequencer.submit(future, sentence)
     except KeyboardInterrupt:
         print("\n[voice-loop] Interrumpido por teclado.")

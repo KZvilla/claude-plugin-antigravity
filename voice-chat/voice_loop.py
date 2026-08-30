@@ -48,7 +48,8 @@ except ImportError as err:
 
 from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
-    resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes
+    resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
+    get_model_status, resolve_engine_and_model
 )
 
 SAMPLE_RATE = 16000
@@ -171,10 +172,21 @@ def main():
     parser.add_argument("--min-speech-ms", type=int, default=150,
                          help="Cruce sostenido del umbral antes de arrancar una utterance (filtra clicks/tos)")
     parser.add_argument("--list-devices", action="store_true", help="Lista dispositivos de audio y sale")
+    parser.add_argument("--engine", default=None,
+                         help="Forzar motor TTS (qwen, qwen_custom_voice, kokoro, luxtts, chatterbox, chatterbox_turbo, tada). "
+                              "Por defecto usa el default_engine del perfil elegido.")
+    parser.add_argument("--model-size", default=None, help='Forzar tamano de modelo (ej. "1.7B", "0.6B") - solo aplica a motores Qwen.')
+    parser.add_argument("--list-engines", action="store_true", help="Lista motores/modelos TTS descargados y sale")
     args = parser.parse_args()
 
     if args.list_devices:
         print(sd.query_devices())
+        return
+
+    if args.list_engines:
+        for m in get_model_status().values():
+            estado = "cargado" if m.get("loaded") else ("descargado en disco" if m.get("downloaded") else "no descargado")
+            print(f"  {m['model_name']:24s} {m['display_name']:28s} [{estado}]")
         return
 
     device = args.device
@@ -190,6 +202,12 @@ def main():
     print(f"[voice-loop] Resolviendo perfil de voz en Voicebox (preferido: {args.voice or 'default'})...")
     profile = resolve_voice_profile(args.voice, args.language)
     print(f"[voice-loop] Perfil elegido: {profile['name']}")
+
+    # No asumir "qwen"/"1.7B": cada perfil declara su propio default_engine y lo
+    # que esta realmente descargado varia por maquina - se consulta en vivo.
+    model_status = get_model_status()
+    engine, model_size = resolve_engine_and_model(profile, model_status, args.engine, args.model_size)
+    print(f"[voice-loop] Motor TTS: {engine}" + (f" ({model_size})" if model_size else ""))
 
     print("[voice-loop] Iniciando sesion agy_voice_stream (con pre-warm de Voicebox en paralelo)...")
     start_text = mcp.call_tool("agy_voice_stream", {
@@ -252,7 +270,7 @@ def main():
                     if generation_token["value"] != my_token:
                         continue  # barge-in ocurrio mientras agy seguia respondiendo
                     print(f"Agy> {sentence}")
-                    future = executor.submit(synthesize_sentence, sentence, profile, args.language)
+                    future = executor.submit(synthesize_sentence, sentence, profile, args.language, engine, model_size)
                     sequencer.submit(future, sentence)
 
     threading.Thread(target=turn_worker, daemon=True).start()

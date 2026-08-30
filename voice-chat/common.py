@@ -131,6 +131,43 @@ def resolve_voice_profile(preferred_name, language):
     return profiles[0]
 
 
+def get_model_status():
+    """GET /models/status, indexado por model_name para lookup facil. Refleja lo
+    que el usuario tiene REALMENTE descargado/cargado en su Voicebox - no asumas
+    que un motor esta disponible sin chequear esto primero."""
+    res = voicebox_request("/models/status")
+    return {m["model_name"]: m for m in res.get("models", [])}
+
+
+_QWEN_SIZE_PRIORITY = ["1.7B", "0.6B"]
+
+
+def resolve_engine_and_model(profile, model_status, engine_override=None, model_size_override=None):
+    """No hardcodear "qwen"/"1.7B": cada perfil de Voicebox declara su propio
+    default_engine (verificado en vivo: Bananero -> qwen, Dora -> kokoro), y lo
+    que el usuario tiene descargado varia por maquina. Prioridad: override de CLI
+    > default_engine del perfil > "qwen" como ultimo recurso (funciona para
+    cualquier voz clonada)."""
+    engine = engine_override or profile.get("default_engine") or "qwen"
+
+    if engine not in ("qwen", "qwen_custom_voice"):
+        # Kokoro, luxtts, chatterbox, tada, etc. no versionan por model_size de
+        # la misma forma que Qwen - dejamos que Voicebox use su default (None es
+        # valido en el schema de GenerationRequest) salvo que el usuario lo pida.
+        return engine, model_size_override
+
+    if model_size_override:
+        return engine, model_size_override
+
+    prefix = "qwen-tts-" if engine == "qwen" else "qwen-custom-voice-"
+    for size in _QWEN_SIZE_PRIORITY:
+        entry = model_status.get(f"{prefix}{size}")
+        if entry and entry.get("downloaded"):
+            return engine, size
+
+    return engine, "1.7B"  # default del schema si no encontramos nada ya descargado
+
+
 def wait_for_generation_wav(generation_id, before_files, timeout=90):
     # Si tenemos un generation_id, NUNCA usar el fallback de "cualquier archivo
     # nuevo": con sintesis en paralelo (varias oraciones a la vez), el fallback
@@ -160,20 +197,22 @@ def wait_for_generation_wav(generation_id, before_files, timeout=90):
     return None
 
 
-def synthesize_sentence(text, profile, language):
+def synthesize_sentence(text, profile, language, engine, model_size=None):
     # POST /generate, no /generate/stream: mcp-server/index.js ya documenta que
     # /generate/stream dispara un bug de doble reproduccion en Voicebox y usa
     # /generate a proposito (ver index.js linea ~2810). Seguimos el camino probado.
     before = set(os.listdir(GENERATIONS_DIR)) if os.path.isdir(GENERATIONS_DIR) else set()
-    res = voicebox_request("/generate", method="POST", payload={
+    payload = {
         "profile_id": profile["id"],
         "text": text,
         "language": language,
-        "model_size": "1.7B",
-        "engine": "qwen",
+        "engine": engine,
         "personality": False,
         "normalize": True
-    })
+    }
+    if model_size:
+        payload["model_size"] = model_size
+    res = voicebox_request("/generate", method="POST", payload=payload)
     gen_id = res.get("id")
     wav_path = wait_for_generation_wav(gen_id, before)
     if not wav_path:
