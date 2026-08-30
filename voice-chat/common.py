@@ -1,0 +1,276 @@
+"""
+Piezas compartidas entre text_loop.py (entrada por consola) y voice_loop.py
+(entrada por microfono): cliente MCP, cliente HTTP de Voicebox, y el
+reproductor local en cola FIFO. Sin dependencias pip - solo stdlib.
+"""
+
+import json
+import os
+import queue
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MCP_SERVER = os.path.join(REPO_ROOT, "mcp-server", "index.js")
+VOICEBOX_URL = os.environ.get("VOICEBOX_URL", "http://127.0.0.1:17493")
+GENERATIONS_DIR = os.path.join(
+    os.environ.get("APPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Roaming")),
+    "sh.voicebox.app", "generations"
+)
+
+
+class McpClient:
+    """Habla JSON-RPC 2.0 con un mcp-server/index.js recien spawneado, sobre stdio -
+    el mismo protocolo y el mismo binario que usa Claude Code."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            ["node", MCP_SERVER],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            cwd=REPO_ROOT, text=True, encoding="utf-8", bufsize=1
+        )
+        self._next_id = 1
+        self._lock = threading.Lock()
+        self._pending = {}
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        self._request("initialize", {})
+
+    def _read_loop(self):
+        for line in self.proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg:
+                with self._lock:
+                    ev = self._pending.get(msg["id"])
+                if ev:
+                    ev["response"] = msg
+                    ev["event"].set()
+
+    def _request(self, method, params):
+        with self._lock:
+            req_id = self._next_id
+            self._next_id += 1
+            ev = {"event": threading.Event(), "response": None}
+            self._pending[req_id] = ev
+        payload = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        self.proc.stdin.write(payload + "\n")
+        self.proc.stdin.flush()
+        if not ev["event"].wait(timeout=30):
+            raise TimeoutError(f"El servidor MCP no respondio a '{method}' a tiempo.")
+        with self._lock:
+            del self._pending[req_id]
+        return ev["response"]
+
+    def call_tool(self, name, arguments):
+        resp = self._request("tools/call", {"name": name, "arguments": arguments})
+        result = resp.get("result", {})
+        if result.get("isError"):
+            text = result["content"][0]["text"] if result.get("content") else "Error MCP desconocido"
+            raise RuntimeError(f"{name} fallo: {text}")
+        return result["content"][0]["text"]
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+
+
+def voicebox_request(path, method="GET", payload=None, timeout=15, raw_body=None, headers=None):
+    data = raw_body if raw_body is not None else (json.dumps(payload).encode("utf-8") if payload is not None else None)
+    req_headers = {"X-Voicebox-Client-Id": "voice-loop-fase4"}
+    if raw_body is None:
+        req_headers["Content-Type"] = "application/json"
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(VOICEBOX_URL + path, data=data, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            body = res.read().decode("utf-8")
+            return json.loads(body) if body else {}
+    except urllib.error.URLError as err:
+        raise RuntimeError(
+            f"No se pudo contactar Voicebox en {VOICEBOX_URL}{path} ({err}). "
+            "¿Esta la app Voicebox corriendo?"
+        )
+
+
+def resolve_voice_profile(preferred_name, language):
+    profiles = voicebox_request("/profiles")
+    if not profiles:
+        raise RuntimeError("Voicebox no devolvio ningun perfil de voz.")
+
+    if preferred_name:
+        for p in profiles:
+            if p["name"].lower() == preferred_name.lower():
+                return p
+        for p in profiles:
+            if preferred_name.lower() in p["name"].lower():
+                return p
+
+    default_name = "diego alvarez" if language == "es" else "emily"
+    for p in profiles:
+        if default_name in p["name"].lower():
+            return p
+    for p in profiles:
+        if (p.get("language") or "").lower().startswith(language):
+            return p
+    return profiles[0]
+
+
+def wait_for_generation_wav(generation_id, before_files, timeout=90):
+    target = os.path.join(GENERATIONS_DIR, f"{generation_id}.wav") if generation_id else None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if target and os.path.exists(target) and os.path.getsize(target) > 2000:
+            time.sleep(0.2)
+            return target
+        if os.path.isdir(GENERATIONS_DIR):
+            for f in os.listdir(GENERATIONS_DIR):
+                if f not in before_files and f.endswith((".wav", ".ogg", ".mp3")):
+                    full = os.path.join(GENERATIONS_DIR, f)
+                    if os.path.getsize(full) > 2000:
+                        time.sleep(0.2)
+                        return full
+        time.sleep(0.3)
+    return None
+
+
+def synthesize_sentence(text, profile, language):
+    # POST /generate, no /generate/stream: mcp-server/index.js ya documenta que
+    # /generate/stream dispara un bug de doble reproduccion en Voicebox y usa
+    # /generate a proposito (ver index.js linea ~2810). Seguimos el camino probado.
+    before = set(os.listdir(GENERATIONS_DIR)) if os.path.isdir(GENERATIONS_DIR) else set()
+    res = voicebox_request("/generate", method="POST", payload={
+        "profile_id": profile["id"],
+        "text": text,
+        "language": language,
+        "model_size": "1.7B",
+        "engine": "qwen",
+        "personality": False,
+        "normalize": True
+    })
+    gen_id = res.get("id")
+    wav_path = wait_for_generation_wav(gen_id, before)
+    if not wav_path:
+        raise RuntimeError(f"Voicebox nunca escribio el .wav de la generacion {gen_id}")
+    return gen_id, wav_path
+
+
+def voicebox_cancel(generation_id):
+    if not generation_id:
+        return
+    try:
+        voicebox_request(f"/generate/{generation_id}/cancel", method="POST", payload={})
+    except Exception:
+        pass
+
+
+def transcribe_wav_bytes(wav_bytes, language=None):
+    boundary = "----voiceloopboundary"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
+        f"Content-Type: audio/wav\r\n\r\n"
+    ).encode("utf-8") + wav_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    res = voicebox_request(
+        "/transcribe", method="POST", raw_body=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        timeout=60
+    )
+    return res.get("text", "").strip()
+
+
+class AudioPlayer:
+    """Cola FIFO de reproduccion via el reproductor nativo de Windows (mismo mecanismo
+    que playLocalAudio() en mcp-server/index.js: System.Media.SoundPlayer, cero eco,
+    cero dependencias extra). barge_in() corta lo que suena y descarta lo pendiente."""
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._current_proc = None
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def enqueue(self, wav_path, label):
+        self._queue.put((wav_path, label))
+
+    def is_active(self):
+        with self._lock:
+            playing = self._current_proc is not None and self._current_proc.poll() is None
+        return playing or not self._queue.empty()
+
+    def _run(self):
+        while True:
+            wav_path, label = self._queue.get()
+            if wav_path is None:
+                return
+            escaped = wav_path.replace("'", "''")
+            ps_cmd = f"& {{ $p = '{escaped}'; (New-Object System.Media.SoundPlayer $p).PlaySync() }}"
+            with self._lock:
+                self._current_proc = subprocess.Popen(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            print(f"  \U0001F50A {label}")
+            self._current_proc.wait()
+            with self._lock:
+                self._current_proc = None
+
+    def barge_in(self):
+        dropped = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+        with self._lock:
+            if self._current_proc and self._current_proc.poll() is None:
+                self._current_proc.terminate()
+                print("  ✋ Barge-in: reproduccion actual cortada.")
+        if dropped:
+            print(f"  ✋ Barge-in: {dropped} frase(s) pendiente(s) descartada(s).")
+
+
+class SentenceSequencer:
+    """Sintetizar en paralelo (ThreadPoolExecutor) puede terminar oraciones fuera de
+    orden. Este hilo consume los Future en el orden en que se ENVIARON, no en el que
+    terminan, y recien ahi encola para reproduccion - preserva orden sin serializar
+    la sintesis."""
+
+    def __init__(self, player, last_generation_id):
+        self._queue = queue.Queue()
+        self._player = player
+        self._last_generation_id = last_generation_id
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, future, text):
+        self._queue.put((future, text))
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, text = item
+            try:
+                gen_id, wav_path = future.result()
+                self._last_generation_id["id"] = gen_id
+                self._player.enqueue(wav_path, text)
+            except Exception as err:
+                print(f"  ⚠️ Error sintetizando \"{text}\": {err}")

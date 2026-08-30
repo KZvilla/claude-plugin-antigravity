@@ -1,0 +1,5 @@
+# Solo necesario para voice_loop.py (captura de microfono real + VAD).
+# text_loop.py no tiene dependencias pip - usa solo stdlib.
+sounddevice
+silero-vad
+numpy
