@@ -28,7 +28,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
     resolve_voice_profile, synthesize_sentence, voicebox_cancel,
-    get_model_status, resolve_engine_and_model
+    get_model_status, resolve_engine_and_model, unload_all_loaded_models
 )
 
 
@@ -41,7 +41,14 @@ def main():
                          help="Forzar motor TTS (qwen, qwen_custom_voice, kokoro, luxtts, chatterbox, chatterbox_turbo, tada). "
                               "Por defecto usa el default_engine del perfil elegido.")
     parser.add_argument("--model-size", default=None, help='Forzar tamano de modelo (ej. "1.7B", "0.6B") - solo aplica a motores Qwen.')
+    parser.add_argument("--unload-all", action="store_true",
+                         help="Descargar TODO lo que Voicebox tenga cargado ahora mismo (de cualquier corrida previa) y salir.")
     args = parser.parse_args()
+
+    if args.unload_all:
+        freed_gb = unload_all_loaded_models()
+        print(f"\nTotal liberado: {freed_gb:.2f} GB" if freed_gb else "Nada estaba cargado.")
+        return
 
     print("[voice-loop] Conectando al servidor MCP real (mcp-server/index.js)...")
     mcp = McpClient()

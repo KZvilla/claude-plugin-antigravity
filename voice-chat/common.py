@@ -286,6 +286,21 @@ def unload_model(model_name):
         return False
 
 
+def unload_all_loaded_models():
+    """A diferencia de unload_model() (que descarga UN modelo puntual), esto
+    descarga TODO lo que Voicebox tenga marcado como loaded en este momento -
+    util porque --unload-on-exit solo limpia lo que ESA corrida del script uso,
+    no lo que quedo cargado de corridas anteriores (perfiles/motores distintos)."""
+    status = get_model_status()
+    loaded = [m for m in status.values() if m.get("loaded")]
+    freed_mb = 0
+    for m in loaded:
+        if unload_model(m["model_name"]):
+            freed_mb += m.get("size_mb") or 0
+            print(f"  🗑️ {m['model_name']} descargado ({(m.get('size_mb') or 0) / 1024:.2f} GB)")
+    return freed_mb / 1024
+
+
 class AudioPlayer:
     """Cola FIFO de reproduccion via el reproductor nativo de Windows (mismo mecanismo
     que playLocalAudio() en mcp-server/index.js: System.Media.SoundPlayer, cero eco,

@@ -49,7 +49,8 @@ except ImportError as err:
 from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
     resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
-    get_model_status, resolve_engine_and_model, tts_model_name, unload_model, stt_full_model_name
+    get_model_status, resolve_engine_and_model, tts_model_name, unload_model, stt_full_model_name,
+    unload_all_loaded_models
 )
 
 SAMPLE_RATE = 16000
@@ -182,10 +183,20 @@ def main():
                               '(esa convencion es solo de /models/status). Sin esto, Voicebox caia en "base" por default silencioso.')
     parser.add_argument("--unload-on-exit", action="store_true",
                          help="Al cerrar, descargar de memoria (no del disco) el modelo TTS y el STT usados en esta sesion.")
+    parser.add_argument("--unload-all-on-exit", action="store_true",
+                         help="Al cerrar, descargar TODO lo que Voicebox tenga cargado en memoria en ese momento "
+                              "(no solo lo que esta corrida uso) - util si quedaron modelos de corridas anteriores.")
+    parser.add_argument("--unload-all", action="store_true",
+                         help="Descargar TODO lo que Voicebox tenga cargado ahora mismo y salir, sin arrancar sesion.")
     args = parser.parse_args()
 
     if args.list_devices:
         print(sd.query_devices())
+        return
+
+    if args.unload_all:
+        freed_gb = unload_all_loaded_models()
+        print(f"\nTotal liberado: {freed_gb:.2f} GB" if freed_gb else "Nada estaba cargado.")
         return
 
     if args.list_engines:
@@ -327,8 +338,12 @@ def main():
         mcp.close()
         executor.shutdown(wait=False)
 
-        if args.unload_on_exit:
-            print("[voice-loop] Descargando modelos de memoria...")
+        if args.unload_all_on_exit:
+            print("[voice-loop] Descargando TODO lo que Voicebox tenga cargado...")
+            freed_gb = unload_all_loaded_models()
+            print(f"[voice-loop] Total liberado: {freed_gb:.2f} GB")
+        elif args.unload_on_exit:
+            print("[voice-loop] Descargando modelos de esta sesion...")
             unload_model(tts_model_name(engine, model_size))
             unload_model(stt_full_model_name(args.stt_model))
 
