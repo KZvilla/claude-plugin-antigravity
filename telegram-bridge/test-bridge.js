@@ -57,6 +57,17 @@ const dequeued = dequeueTask();
 assert.strictEqual(dequeued.id, 'task-1', 'Debe desencolar la tarea');
 console.log('✔ Test 5: Cola de ejecución (concurrency 1) validada');
 
+// Test 6: La cola debe mantener el ctx vivo (no debe serializarse a JSON).
+// Si esto se rompe, ctx.reply deja de ser una función tras encolar/desencolar
+// (queda un objeto plano de JSON.parse) y el bot crashea con una excepción
+// no controlada en cuanto intenta responder al usuario.
+const fakeCtx = { reply: () => 'called', chat: { id: 1 } };
+enqueueTask({ ctx: fakeCtx, chatId: 1, prompt: 'test', mode: 'accept-edits', conversationId: null });
+const dequeuedWithCtx = dequeueTask();
+assert.strictEqual(typeof dequeuedWithCtx.ctx.reply, 'function', 'ctx.reply debe seguir siendo una función tras desencolar');
+assert.strictEqual(dequeuedWithCtx.ctx, fakeCtx, 'ctx debe ser la misma referencia en memoria, no una copia JSON');
+console.log('✔ Test 6: ctx conserva sus métodos a través de la cola');
+
 // Limpieza de state.json de test
 try {
   const statePath = path.join(__dirname, 'state.json');

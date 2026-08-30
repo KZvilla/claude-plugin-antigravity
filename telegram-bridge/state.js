@@ -8,7 +8,6 @@ const STATE_FILE = path.join(__dirname, 'state.json');
 
 const DEFAULT_STATE = {
   chats: {},
-  queue: [],
   pendingAsks: {}
 };
 
@@ -17,19 +16,18 @@ const DEFAULT_STATE = {
  */
 export function loadState() {
   if (!fs.existsSync(STATE_FILE)) {
-    return { ...DEFAULT_STATE, chats: {}, queue: [], pendingAsks: {} };
+    return { ...DEFAULT_STATE, chats: {}, pendingAsks: {} };
   }
   try {
     const raw = fs.readFileSync(STATE_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     return {
       chats: parsed.chats || {},
-      queue: Array.isArray(parsed.queue) ? parsed.queue : [],
       pendingAsks: parsed.pendingAsks || {}
     };
   } catch (err) {
     console.error(`[state] Error leyendo state.json: ${err.message}. Reinicializando.`);
-    return { ...DEFAULT_STATE, chats: {}, queue: [], pendingAsks: {} };
+    return { ...DEFAULT_STATE, chats: {}, pendingAsks: {} };
   }
 }
 
@@ -83,35 +81,41 @@ export function clearConversationId(chatId) {
 }
 
 /**
+ * Cola de tareas en memoria (NO persistida en state.json).
+ *
+ * Cada tarea lleva el `ctx` vivo de grammY (con sus métodos .reply,
+ * .replyWithChatAction, etc.). Si se serializa a JSON y se vuelve a leer,
+ * `ctx` se convierte en un objeto plano sin esos métodos: el bot llamaría
+ * a `ctx.reply(...)` sobre `undefined` y la excepción resultante quedaría
+ * sin capturar, terminando el proceso (unhandled rejection). Por eso la
+ * cola se mantiene solo en memoria del proceso actual.
+ */
+let taskQueue = [];
+
+/**
  * Agrega una tarea a la cola
  */
 export function enqueueTask(task) {
-  const state = loadState();
-  state.queue.push({
+  taskQueue.push({
     ...task,
     enqueuedAt: new Date().toISOString()
   });
-  saveState(state);
-  return state.queue.length;
+  return taskQueue.length;
 }
 
 /**
  * Extrae la siguiente tarea de la cola
  */
 export function dequeueTask() {
-  const state = loadState();
-  if (state.queue.length === 0) return null;
-  const task = state.queue.shift();
-  saveState(state);
-  return task;
+  if (taskQueue.length === 0) return null;
+  return taskQueue.shift();
 }
 
 /**
  * Retorna la longitud actual de la cola
  */
 export function getQueueLength() {
-  const state = loadState();
-  return state.queue.length;
+  return taskQueue.length;
 }
 
 /**

@@ -98,6 +98,11 @@ process.on('uncaughtException', (err) => {
   releaseLock();
   process.exit(1);
 });
+process.on('unhandledRejection', (err) => {
+  console.error('[UNHANDLED REJECTION]', err);
+  releaseLock();
+  process.exit(1);
+});
 
 // ==============================================================================
 // 3. Inicialización del Bot e Infraestructura de Cola (Concurrency = 1)
@@ -120,7 +125,13 @@ bot.use(async (ctx, next) => {
  */
 async function processTaskQueue() {
   if (isProcessingTask) return;
-  const task = dequeueTask();
+  let task;
+  try {
+    task = dequeueTask();
+  } catch (err) {
+    console.error('[QUEUE ERROR] No se pudo obtener la siguiente tarea:', err);
+    return;
+  }
   if (!task) return;
 
   isProcessingTask = true;
@@ -170,12 +181,18 @@ async function processTaskQueue() {
   } catch (err) {
     if (typingInterval) clearInterval(typingInterval);
     console.error('[TASK ERROR]', err);
-    await ctx.reply(`❌ Ocurrió un error inesperado al procesar la tarea: ${err.message}`);
+    try {
+      await ctx.reply(`❌ Ocurrió un error inesperado al procesar la tarea: ${err.message}`);
+    } catch (replyErr) {
+      console.error('[TASK ERROR] No se pudo notificar el error al usuario:', replyErr);
+    }
   } finally {
     isProcessingTask = false;
     // Si quedan tareas en cola, procesar la siguiente
     if (getQueueLength() > 0) {
-      setImmediate(processTaskQueue);
+      setImmediate(() => {
+        processTaskQueue().catch((err) => console.error('[QUEUE ERROR]', err));
+      });
     }
   }
 }
@@ -196,7 +213,7 @@ async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = nu
   // Despachar inmediatamente
   enqueueTask({ ctx, chatId, prompt, mode, conversationId: activeConvId });
   await ctx.reply(mode === 'plan' ? '🧠 Generando plan arquitectónico...' : '⚙️ Ejecutando tarea con Antigravity...');
-  processTaskQueue();
+  processTaskQueue().catch((err) => console.error('[QUEUE ERROR]', err));
 }
 
 // ==============================================================================
