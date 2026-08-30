@@ -1,0 +1,23 @@
+{
+  "name": "antigravity-telegram-bridge",
+  "version": "1.0.0",
+  "description": "Zero-cost Telegram bot bridge for Antigravity CLI and Claude Code over CGNAT",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "test": "node test-bridge.js"
+  },
+  "dependencies": {
+    "grammy": "^1.35.0"
+  },
+  "keywords": [
+    "telegram-bot",
+    "antigravity",
+    "claude-code",
+    "cgnat",
+    "long-polling"
+  ],
+  "author": "KZvilla",
+  "license": "MIT"
+}

@@ -8,6 +8,8 @@ SESSION-SUMMARY.md
 # Security & Secrets (Standard §11.1)
 .env
 .env.*
+!.env.example
+!telegram-bridge/.env.example
 *.key
 *.pem
 *.cert
@@ -20,3 +22,9 @@ SESSION-SUMMARY.md
 antigravity.json
 antigravity-usage.json
 antigravity-sessions.json
+
+# Telegram bridge state & locks
+telegram-bridge/state.json
+telegram-bridge/*.lock
+state.json
+*.lock

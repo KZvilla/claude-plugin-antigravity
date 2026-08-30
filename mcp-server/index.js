@@ -658,6 +658,14 @@ const TOOLS = [
         personality: {
           type: 'boolean',
           description: 'When true, adopts the persona and personality configured on the Voicebox profile (from profile.description and profile.personality). Defaults to false (neutral professional tone).'
+        },
+        send_telegram: {
+          type: 'boolean',
+          description: 'When true (default: true if Telegram is configured), automatically delivers the synthesized speech as a native playable voice note to your mobile Telegram app.'
+        },
+        local_playback: {
+          type: 'boolean',
+          description: 'When true, plays the audio aloud through your PC speakers via Voicebox /speak. Defaults to false (silent background generation via /generate, delivering cleanly to Telegram without scaring anyone).'
         }
       }
     }
@@ -680,6 +688,73 @@ const TOOLS = [
         voicebox_port: {
           type: 'number',
           description: 'Custom Voicebox port number if running on a non-default port.'
+        }
+      }
+    }
+  },
+  {
+    name: 'telegram_notify',
+    description: 'Send an instant push notification or alert from your development environment to your mobile Telegram app (e.g. task completed, test failures, build status). Supports markdown formatting and file attachments.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: {
+          type: 'string',
+          description: 'The notification message text to display on your mobile phone.'
+        },
+        title: {
+          type: 'string',
+          description: 'Optional bold title header for the notification.'
+        },
+        level: {
+          type: 'string',
+          enum: ['info', 'success', 'warning', 'error'],
+          description: 'Alert severity level (determines the emoji indicator: ℹ️ info, ✅ success, ⚠️ warning, 🚨 error). Defaults to "info".'
+        },
+        file_path: {
+          type: 'string',
+          description: 'Optional absolute path to a file, screenshot, or report to attach and send along with the notification.'
+        }
+      },
+      required: ['message']
+    }
+  },
+  {
+    name: 'telegram_ask',
+    description: 'Ask the user a question on their mobile Telegram app with interactive choice buttons (Human-in-the-Loop). Pauses agent execution until the user selects an option on their phone, then returns the selected choice.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: 'The decision question to ask the user on mobile (e.g. "Do you want to apply this database migration?").'
+        },
+        options: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Interactive button choices presented on the phone. Defaults to ["Aprobar", "Rechazar"].'
+        },
+        timeout_seconds: {
+          type: 'number',
+          description: 'Maximum seconds to wait for user response on mobile before timing out (defaults to 300 seconds).'
+        }
+      },
+      required: ['question']
+    }
+  },
+  {
+    name: 'telegram_send_voice',
+    description: 'Send an audio file or the latest Voicebox TTS generation as a native playable voice note (waveform player) to your mobile Telegram app.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        audio_path: {
+          type: 'string',
+          description: 'Path to audio file (.wav, .ogg, .mp3). If omitted, automatically locates the latest speech generation from Voicebox.'
+        },
+        caption: {
+          type: 'string',
+          description: 'Optional caption text to display with the voice note.'
         }
       }
     }
@@ -1249,6 +1324,87 @@ async function sendVoiceboxSpeak(baseUrl, text, profileName, language) {
   throw new Error(`Voicebox /speak returned HTTP ${res.statusCode}: ${res.body}`);
 }
 
+async function sendVoiceboxGenerate(baseUrl, text, profileId, language, options = {}) {
+  const postData = {
+    profile_id: profileId,
+    text,
+    language: language || 'es',
+    model_size: '1.7B',
+    engine: options.engine || 'qwen',
+    personality: Boolean(options.personality),
+    normalize: true
+  };
+  const res = await httpRequest(`${baseUrl}/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 15000
+  }, postData);
+
+  if (res.statusCode >= 200 && res.statusCode < 300) {
+    try {
+      return JSON.parse(res.body);
+    } catch {
+      return { status: 'generating', raw: res.body };
+    }
+  }
+  throw new Error(`Voicebox /generate returned HTTP ${res.statusCode}: ${res.body}`);
+}
+
+function playLocalAudio(filePath) {
+  return new Promise((resolve) => {
+    if (!filePath || !fs.existsSync(filePath)) return resolve(false);
+    if (process.platform === 'win32') {
+      const escaped = filePath.replace(/'/g, "''");
+      const psCmd = `& { $p = '${escaped}'; (New-Object System.Media.SoundPlayer $p).PlaySync() }`;
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
+        windowsHide: true,
+        stdio: 'ignore'
+      });
+      child.on('close', (code) => resolve(code === 0));
+      child.on('error', () => resolve(false));
+    } else {
+      resolve(false);
+    }
+  });
+}
+
+async function waitForGenerationFile(genDir, generationId, beforeFiles = [], timeoutMs = 90000) {
+  const beforeSet = new Set(beforeFiles);
+  const startTime = Date.now();
+  const targetFileById = generationId ? path.join(genDir, `${generationId}.wav`) : null;
+
+  while (Date.now() - startTime < timeoutMs) {
+    if (targetFileById && fs.existsSync(targetFileById)) {
+      try {
+        const stat = fs.statSync(targetFileById);
+        if (stat.size > 2000) {
+          await new Promise(r => setTimeout(r, 400));
+          return targetFileById;
+        }
+      } catch {}
+    }
+
+    if (fs.existsSync(genDir)) {
+      try {
+        const currentFiles = fs.readdirSync(genDir);
+        for (const file of currentFiles) {
+          if ((file.endsWith('.wav') || file.endsWith('.ogg') || file.endsWith('.mp3')) && !beforeSet.has(file)) {
+            const fullPath = path.join(genDir, file);
+            const stat = fs.statSync(fullPath);
+            if (stat.size > 2000) {
+              await new Promise(r => setTimeout(r, 400));
+              return fullPath;
+            }
+          }
+        }
+      } catch {}
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return null;
+}
+
 function extractLastCheckpoint(filePath) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`Session log file not found: ${filePath}`);
@@ -1535,6 +1691,57 @@ function executeAgy(args, options = {}) {
           stderr
         });
       }
+    });
+  });
+}
+
+// Helper: Invoke Telegram Bridge for outbound notifications and human-in-the-loop decisions
+function invokeTelegramBridge(command, payload = {}) {
+  return new Promise((resolve) => {
+    const notifyScript = path.join(__dirname, '..', 'telegram-bridge', 'notify.js');
+    if (!fs.existsSync(notifyScript)) {
+      return resolve({ ok: false, error: 'telegram-bridge/notify.js not found' });
+    }
+
+    const timeoutSec = (payload.timeoutSeconds || payload.timeout_seconds || 300) + 15;
+    const child = spawn(process.execPath, [notifyScript, command, '-'], {
+      shell: false,
+      cwd: path.dirname(notifyScript),
+      env: { ...process.env },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch {}
+      resolve({ ok: false, error: `Telegram operation timed out after ${timeoutSec}s` });
+    }, timeoutSec * 1000);
+
+    child.stdin.write(JSON.stringify(payload) + '\n');
+    child.stdin.end();
+
+    child.stdout.on('data', d => { stdout += d.toString('utf8'); });
+    child.stderr.on('data', d => { stderr += d.toString('utf8'); });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        resolve({ ok: code === 0, ...parsed });
+      } catch {
+        resolve({
+          ok: code === 0,
+          raw: stdout.trim(),
+          error: stderr.trim() || `Process exited with code ${code}`
+        });
+      }
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ ok: false, error: err.message });
     });
   });
 }
@@ -2262,21 +2469,70 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
           : 'La última tarea se ha completado exitosamente.';
       }
 
-      // 6. Send to Voicebox TTS
+      // 5.9 Snapshot previo de archivos en generations/ para FIFO / detección exacta
+      const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Roaming');
+      const genDir = path.join(appData, 'sh.voicebox.app', 'generations');
+      const beforeFiles = fs.existsSync(genDir) ? fs.readdirSync(genDir) : [];
+
+      // 6. Send to Voicebox TTS: siempre usamos /generate para evitar el bug de doble reproducción de Voicebox
       let speakRes;
       try {
-        speakRes = await sendVoiceboxSpeak(voiceboxUrl, spokenText, chosenProfile.name, targetLang);
+        speakRes = await sendVoiceboxGenerate(voiceboxUrl, spokenText, chosenProfile.id, targetLang, {
+          personality: enablePersonality
+        });
       } catch (err) {
         return {
           content: [{
             type: 'text',
-            text: `⚠️ **Guión generado pero falló la emisión en Voicebox:**\n\n"${spokenText}"\n\nError: ${err.message}`
+            text: `⚠️ **Guión generado pero falló la generación en Voicebox:**\n\n"${spokenText}"\n\nError: ${err.message}`
           }]
         };
       }
 
-      // 7. Format structured output for Claude
       const langLabel = targetLang === 'es' ? 'Español' : 'Inglés';
+      const playLocally = Boolean(args.local_playback);
+      let localPlayed = false;
+      let telegramDelivered = false;
+      let generatedWavPath = null;
+
+      // 6.1 Si se solicitó reproducción local, esperar a que el archivo termine y reproducirlo con el motor nativo de Windows (0 eco)
+      if (playLocally) {
+        try {
+          generatedWavPath = await waitForGenerationFile(
+            genDir,
+            (speakRes && speakRes.id) ? speakRes.id : null,
+            beforeFiles,
+            90000
+          );
+          if (generatedWavPath) {
+            localPlayed = await playLocalAudio(generatedWavPath);
+          }
+        } catch (pErr) {
+          process.stderr.write(`[antigravity-mcp] Local playback error: ${pErr.message}\n`);
+        }
+      }
+
+      // 6.2 Enviar nota de voz a Telegram si está configurado (por defecto activo)
+      if (args.send_telegram !== false) {
+        try {
+          const tPayload = {
+            generationId: (speakRes && speakRes.id) ? speakRes.id : null,
+            beforeFiles,
+            waitForGeneration: !generatedWavPath,
+            timeoutSeconds: 95,
+            caption: `🎙️ "${spokenText}"\n(Voz: ${chosenProfile.name} • ${langLabel})`
+          };
+          if (generatedWavPath) {
+            tPayload.audioPath = generatedWavPath;
+          }
+          const tRes = await invokeTelegramBridge('--voice-json', tPayload);
+          if (tRes && tRes.ok) telegramDelivered = true;
+        } catch (tErr) {
+          process.stderr.write(`[antigravity-mcp] Telegram delivery skipped: ${tErr.message}\n`);
+        }
+      }
+
+      // 7. Format structured output for Claude
       const fallbackNotice = voiceResolution.isFallback
         ? ` *(Fallback: ${voiceResolution.reason})*`
         : ' *(Voz preferida)*';
@@ -2288,9 +2544,13 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       out += `- **Perfil de voz**: \`${chosenProfile.name}\` (${chosenProfile.voice_type || 'cloned'})${fallbackNotice}\n`;
       out += `- **Idioma**: \`${langLabel} (${targetLang})\`\n`;
       out += `- **Modo de Personalidad**: ${enablePersonality ? `🎭 En personaje (\`${chosenProfile.personality || chosenProfile.description || 'expresivo'}\`)` : '👔 Neutral / Profesional'}\n`;
+      out += `- **Reproducción Local en PC**: ${playLocally ? (localPlayed ? '🔊 Reproducido limpiamente en altavoces (sin eco)' : '⚠️ Solicitado pero falló el reproductor local') : '🤫 Silencioso en PC'}\n`;
       out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
       if (speakRes && speakRes.id) {
         out += `- **Voicebox Generation ID**: \`${speakRes.id}\`\n`;
+      }
+      if (telegramDelivered) {
+        out += `- **Telegram Móvil**: ✅ Nota de voz entregada a tu teléfono\n`;
       }
       out += `\n**Contexto del Checkpoint detectado:**\n`;
       out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
@@ -2379,6 +2639,66 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
 
       return {
         content: [{ type: 'text', text: out }]
+      };
+    }
+
+    case 'telegram_notify': {
+      const res = await invokeTelegramBridge('--notify-json', {
+        title: args.title,
+        message: args.message,
+        level: args.level || 'info',
+        filePath: args.file_path
+      });
+
+      if (!res.ok) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Failed to send Telegram notification: ${res.error}` }]
+        };
+      }
+
+      return {
+        content: [{ type: 'text', text: `✅ Notification successfully delivered to your mobile Telegram app.` }]
+      };
+    }
+
+    case 'telegram_ask': {
+      const res = await invokeTelegramBridge('--ask-json', {
+        question: args.question,
+        options: args.options || ['Aprobar', 'Rechazar'],
+        timeoutSeconds: args.timeout_seconds || 300
+      });
+
+      if (!res.ok || !res.answered) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Telegram ask error or timeout: ${res.error || 'No answer received within time limit'}` }]
+        };
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: `User responded from mobile Telegram app:\n- Selected Choice: "${res.selected}"\n- Answered By ID: ${res.answeredBy || 'Authorized User'}`
+        }]
+      };
+    }
+
+    case 'telegram_send_voice': {
+      const res = await invokeTelegramBridge('--voice-json', {
+        audioPath: args.audio_path,
+        caption: args.caption || '🎙️ Nota de voz de Voicebox'
+      });
+
+      if (!res.ok) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Failed to send voice note to Telegram: ${res.error}` }]
+        };
+      }
+
+      return {
+        content: [{ type: 'text', text: `✅ Voice note delivered to your mobile Telegram app.` }]
       };
     }
 
