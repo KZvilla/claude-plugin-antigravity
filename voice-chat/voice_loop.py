@@ -196,12 +196,16 @@ def main():
         print("\U0001F3A4 Te escucho...")
 
     def on_utterance(audio_samples):
-        turn_queue.put(audio_samples)
+        # Capturar el token AHORA, no cuando turn_worker la saque de la cola: si
+        # el usuario vuelve a hablar enseguida, on_speech_start ya subio el token
+        # antes de que esta utterance se procese, y ese turno "viejo" se colaria
+        # como si fuera vigente (asi sonaban dos respuestas identicas seguidas).
+        turn_queue.put((audio_samples, generation_token["value"]))
 
     def turn_worker():
         while True:
-            audio_samples = turn_queue.get()
-            my_token = generation_token["value"]
+            audio_samples, my_token = turn_queue.get()
+            print(f"  [debug] utterance recibida: {len(audio_samples)/SAMPLE_RATE:.2f}s, token={my_token}")
             try:
                 wav_bytes = float32_to_wav_bytes(audio_samples)
                 text = transcribe_wav_bytes(wav_bytes, language=args.language)

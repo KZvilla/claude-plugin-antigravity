@@ -132,12 +132,23 @@ def resolve_voice_profile(preferred_name, language):
 
 
 def wait_for_generation_wav(generation_id, before_files, timeout=90):
-    target = os.path.join(GENERATIONS_DIR, f"{generation_id}.wav") if generation_id else None
+    # Si tenemos un generation_id, NUNCA usar el fallback de "cualquier archivo
+    # nuevo": con sintesis en paralelo (varias oraciones a la vez), el fallback
+    # puede agarrar el .wav de OTRA generacion concurrente que broto primero,
+    # encolando el mismo audio dos veces bajo dos oraciones distintas. El
+    # fallback por snapshot solo es seguro cuando no hay id para apuntar.
+    if generation_id:
+        target = os.path.join(GENERATIONS_DIR, f"{generation_id}.wav")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(target) and os.path.getsize(target) > 2000:
+                time.sleep(0.2)
+                return target
+            time.sleep(0.3)
+        return None
+
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if target and os.path.exists(target) and os.path.getsize(target) > 2000:
-            time.sleep(0.2)
-            return target
         if os.path.isdir(GENERATIONS_DIR):
             for f in os.listdir(GENERATIONS_DIR):
                 if f not in before_files and f.endswith((".wav", ".ogg", ".mp3")):
@@ -270,6 +281,7 @@ class SentenceSequencer:
             future, text = item
             try:
                 gen_id, wav_path = future.result()
+                print(f"  [debug] enqueue gen_id={gen_id} wav={os.path.basename(wav_path)} text={text[:40]!r}")
                 self._last_generation_id["id"] = gen_id
                 self._player.enqueue(wav_path, text)
             except Exception as err:
