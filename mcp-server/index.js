@@ -2846,6 +2846,7 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       }
 
       // 6.2 Enviar nota de voz a Telegram si está configurado (por defecto activo)
+      let telegramError = null;
       if (args.send_telegram !== false) {
         try {
           const tPayload = {
@@ -2859,9 +2860,16 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
             tPayload.audioPath = generatedWavPath;
           }
           const tRes = await invokeTelegramBridge('--voice-json', tPayload);
-          if (tRes && tRes.ok) telegramDelivered = true;
+          if (tRes && tRes.ok) {
+            telegramDelivered = true;
+          } else {
+            telegramError = (tRes && tRes.error) ? tRes.error : 'Fallo desconocido enviando a Telegram.';
+          }
         } catch (tErr) {
-          process.stderr.write(`[antigravity-mcp] Telegram delivery skipped: ${tErr.message}\n`);
+          telegramError = tErr.message;
+        }
+        if (telegramError) {
+          process.stderr.write(`[antigravity-mcp] Telegram delivery failed: ${telegramError}\n`);
         }
       }
 
@@ -2884,6 +2892,8 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       }
       if (telegramDelivered) {
         out += `- **Telegram Móvil**: ✅ Nota de voz entregada a tu teléfono\n`;
+      } else if (telegramError) {
+        out += `- **Telegram Móvil**: ⚠️ Falló el envío — ${telegramError}\n`;
       }
       out += `\n**Contexto del Checkpoint detectado:**\n`;
       out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
