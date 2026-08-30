@@ -661,6 +661,10 @@ const TOOLS = [
           type: 'boolean',
           description: 'Auto-approve tool permissions on "start" without interactive prompting. Defaults to true (required for headless voice sessions).'
         },
+        prime_conversational: {
+          type: 'boolean',
+          description: 'On "start", send one throwaway priming turn instructing agy to respond conversationally (short spoken sentences, no markdown, no file writes/plans) instead of treating spoken input like a coding task. Defaults to true — without it, agy can respond to a simple spoken question by writing a plan.md file instead of just answering. The priming exchange is drained away and never surfaced to the caller.'
+        },
         prewarm_voicebox: {
           type: 'boolean',
           description: 'On "start", also fire a non-blocking POST /models/load to Voicebox so the TTS model is already in VRAM before the first spoken reply. Defaults to true.'
@@ -2220,10 +2224,35 @@ ${args.prompt}`;
           await new Promise((r) => setTimeout(r, 50));
         }
 
+        // Priming turn: without this, agy treats spoken questions as coding-agent tasks
+        // and can do things like write a plan.md file instead of just answering out loud
+        // (verified live 2026-08-30 — a plain "tell me two facts" prompt produced a written
+        // plan document and markdown links). Send one throwaway turn establishing
+        // conversational behavior, then drain it away so callers never see it.
+        let primingNote = '';
+        if (args.prime_conversational !== false) {
+          const primingText = 'A partir de ahora estamos en una conversación de voz en tiempo real, no en una sesión de código. ' +
+            'Respondé siempre en 1 a 3 oraciones breves, en lenguaje hablado natural. ' +
+            'No uses markdown, listas, enlaces ni bloques de código. No escribas, edites ni planifiques archivos — ' +
+            'es una charla, no una tarea de programación, salvo que te pida explícitamente hacer algo en el proyecto. ' +
+            'Confirmá que entendiste respondiendo con una sola palabra: OK.';
+          try {
+            sendVoiceStreamTurn(session, primingText);
+            const primingDeadline = Date.now() + 10000;
+            while (Date.now() < primingDeadline && !session.events.slice(session.cursor).some(e => e.event === 'result')) {
+              await new Promise((r) => setTimeout(r, 50));
+            }
+            drainVoiceStreamEvents(session); // discard the priming exchange
+            primingNote = '\n- Priming conversacional: aplicado';
+          } catch (err) {
+            primingNote = `\n- Priming conversacional: falló (${err.message})`;
+          }
+        }
+
         return {
           content: [{
             type: 'text',
-            text: `Voice stream session started.\n- stream_id: \`${session.id}\`\n- conversation_id: \`${session.conversationId || 'pending'}\`\n- Model: \`${effectiveModel || 'default'}\` | Effort: \`${effectiveEffort}\` | Mode: \`${effectiveMode}\`\n- Status: \`${session.status}\`${prewarmNote}\n\nUse \`action: "send"\` with this stream_id to send a turn, then poll \`action: "drain"\` to read incremental text_delta events as they arrive.`
+            text: `Voice stream session started.\n- stream_id: \`${session.id}\`\n- conversation_id: \`${session.conversationId || 'pending'}\`\n- Model: \`${effectiveModel || 'default'}\` | Effort: \`${effectiveEffort}\` | Mode: \`${effectiveMode}\`\n- Status: \`${session.status}\`${prewarmNote}${primingNote}\n\nUse \`action: "send"\` with this stream_id to send a turn, then poll \`action: "drain"\` to read incremental text_delta events as they arrive.`
           }]
         };
       }
