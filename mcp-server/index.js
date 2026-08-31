@@ -1784,7 +1784,7 @@ function executeAgy(args, options = {}) {
 
 // Fase 2 (Modo Charla): persistent `agy.exe` stream sessions.
 // Distinct from executeAgy() on purpose — that helper blocks until child.on('close'),
-// which defeats the point of a low-latency conversational loop (see docs/future-implementations/voice-chat-architecture.md, section 3.1).
+// which defeats the point of a low-latency conversational loop (see docs/architecture/voice-chat-architecture.md, section 3.1).
 // A session here keeps one agy.exe process alive across many turns via
 // `--input-format stream-json --output-format stream-json`, avoiding per-turn cold starts.
 //

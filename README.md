@@ -21,6 +21,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Slash Commands](#-slash-commands)
 - [MCP Tools Reference](#-mcp-tools-reference)
 - [Voice Checkpoint Narration](#-voice-checkpoint-narration-agy-narrate)
+- [Real-Time Voice Mode (`voice-chat/`)](#-real-time-voice-mode-voice-chat)
 - [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-agy-summary)
 - [Permissions (ALLOW / DENY)](#-granular-permissions-system-allow--deny)
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
@@ -84,6 +85,7 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 | 🤖 | **Autonomous Subagent** | Claude spins up Antigravity to execute complex tasks, multi-step refactors, and test suites |
 | 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (2.5 / 3.7 Pro & Flash) with configurable reasoning effort |
 | 🎙️ | **Voice Checkpoint Narration** | Zero-Claude-token spoken status updates via Voicebox TTS with automatic profile fallback |
+| 🗣️ | **Real-Time Voice Mode** | Full-duplex spoken conversation with barge-in, mic capture, and Silero VAD (`voice-chat/`) — zero-cloud audio via a local Voicebox TTS/STT engine |
 | 📋 | **Anti-Compaction Session Summary** | Analyzes raw JSONL session logs with Gemini (1M-2M context) to generate persistent, structured Markdown docs before context degrades |
 | 🌐 | **Cited Web Research** | Leverages Antigravity's native web search and synthesis capabilities that Claude Code lacks out of the box |
 | 🛡️ | **Granular Permissions** | ALLOW / DENY capabilities, forbidden paths, forbidden commands, and sandbox isolation |
@@ -126,7 +128,7 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 
 ## 🔧 MCP Tools Reference
 
-Ten tools exposed via the MCP server:
+Eleven tools exposed via the MCP server:
 
 | Tool | Mode | Default Timeout | Description |
 |------|------|-----------------|-------------|
@@ -135,6 +137,7 @@ Ten tools exposed via the MCP server:
 | `agy_review` | read-only | 20m | Adversarial code review on git diffs or specific files |
 | `agy_audit` | read-only | 25m | Rigorous adversarial audit with severity rubric (BLOCKER, MAJOR, MINOR) |
 | `agy_session_summary` | read-only | 15m | Parse session JSONL and generate structured summary doc with Gemini |
+| `agy_voice_stream` | conversational | persistent (no fixed timeout) | Manage a long-lived, streaming `agy.exe` process for low-latency voice chat ("Modo Charla") — the backend behind `voice-chat/` |
 | `agy_narrate` | audio TTS | 3m | Spoken audio update of latest checkpoint via Voicebox (zero Claude tokens) |
 | `agy_narrate_voices` | read-only | — | List installed Voicebox voice profiles, languages, roles, and GPU health |
 | `agy_usage` | — | — | Session token telemetry, context window saturation, model limits, quota health |
@@ -335,6 +338,27 @@ Gemini (`agy`) lee estos campos dinámicamente en tiempo real desde la API de Vo
 
 ---
 
+## 🗣️ Real-Time Voice Mode (`voice-chat/`)
+
+Full-duplex spoken conversation with Antigravity — not a Claude Code slash command, since a persistent audio loop with real-time barge-in doesn't fit Claude Code's request/response tool-call model. Instead, `voice-chat/*.py` are standalone companion scripts that talk to the same MCP server (`agy_voice_stream` — see MCP Tools Reference above) as a client over the same stdio JSON-RPC protocol Claude Code itself uses, keeping one long-lived `agy.exe` process alive across turns instead of paying a cold start per message.
+
+- `voice-chat/text_loop.py` — console input, zero pip dependencies (stdlib only).
+- `voice-chat/voice_loop.py` — real microphone input via Silero VAD, with real barge-in: the instant it detects you starting to speak, it cuts playback and cancels any in-flight Voicebox synthesis.
+
+Both require a local Voicebox instance reachable at `http://127.0.0.1:17493` (or `VOICEBOX_URL`) for TTS/STT; `voice_loop.py` additionally needs `pip install -r voice-chat/requirements.txt` (`sounddevice`, `silero-vad`, `numpy`).
+
+```bash
+# Console-only, zero extra dependencies
+python voice-chat/text_loop.py --voice "Diego Alvarez" --language es
+
+# Real microphone + VAD
+python voice-chat/voice_loop.py --voice "Diego Alvarez" --language es --stt-model turbo
+```
+
+Run either script with `--help` for the full flag list (TTS engine/model overrides, VAD sensitivity, input device selection, VRAM unload-on-exit).
+
+---
+
 ## 🌐 Deep Web Research (`/agy-research`)
 
 Delegate deep web research and live doc searches directly to Antigravity, which leverages Gemini's native search tools and Vertex AI:
@@ -351,7 +375,8 @@ Returns a structured report with an Executive Summary, Key Findings, Cited Sourc
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (10 tools) |
+| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (11 tools) |
+| | `mcp-server/lib/sentence-chunker.js` | Groups streamed `text_delta` fragments into complete sentences for TTS |
 | **Subagent** | `agents/antigravity.md` | Autonomous subagent definition (`antigravity:Antigravity`) |
 | **Skills** | `skills/antigravity/SKILL.md` | Context-aware delegation guidelines |
 | | `skills/adversarial-review/SKILL.md` | Skeptical, evidence-based audit guidelines |
@@ -365,6 +390,7 @@ Returns a structured report with an Executive Summary, Key Findings, Cited Sourc
 | | `commands/agy-narrate-voices.md` | `/agy-narrate-voices [lang]` |
 | | `commands/agy-research.md` | `/agy-research <topic>` |
 | | `commands/agy-usage.md` | `/agy-usage` |
+| **Voice Chat** | `voice-chat/text_loop.py` / `voice_loop.py` | Real-Time Voice Mode companion scripts (console / real mic + VAD) |
 | **Installers** | `install.ps1` / `install.sh` | 1-command install for all platforms |
 
 ---

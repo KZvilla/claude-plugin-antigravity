@@ -37,7 +37,7 @@ if ($AgyPath) {
 } else {
     Warn "Antigravity CLI (agy) not found on PATH."
     Warn "The plugin will install, but won't work until agy is available."
-    Warn "Install guide: https://github.com/google-gemini/antigravity"
+    Warn "Install guide: https://antigravity.google/cli"
 }
 
 # ── Install / Update ────────────────────────────────────────────────

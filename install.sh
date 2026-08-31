@@ -35,7 +35,7 @@ elif command -v agy.exe >/dev/null 2>&1; then
 else
   warn "Antigravity CLI (agy) not found on PATH."
   warn "The plugin will install, but won't work until agy is available."
-  warn "Install guide: https://github.com/google-gemini/antigravity"
+  warn "Install guide: https://antigravity.google/cli"
 fi
 
 # ── Install / Update ────────────────────────────────────────────────

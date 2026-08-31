@@ -3,7 +3,7 @@
  * Consumes incremental text_delta fragments from an agy_voice_stream session and
  * groups them into complete sentences ready for the TTS synthesis queue.
  *
- * Cut criteria (docs/future-implementations/voice-chat-architecture.md, section 4.2):
+ * Cut criteria (docs/architecture/voice-chat-architecture.md, section 4.2):
  *   - Strong sentence enders: . ! ? \n
  *   - Soft pauses: ; :
  *   - Minimum word count before emitting, to avoid firing on abbreviations (e.g. "Dr.", "pág.")
