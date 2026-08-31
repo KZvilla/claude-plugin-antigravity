@@ -26,7 +26,6 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
 - [Telemetry (`/agy-usage`)](#-telemetry--usage-tracking-agy-usage)
 - [Components](#-components)
-- [Documentation Hub (`docs/`)](docs/README.md)
 
 ---
 
@@ -101,7 +100,7 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 | Requirement | Details |
 |-------------|---------|
 | **Node.js** | ≥ 18 (used to run the MCP server) |
-| **Antigravity CLI** | `agy` or `agy.exe` installed and on your `PATH` ([Install guide](https://github.com/google-gemini/antigravity)) |
+| **Antigravity CLI** | `agy` or `agy.exe` installed and on your `PATH` ([Install guide](https://antigravity.google/cli)) |
 | **Claude Code** | Active Claude Code terminal session |
 | **Google API Key** | Configured for Antigravity (`GEMINI_API_KEY` or `agy auth login`) |
 
@@ -417,17 +416,6 @@ The Telegram tools (`telegram_notify`, `telegram_ask`, `telegram_send_voice`, an
 **Important if you installed via the script above:** `.env` is git-ignored on purpose, so it is never cloned or copied into `~/.claude/skills/antigravity` (or wherever `install.ps1`/`install.sh` placed the plugin) — the installer only fetches what's tracked in git. Create `.env` directly at the **installed** plugin root (`~/.claude/skills/antigravity/.env`), not just in a separate local dev checkout, or outbound Telegram delivery will silently look unconfigured from the live plugin even though it works fine in a manual test run elsewhere.
 
 The bidirectional bot (`telegram-bridge/bot.js`, started with `npm run start` inside `telegram-bridge/`) is only needed if you want to message the bot *from* your phone to kick off `agy` tasks or answer `telegram_ask` prompts — outbound notifications and voice notes work without it.
-
----
-
-## 📚 Documentation Hub
-
-Explore the in-depth technical documentation in the [`docs/`](docs/README.md) directory:
-
-- **[Architecture](docs/architecture/README.md):** MCP server design, stdio transport, permissions, and security.
-- **[Integrations](docs/integrations/README.md):** External bridges such as the [Telegram Bridge](docs/integrations/telegram-bridge.md) ($0 cost, CGNAT-ready).
-- **[Future Implementations](docs/future-implementations/README.md):** Upcoming roadmap features like the [Real-Time Voice Mode](docs/future-implementations/voice-chat-architecture.md).
-- **[Old Implementations / History](docs/old-implementations/README.md):** Historical milestone logs like the [Foundational Session Summary](docs/old-implementations/session-summary-2026-08-27.md).
 
 ---
 

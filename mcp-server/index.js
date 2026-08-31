@@ -2902,6 +2902,18 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
         }
       }
 
+      // 6.3 Limpieza: si reprodujimos localmente, el .wav quedó resuelto en
+      // generatedWavPath y ya cumplió su propósito (se reprodujo y, si correspondía,
+      // ya se lo pasamos a Telegram como audioPath). Voicebox no lo borra solo —
+      // sin esto, generations/ crece sin límite en cada narración.
+      if (generatedWavPath) {
+        try {
+          fs.unlinkSync(generatedWavPath);
+        } catch (delErr) {
+          process.stderr.write(`[antigravity-mcp] No se pudo borrar ${generatedWavPath}: ${delErr.message}\n`);
+        }
+      }
+
       // 7. Format structured output for Claude
       const fallbackNotice = voiceResolution.isFallback
         ? ` *(Fallback: ${voiceResolution.reason})*`

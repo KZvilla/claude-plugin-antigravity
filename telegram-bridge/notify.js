@@ -166,6 +166,12 @@ export async function sendTelegramVoice(options = {}) {
 
   const chatId = getDefaultChatId(targetChatId);
   let resolvedPath = audioPath;
+  // Solo se borra el .wav si esta función lo resolvió ella misma dentro de
+  // generations/ (waitForVoiceboxGeneration) — nunca si vino como audioPath
+  // explícito (podría ser cualquier archivo del caller) ni si cayó al fallback
+  // findLatestVoiceboxAudio(), que también busca en profiles/ (muestras de voz
+  // clonada, no generaciones descartables).
+  const selfResolvedGeneration = !audioPath && (waitForGeneration || generationId);
 
   if (!resolvedPath && (waitForGeneration || generationId)) {
     resolvedPath = await waitForVoiceboxGeneration({
@@ -182,8 +188,9 @@ export async function sendTelegramVoice(options = {}) {
   }
 
   // Intentar primero como Nota de Voz nativa (sendVoice)
+  let uploadResult;
   try {
-    return await telegramUploadCall('sendVoice', 'voice', resolvedPath, {
+    uploadResult = await telegramUploadCall('sendVoice', 'voice', resolvedPath, {
       chat_id: chatId,
       caption,
       parse_mode: 'Markdown'
@@ -191,7 +198,7 @@ export async function sendTelegramVoice(options = {}) {
   } catch (voiceErr) {
     console.warn(`[notify] sendVoice falló (${voiceErr.message}). Intentando sendAudio como fallback...`);
     // Fallback a reproductor de audio integrado (sendAudio) para archivos .wav
-    return await telegramUploadCall('sendAudio', 'audio', resolvedPath, {
+    uploadResult = await telegramUploadCall('sendAudio', 'audio', resolvedPath, {
       chat_id: chatId,
       caption,
       parse_mode: 'Markdown',
@@ -199,6 +206,17 @@ export async function sendTelegramVoice(options = {}) {
       performer: 'Voicebox'
     });
   }
+
+  // Limpieza: generations/ crece sin límite si nadie borra lo ya entregado.
+  if (selfResolvedGeneration) {
+    try {
+      fs.unlinkSync(resolvedPath);
+    } catch (delErr) {
+      console.warn(`[notify] No se pudo borrar ${resolvedPath}: ${delErr.message}`);
+    }
+  }
+
+  return uploadResult;
 }
 
 /**

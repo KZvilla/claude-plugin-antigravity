@@ -301,6 +301,16 @@ def unload_all_loaded_models():
     return freed_mb / 1024
 
 
+def _delete_generation(wav_path):
+    """Borra un .wav de generations/ una vez consumido (reproducido o descartado por
+    barge-in) - sin esto la carpeta crece sin limite, un .wav por cada oracion de
+    cada turno de la charla."""
+    try:
+        os.remove(wav_path)
+    except OSError:
+        pass
+
+
 class AudioPlayer:
     """Cola FIFO de reproduccion via el reproductor nativo de Windows (mismo mecanismo
     que playLocalAudio() en mcp-server/index.js: System.Media.SoundPlayer, cero eco,
@@ -337,12 +347,14 @@ class AudioPlayer:
             self._current_proc.wait()
             with self._lock:
                 self._current_proc = None
+            _delete_generation(wav_path)
 
     def barge_in(self):
         dropped = 0
         while True:
             try:
-                self._queue.get_nowait()
+                wav_path, _ = self._queue.get_nowait()
+                _delete_generation(wav_path)
                 dropped += 1
             except queue.Empty:
                 break
