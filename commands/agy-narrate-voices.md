@@ -3,9 +3,10 @@ description: List all installed Voicebox voice profiles and their role assignmen
 argument-hint: ["all" | "es" | "en"]
 ---
 
-List available voice profiles from Voicebox TTS:
+List available voice profiles from Voicebox TTS.
 
-${ARGUMENTS:-all}
+Language filter (may be empty — if so, treat it as `all`):
+$ARGUMENTS
 
 Instructions:
 1. Parse the user's argument:

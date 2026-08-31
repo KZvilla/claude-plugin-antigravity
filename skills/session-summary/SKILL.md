@@ -1,7 +1,8 @@
 ---
 name: session-summary
 description: Use this skill when the user wants to create a session summary, document what was done in a session, preserve context before compaction, generate a handoff document, or mentions "summarize session", "session summary", "what did we do", "document this session", or "save session notes".
-version: 0.3.0
+metadata:
+  version: 0.3.0
 ---
 
 # Session Summary Skill

@@ -3,9 +3,10 @@ description: Narrate a spoken voice summary of the latest completed checkpoint o
 argument-hint: ["emily" | "diego" | "<voice-name>" | "personality"]
 ---
 
-Narrate a voice update of the latest task/checkpoint using Voicebox TTS:
+Narrate a voice update of the latest task/checkpoint using Voicebox TTS.
 
-${ARGUMENTS:-default voice}
+Requested voice / options (may be empty — if so, use the defaults below):
+$ARGUMENTS
 
 Instructions:
 1. Parse the user's argument:
@@ -17,11 +18,18 @@ Instructions:
    - Persona / Personality mode:
      * If user explicitly asks for personality (mentions "personality", "personaje", "con estilo", "humor") -> pass `personality: true`
      * Otherwise -> default to `personality: false` (clean professional tone).
-2. Call the `mcp__antigravity__agy_narrate` tool.
+2. Call the `mcp__antigravity__agy_narrate` tool with `local_playback: true`.
+   The tool's own default is `false` (silent generation for background/agentic use), but someone
+   typing `/agy-narrate` is asking to *hear* it, so this command always plays it aloud.
+   Pass `local_playback: false` only if the user explicitly asks to keep the PC silent
+   (e.g. "mandámelo solo al teléfono", "sin sonido acá").
 3. The plugin will automatically:
    - Check Voicebox connection on `http://127.0.0.1:17493` (or configured port)
    - Extract the latest checkpoint from the session log (without consuming your context tokens)
    - Read the voice profile metadata (name, description, personality) dynamically from Voicebox
    - Generate a concise spoken narration script using Gemini (`agy`)
-   - Send the text to Voicebox `/speak` to play aloud through the user's speakers.
+   - Synthesize the audio via Voicebox `POST /generate` and play the resulting `.wav` with the
+     native OS player. It does not use `POST /speak`, which double-plays.
+   - Also deliver it as a Telegram voice note when the bridge is configured (`send_telegram`
+     defaults to true; pass `false` to suppress).
 4. Present the tool's confirmation message to the user, highlighting the spoken text and voice profile used.

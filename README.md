@@ -298,7 +298,9 @@ Claude **does not** generate or summarize the text in its context window. Instea
 1. Claude simply invokes `/agy-narrate` (or the `agy_narrate` tool).
 2. The plugin locates Claude Code's session log (`.jsonl`), extracts the latest task checkpoint (user goal, modified files, and final test execution status).
 3. The plugin invokes Gemini CLI (`agy`) with `--effort low` to draft a concise 2-3 sentence conversational spoken script in ~1-2 seconds (using Gemini quota, **0 Claude tokens**).
-4. The plugin sends the text directly to Voicebox HTTP (`POST /speak`), playing the audio out loud on your speakers.
+4. The plugin sends the text to Voicebox HTTP (`POST /generate`), which synthesizes a `.wav` silently, and then plays that file with the native OS audio player. (It deliberately avoids `POST /speak` — letting Voicebox do its own playback triggers a double-playback bug.)
+
+Running `/agy-narrate` plays the result on your speakers. When `agy_narrate` is called programmatically, local playback is off by default (`local_playback: false`) so background narration doesn't startle anyone — it still reaches your phone if the Telegram bridge is configured.
 
 ### Usage
 

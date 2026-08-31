@@ -5,8 +5,8 @@ argument-hint: [optional review target, default: git diff]
 
 Request an adversarial code review from Google Antigravity CLI (`agy`):
 
-Target:
-${ARGUMENTS:-git diff HEAD~1}
+Target to review (may be empty — if so, default to `git diff HEAD~1`):
+$ARGUMENTS
 
 Instructions:
 1. Run `git status` or check current diff if needed to gather context.

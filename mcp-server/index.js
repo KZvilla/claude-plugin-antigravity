@@ -739,7 +739,7 @@ const TOOLS = [
         },
         local_playback: {
           type: 'boolean',
-          description: 'When true, plays the audio aloud through your PC speakers via Voicebox /speak. Defaults to false (silent background generation via /generate, delivering cleanly to Telegram without scaring anyone).'
+          description: 'When true, plays the audio aloud through your PC speakers (synthesized via POST /generate, then played with the native OS player — never Voicebox /speak, which double-plays). Defaults to false: silent generation, delivered to Telegram without scaring anyone. The /agy-narrate slash command sets this to true, since asking for narration out loud implies hearing it.'
         }
       }
     }
@@ -1393,28 +1393,10 @@ function resolveVoiceProfile(profiles, requestedVoice, requestedLang) {
   return { profile: profiles[0], isFallback: true, reason: 'fallback_first_available', language: lang };
 }
 
-async function sendVoiceboxSpeak(baseUrl, text, profileName, language) {
-  const postData = {
-    text,
-    profile: profileName,
-    language
-  };
-  const res = await httpRequest(`${baseUrl}/speak`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 10000
-  }, postData);
-
-  if (res.statusCode >= 200 && res.statusCode < 300) {
-    try {
-      return JSON.parse(res.body);
-    } catch {
-      return { status: 'generating', raw: res.body };
-    }
-  }
-  throw new Error(`Voicebox /speak returned HTTP ${res.statusCode}: ${res.body}`);
-}
-
+// NOTE: there is deliberately no /speak helper here. Voicebox's POST /speak makes
+// Voicebox itself play the audio, which triggers its double-playback bug; every path
+// in this server uses POST /generate (synthesize silently to a .wav) and then plays
+// the file with the native OS player. See playLocalAudio() and the agy_narrate case.
 async function sendVoiceboxGenerate(baseUrl, text, profileId, language, options = {}) {
   const postData = {
     profile_id: profileId,
