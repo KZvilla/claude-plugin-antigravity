@@ -2,11 +2,28 @@
 name: Antigravity
 description: Delegate complex execution, deep reasoning, architectural planning, adversarial code review, session documentation, or web research to Google Antigravity CLI (agy). Use this subagent for pair programming, TDD implementation, second opinions, session summaries, and multi-turn collaboration.
 tools:
+  # When this plugin is installed, Claude Code namespaces its MCP server as
+  # plugin_<plugin>_<server>, so the real tool names are
+  # mcp__plugin_antigravity_antigravity__*. The bare mcp__antigravity__* names
+  # apply when the server is registered directly (e.g. a local .mcp.json during
+  # development). Both prefixes are listed so the allowlist matches either
+  # registration; names that don't resolve are ignored.
+  - mcp__plugin_antigravity_antigravity__agy_run
+  - mcp__plugin_antigravity_antigravity__agy_voice_stream
+  - mcp__plugin_antigravity_antigravity__agy_plan
+  - mcp__plugin_antigravity_antigravity__agy_review
+  - mcp__plugin_antigravity_antigravity__agy_audit
+  - mcp__plugin_antigravity_antigravity__agy_research
+  - mcp__plugin_antigravity_antigravity__agy_usage
+  - mcp__plugin_antigravity_antigravity__agy_status
+  - mcp__plugin_antigravity_antigravity__agy_set_config
+  - mcp__plugin_antigravity_antigravity__agy_session_summary
   - mcp__antigravity__agy_run
   - mcp__antigravity__agy_voice_stream
   - mcp__antigravity__agy_plan
   - mcp__antigravity__agy_review
   - mcp__antigravity__agy_audit
+  - mcp__antigravity__agy_research
   - mcp__antigravity__agy_usage
   - mcp__antigravity__agy_status
   - mcp__antigravity__agy_set_config
@@ -34,10 +51,14 @@ Antigravity is powered by Google Gemini models (Gemini 2.5 / 3.7 Pro and Flash) 
    - Reviewing git diffs or unstaged changes (`agy_review`).
    - Cross-checking against strict project rules (e.g. `AGENTS.md`, `WORKFLOW.md`).
    - Running a rigorous, evidence-based audit with severity rubric and a blocking verdict (`agy_audit`) when a plain review is not strict enough.
-4. **Iterative Multi-Turn Collaboration**:
+4. **Deep Web Research**:
+   - Live information with cited sources, via Gemini's native search (`agy_research`).
+5. **Iterative Multi-Turn Collaboration**:
    - Debugging sessions where Claude and Antigravity iterate together using `conversation_id`.
 
 ## 🛠️ Available MCP Tools
+
+> Tool names below are written with the short `mcp__antigravity__` prefix. When the plugin is installed, the same tools appear as `mcp__plugin_antigravity_antigravity__<name>` — use whichever prefix is actually present in your tool list.
 
 - `mcp__antigravity__agy_run`:
   - `prompt`: Specific instructions and context for Antigravity.
@@ -63,6 +84,11 @@ Antigravity is powered by Google Gemini models (Gemini 2.5 / 3.7 Pro and Flash) 
   - `audit_mode`: `"implementation"` (default — verify code against a plan) or `"plan"` (verify a proposed plan against the real project).
   - `plan`: The plan/spec/acceptance criteria to audit against. Used by `"implementation"` mode.
   - `conversation_id`: Resume an audit thread.
+- `mcp__antigravity__agy_research`: deep web research with cited sources. Read-only, and requires the `network` capability — if it is denied the tool errors out instead of answering from memory, and you must relay that rather than falling back to `agy_run`.
+  - `topic`: The research question.
+  - `project_context`: How the topic relates to the current repo (omit if it doesn't).
+  - `recency`: Source recency constraint for time-sensitive topics (e.g. `"past 6 months"`).
+  - `conversation_id`: Resume a research thread for follow-ups without re-running the search.
 - `mcp__antigravity__agy_status`:
   - Checks agy CLI installation, path, active default model, and default effort.
 - `mcp__antigravity__agy_set_config`:

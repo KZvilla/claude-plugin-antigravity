@@ -8,6 +8,8 @@ SESSION-SUMMARY.md
 *.local.md
 docs/*
 docs/
+test/*
+test/
 
 # Security & Secrets (Standard §11.1)
 .env

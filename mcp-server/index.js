@@ -143,7 +143,7 @@ function loadUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, summary: 0, narrate: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, research: 0, summary: 0, narrate: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -239,7 +239,7 @@ function resetUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, summary: 0, narrate: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, research: 0, summary: 0, narrate: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -300,6 +300,111 @@ function formatDuration(sec) {
   return `${m}m ${rem}s`;
 }
 
+const DEFAULT_ALLOW = ['read', 'edit', 'commands', 'network'];
+
+/**
+ * Merge per-call `permissions` over the persisted config policy.
+ * Per-call keys replace (not merge with) the config value, so a caller can
+ * clear a base deny list by passing an explicit empty array.
+ */
+function resolvePermissions(callPerms = {}, config = {}) {
+  const basePerms = config.permissions || {};
+  return {
+    allow: callPerms.allow || basePerms.allow || DEFAULT_ALLOW,
+    deny: callPerms.deny || basePerms.deny || [],
+    deny_paths: callPerms.deny_paths || basePerms.deny_paths || [],
+    deny_commands: callPerms.deny_commands || basePerms.deny_commands || [],
+    sandbox: callPerms.sandbox !== undefined ? callPerms.sandbox : (basePerms.sandbox || false)
+  };
+}
+
+function permits(perms, capability) {
+  return !perms.deny.includes(capability) && perms.allow.includes(capability);
+}
+
+/**
+ * Build the natural-language guardrails injected ahead of the task prompt.
+ * `readOnly` tools (plan/review/audit/summary) are already locked to `--mode plan`
+ * at the CLI level, so they skip the edit rule but still need path, command and
+ * network restrictions — those are not enforced by plan mode.
+ */
+function buildSecurityRules(perms, { readOnly = false } = {}) {
+  const rules = [];
+
+  if (readOnly) {
+    rules.push('- READ-ONLY SESSION: Do not write or edit any files. Analysis and reporting only.');
+  } else if (!permits(perms, 'edit')) {
+    rules.push('- EDIT PERMISSION DENIED: You are operating in STRICT READ-ONLY mode. Do not write or edit any files.');
+  }
+
+  if (!permits(perms, 'commands')) {
+    rules.push('- COMMAND EXECUTION DENIED: Do not run or propose any shell/terminal commands.');
+  }
+  if (!permits(perms, 'network')) {
+    rules.push('- NETWORK ACCESS DENIED: Do not use web search, fetch URLs, or make any outbound network request. If the task requires live information from the internet, stop and report that it cannot be completed under the current network policy instead of answering from memory.');
+  }
+  if (perms.deny_paths.length > 0) {
+    rules.push(`- FORBIDDEN PATHS: You MUST NEVER access, read, write, or mention contents of these path patterns: ${perms.deny_paths.join(', ')}`);
+  }
+  if (perms.deny_commands.length > 0) {
+    rules.push(`- FORBIDDEN COMMANDS: You MUST NEVER execute commands matching: ${perms.deny_commands.join(', ')}`);
+  }
+
+  return rules;
+}
+
+function applyGuardrails(prompt, rules) {
+  if (rules.length === 0) return prompt;
+  return `[SECURITY & PERMISSION GUARDRAILS ENFORCED BY USER POLICY]
+${rules.join('\n')}
+If any requested action violates these rules, refuse that specific action and explain the restriction.
+
+[TASK INSTRUCTIONS]
+${prompt}`;
+}
+
+function formatPermissionSummary(perms) {
+  return `allow=[${perms.allow.join(', ')}], deny=[${perms.deny.join(', ') || 'none'}], sandbox=${perms.sandbox}`;
+}
+
+const PERMISSIONS_SCHEMA = {
+  type: 'object',
+  description: 'Granular ALLOW and DENY permission policies for this subagent execution. Overrides the persisted policy in .claude/antigravity.json for this call only.',
+  properties: {
+    allow: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Explicitly allowed capabilities: "read", "edit", "commands", "network".'
+    },
+    deny: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Explicitly denied capabilities (e.g. "edit" for read-only, "commands" to forbid shell execution, "network" to forbid web access).'
+    },
+    deny_paths: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Path patterns forbidden from being read or modified (e.g. [".env*", "**/*.key"]).'
+    },
+    deny_commands: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Command patterns forbidden from being executed (e.g. ["git push*", "npm publish*"]).'
+    },
+    sandbox: {
+      type: 'boolean',
+      description: 'Enable Antigravity terminal sandbox restrictions (--sandbox).'
+    }
+  }
+};
+
+// Read-only tools are locked to `--mode plan`, so "edit" is denied regardless of
+// what the policy says; the remaining keys still apply.
+const READONLY_PERMISSIONS_SCHEMA = {
+  ...PERMISSIONS_SCHEMA,
+  description: 'Permission policy overrides for this call. This tool is always read-only (file edits are impossible regardless of policy), but "commands", "network", deny_paths, deny_commands and sandbox are enforced. Defaults to the persisted policy in .claude/antigravity.json.'
+};
+
 // MCP Tool Definitions
 const TOOLS = [
   {
@@ -334,36 +439,7 @@ const TOOLS = [
           enum: ['accept-edits', 'plan'],
           description: 'Agent execution mode: "accept-edits" (default, can edit code) or "plan" (pure planning/analysis).'
         },
-        permissions: {
-          type: 'object',
-          description: 'Granular ALLOW and DENY permission policies for this subagent execution.',
-          properties: {
-            allow: {
-              type: 'array',
-              items: { type: 'string' },
-              description: 'Explicitly allowed capabilities: "read", "edit", "commands", "network".'
-            },
-            deny: {
-              type: 'array',
-              items: { type: 'string' },
-              description: 'Explicitly denied capabilities (e.g. "edit" for read-only, "commands" to forbid shell execution).'
-            },
-            deny_paths: {
-              type: 'array',
-              items: { type: 'string' },
-              description: 'Path patterns forbidden from being read or modified (e.g. [".env*", "**/*.key"]).'
-            },
-            deny_commands: {
-              type: 'array',
-              items: { type: 'string' },
-              description: 'Command patterns forbidden from being executed (e.g. ["git push*", "npm publish*"]).'
-            },
-            sandbox: {
-              type: 'boolean',
-              description: 'Enable Antigravity terminal sandbox restrictions (--sandbox).'
-            }
-          }
-        },
+        permissions: PERMISSIONS_SCHEMA,
         cwd: {
           type: 'string',
           description: 'Working directory for the session. Defaults to Claude\'s current working directory.'
@@ -407,6 +483,7 @@ const TOOLS = [
           type: 'number',
           description: 'Timeout in minutes. Defaults to 15.'
         },
+        permissions: READONLY_PERMISSIONS_SCHEMA,
         cwd: {
           type: 'string',
           description: 'Working directory for analysis.'
@@ -446,6 +523,7 @@ const TOOLS = [
           type: 'number',
           description: 'Timeout in minutes. Defaults to 20 (can be increased for large repositories/diffs).'
         },
+        permissions: READONLY_PERMISSIONS_SCHEMA,
         cwd: {
           type: 'string',
           description: 'Working directory.'
@@ -490,12 +568,57 @@ const TOOLS = [
           type: 'number',
           description: 'Timeout in minutes. Defaults to 25 (adversarial audits are deep and heavyweight).'
         },
+        permissions: READONLY_PERMISSIONS_SCHEMA,
         cwd: {
           type: 'string',
           description: 'Working directory.'
         }
       },
       required: ['target']
+    }
+  },
+  {
+    name: 'agy_research',
+    description: 'Delegate deep web research to Antigravity, which uses Gemini\'s native search tools. Returns a structured report with an executive summary, numbered key findings, cited source URLs, and relevance to the current project. Read-only: never edits files. Requires the "network" capability — fails with an explicit error if network access is denied by the permission policy, rather than answering from the model\'s memory.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        topic: {
+          type: 'string',
+          description: 'The research topic or question to investigate.'
+        },
+        project_context: {
+          type: 'string',
+          description: 'Optional description of how this relates to the current project, to focus the "Relevance" section. If omitted, Antigravity infers it from the codebase.'
+        },
+        recency: {
+          type: 'string',
+          description: 'Optional recency constraint for sources (e.g. "past 6 months", "2026 only"). Sources older than this should be flagged as potentially stale.'
+        },
+        model: {
+          type: 'string',
+          description: 'Model override for the research session.'
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'Reasoning effort level. Defaults to "high".'
+        },
+        conversation_id: {
+          type: 'string',
+          description: 'Previous conversation ID to resume a research thread and ask follow-up questions without re-running the whole search.'
+        },
+        timeout_minutes: {
+          type: 'number',
+          description: 'Timeout in minutes. Defaults to 20 (web research involves many sequential searches).'
+        },
+        permissions: READONLY_PERMISSIONS_SCHEMA,
+        cwd: {
+          type: 'string',
+          description: 'Working directory, used to ground the "Relevance to Current Project" section.'
+        }
+      },
+      required: ['topic']
     }
   },
   {
@@ -616,7 +739,8 @@ const TOOLS = [
         timeout_minutes: {
           type: 'number',
           description: 'Timeout in minutes. Defaults to 15.'
-        }
+        },
+        permissions: READONLY_PERMISSIONS_SCHEMA
       }
     }
   },
@@ -1969,7 +2093,7 @@ async function handleToolCall(name, args) {
       out += `- Quota / API Health: **${usageData.quota_status}**\n\n`;
 
       out += `**📈 Cumulative Session Usage:**\n`;
-      out += `- Total Delegated Calls: **${s.total_calls}** (run: ${s.calls_by_tool.run || 0}, plan: ${s.calls_by_tool.plan || 0}, review: ${s.calls_by_tool.review || 0}, audit: ${s.calls_by_tool.audit || 0}, summary: ${s.calls_by_tool.summary || 0})\n`;
+      out += `- Total Delegated Calls: **${s.total_calls}** (run: ${s.calls_by_tool.run || 0}, plan: ${s.calls_by_tool.plan || 0}, review: ${s.calls_by_tool.review || 0}, audit: ${s.calls_by_tool.audit || 0}, research: ${s.calls_by_tool.research || 0}, summary: ${s.calls_by_tool.summary || 0}, narrate: ${s.calls_by_tool.narrate || 0})\n`;
       out += `- Input Tokens: \`${formatTokens(s.input_tokens)}\`\n`;
       out += `- Output Tokens: \`${formatTokens(s.output_tokens)}\`\n`;
       out += `- Thinking / Reasoning Tokens: \`${formatTokens(s.thinking_tokens)}\`\n`;
@@ -2045,18 +2169,8 @@ async function handleToolCall(name, args) {
     }
 
     case 'agy_run': {
-      const callPerms = args.permissions || {};
-      const basePerms = config.permissions;
-      const effectivePerms = {
-        allow: callPerms.allow || basePerms.allow || ['read', 'edit', 'commands', 'network'],
-        deny: callPerms.deny || basePerms.deny || [],
-        deny_paths: callPerms.deny_paths || basePerms.deny_paths || [],
-        deny_commands: callPerms.deny_commands || basePerms.deny_commands || [],
-        sandbox: callPerms.sandbox !== undefined ? callPerms.sandbox : (basePerms.sandbox || false)
-      };
-
-      const canEdit = !effectivePerms.deny.includes('edit') && effectivePerms.allow.includes('edit');
-      const canRunCommands = !effectivePerms.deny.includes('commands') && effectivePerms.allow.includes('commands');
+      const effectivePerms = resolvePermissions(args.permissions, config);
+      const canEdit = permits(effectivePerms, 'edit');
 
       let effectiveMode = args.mode || (canEdit ? 'accept-edits' : 'plan');
       if (!canEdit && effectiveMode === 'accept-edits') {
@@ -2089,30 +2203,7 @@ async function handleToolCall(name, args) {
         cliArgs.push('-c');
       }
 
-      let finalPrompt = args.prompt;
-      const securityRules = [];
-
-      if (!canEdit) {
-        securityRules.push('- EDIT PERMISSION DENIED: You are operating in STRICT READ-ONLY mode. Do not write or edit any files.');
-      }
-      if (!canRunCommands) {
-        securityRules.push('- COMMAND EXECUTION DENIED: Do not run or propose any shell/terminal commands.');
-      }
-      if (effectivePerms.deny_paths.length > 0) {
-        securityRules.push(`- FORBIDDEN PATHS: You MUST NEVER access, read, write, or mention contents of these path patterns: ${effectivePerms.deny_paths.join(', ')}`);
-      }
-      if (effectivePerms.deny_commands.length > 0) {
-        securityRules.push(`- FORBIDDEN COMMANDS: You MUST NEVER execute commands matching: ${effectivePerms.deny_commands.join(', ')}`);
-      }
-
-      if (securityRules.length > 0) {
-        finalPrompt = `[SECURITY & PERMISSION GUARDRAILS ENFORCED BY USER POLICY]
-${securityRules.join('\n')}
-If any requested action violates these rules, refuse that specific action and explain the restriction.
-
-[TASK INSTRUCTIONS]
-${args.prompt}`;
-      }
+      const finalPrompt = applyGuardrails(args.prompt, buildSecurityRules(effectivePerms));
 
       cliArgs.push('-p', finalPrompt);
 
@@ -2151,7 +2242,7 @@ ${args.prompt}`;
       if (effectiveModel) formatted += `- Model: \`${effectiveModel}\`\n`;
       formatted += `- Effort: \`${effectiveEffort}\`\n`;
       formatted += `- Mode: \`${effectiveMode}\` (${canEdit ? 'read/write' : 'read-only'})\n`;
-      formatted += `- Permissions Enforced: allow=[${effectivePerms.allow.join(', ')}], deny=[${effectivePerms.deny.join(', ') || 'none'}], sandbox=${effectivePerms.sandbox}\n`;
+      formatted += `- Permissions Enforced: ${formatPermissionSummary(effectivePerms)}\n`;
       if (conversationId) {
         formatted += `- Conversation ID: \`${conversationId}\` (pass as \`conversation_id\` to continue this thread)\n`;
       }
@@ -2340,6 +2431,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
 
       const effectiveEffort = args.effort || config.defaultEffort || 'high';
       const effectiveModel = args.model || config.defaultModel;
+      const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
         '--output-format', 'json',
@@ -2347,6 +2439,10 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         '--mode', 'plan',
         '--effort', effectiveEffort
       ];
+
+      if (perms.sandbox) {
+        cliArgs.push('--sandbox');
+      }
 
       if (effectiveModel) {
         cliArgs.push('--model', effectiveModel);
@@ -2356,7 +2452,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         cliArgs.push('--conversation', args.conversation_id);
       }
 
-      cliArgs.push('-p', planPrompt);
+      cliArgs.push('-p', applyGuardrails(planPrompt, buildSecurityRules(perms, { readOnly: true })));
 
       const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
       const result = await executeAgy(cliArgs, {
@@ -2389,6 +2485,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
       formatted += `Effort: \`${effectiveEffort}\``;
       if (effectiveModel) formatted += ` | Model: \`${effectiveModel}\``;
       formatted += ` | Mode: \`plan\` (read-only enforced) | Timeout: \`${timeoutMin}m\``;
+      formatted += `\nPermissions Enforced: ${formatPermissionSummary(perms)}`;
       if (conversationId) {
         formatted += `\nConversation ID: \`${conversationId}\` (pass as \`conversation_id\` to refine this plan, or to \`agy_run\` to begin execution)`;
       }
@@ -2419,6 +2516,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
 
       const effectiveEffort = args.effort || config.defaultEffort || 'high';
       const effectiveModel = args.model || config.defaultModel;
+      const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
         '--output-format', 'json',
@@ -2426,6 +2524,10 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         '--mode', 'plan',
         '--effort', effectiveEffort
       ];
+
+      if (perms.sandbox) {
+        cliArgs.push('--sandbox');
+      }
 
       if (effectiveModel) {
         cliArgs.push('--model', effectiveModel);
@@ -2435,7 +2537,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         cliArgs.push('--conversation', args.conversation_id);
       }
 
-      cliArgs.push('-p', auditPrompt);
+      cliArgs.push('-p', applyGuardrails(auditPrompt, buildSecurityRules(perms, { readOnly: true })));
 
       const timeoutMin = args.timeout_minutes || 25;
       const result = await executeAgy(cliArgs, {
@@ -2468,6 +2570,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
       formatted += `Effort: \`${effectiveEffort}\``;
       if (effectiveModel) formatted += ` | Model: \`${effectiveModel}\``;
       formatted += ` | Mode: \`read-only\` | Timeout: \`${timeoutMin}m\``;
+      formatted += `\nPermissions Enforced: ${formatPermissionSummary(perms)}`;
       if (conversationId) {
         formatted += `\nConversation ID: \`${conversationId}\` (pass as \`conversation_id\` to follow up on this audit)`;
       }
@@ -2492,6 +2595,7 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
 
       const effectiveEffort = args.effort || config.defaultEffort || 'high';
       const effectiveModel = args.model || config.defaultModel;
+      const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
         '--output-format', 'json',
@@ -2499,6 +2603,10 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
         '--mode', 'plan',
         '--effort', effectiveEffort
       ];
+
+      if (perms.sandbox) {
+        cliArgs.push('--sandbox');
+      }
 
       if (effectiveModel) {
         cliArgs.push('--model', effectiveModel);
@@ -2508,7 +2616,7 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
         cliArgs.push('--conversation', args.conversation_id);
       }
 
-      cliArgs.push('-p', reviewPrompt);
+      cliArgs.push('-p', applyGuardrails(reviewPrompt, buildSecurityRules(perms, { readOnly: true })));
 
       const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 20;
       const result = await executeAgy(cliArgs, {
@@ -2538,8 +2646,113 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       const responseText = resData.response || result.rawOutput || '';
 
       let formatted = `### Antigravity Code Review (Effort: ${effectiveEffort}${effectiveModel ? `, Model: ${effectiveModel}` : ''}, Mode: read-only)\n\n${responseText.trim()}\n\n---\n`;
+      formatted += `Permissions Enforced: ${formatPermissionSummary(perms)}\n`;
       if (conversationId) {
         formatted += `Conversation ID: \`${conversationId}\` (pass as \`conversation_id\` to follow up on this review)`;
+      }
+
+      return {
+        content: [{ type: 'text', text: formatted }]
+      };
+    }
+
+    case 'agy_research': {
+      const perms = resolvePermissions(args.permissions, config);
+
+      // Research is meaningless without live search. Fail loudly instead of
+      // letting agy answer from memory and pass it off as researched.
+      if (!permits(perms, 'network')) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `Cannot run web research: the "network" capability is not permitted by the current policy (${formatPermissionSummary(perms)}).\n\nRe-enable it with \`agy_set_config\` (include "network" in \`permissions.allow\` and remove it from \`permissions.deny\`), or pass \`permissions: { "allow": ["read", "network"], "deny": [] }\` for this call only.\n\nRefusing to produce a research report from the model's memory, since it would carry citations it never actually verified.`
+          }]
+        };
+      }
+
+      const researchPrompt = `You are acting as a Deep Web Research Subagent.
+
+## Topic
+${args.topic}
+${args.recency ? `\n## Recency Requirement\nPrioritize sources from: ${args.recency}. Explicitly flag any source outside this window as potentially stale.\n` : ''}${args.project_context ? `\n## Project Context\n${args.project_context}\n` : ''}
+Investigate this topic thoroughly using web search and any available research tools. Do not rely on memory: every factual claim must trace to a source you actually retrieved during this session.
+
+Return a structured report with exactly these sections:
+
+## Summary
+A concise 2-3 sentence overview of the findings.
+
+## Key Findings
+Numbered list of the most important discoveries, facts, or insights.
+
+## Sources
+For each source used:
+- [Title](URL) — brief description of what this source contributed
+
+## Relevance to Current Project
+If the research topic relates to the current codebase or project, explain how the findings apply and what actions could be taken. If it does not, say so plainly rather than inventing a connection.
+
+Be thorough but concise. Prioritize primary sources and official documentation over blog posts. If searches return nothing usable on some sub-question, say so explicitly instead of filling the gap from memory.`;
+
+      const effectiveEffort = args.effort || config.defaultEffort || 'high';
+      const effectiveModel = args.model || config.defaultModel;
+
+      const cliArgs = [
+        '--output-format', 'json',
+        '--dangerously-skip-permissions',
+        '--mode', 'plan',
+        '--effort', effectiveEffort
+      ];
+
+      if (perms.sandbox) {
+        cliArgs.push('--sandbox');
+      }
+
+      if (effectiveModel) {
+        cliArgs.push('--model', effectiveModel);
+      }
+
+      if (args.conversation_id) {
+        cliArgs.push('--conversation', args.conversation_id);
+      }
+
+      cliArgs.push('-p', applyGuardrails(researchPrompt, buildSecurityRules(perms, { readOnly: true })));
+
+      const timeoutMin = args.timeout_minutes || 20;
+      const result = await executeAgy(cliArgs, {
+        cwd: args.cwd,
+        timeoutMinutes: timeoutMin
+      });
+
+      const resData = result.data || {};
+      const conversationId = resData.conversation_id || args.conversation_id || '';
+      const duration = resData.duration_seconds || 0;
+
+      if (resData.usage) {
+        recordUsage('research', effectiveModel, effectiveEffort, conversationId, duration, resData.usage, !result.success, result.error || '');
+      }
+
+      if (!result.success) {
+        let errText = `Error running web research with Antigravity:\n${result.error}`;
+        if (conversationId) {
+          errText += `\n\nSession Conversation ID: \`${conversationId}\` (you can resume this research thread by passing this ID).`;
+        }
+        return {
+          isError: true,
+          content: [{ type: 'text', text: errText }]
+        };
+      }
+
+      const responseText = resData.response || result.rawOutput || '';
+
+      let formatted = `### 🌐 Antigravity Web Research\n\n${responseText.trim()}\n\n---\n`;
+      formatted += `Effort: \`${effectiveEffort}\``;
+      if (effectiveModel) formatted += ` | Model: \`${effectiveModel}\``;
+      formatted += ` | Mode: \`read-only\` | Timeout: \`${timeoutMin}m\``;
+      formatted += `\nPermissions Enforced: ${formatPermissionSummary(perms)}`;
+      if (conversationId) {
+        formatted += `\nConversation ID: \`${conversationId}\` (pass as \`conversation_id\` to ask follow-up questions without re-running the search)`;
       }
 
       return {
@@ -2623,6 +2836,7 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
       // 6. Delegate to agy for summarization
       const effectiveEffort = args.effort || config.defaultEffort || 'high';
       const effectiveModel = args.model || config.defaultModel;
+      const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
         '--output-format', 'json',
@@ -2631,11 +2845,15 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
         '--effort', effectiveEffort
       ];
 
+      if (perms.sandbox) {
+        cliArgs.push('--sandbox');
+      }
+
       if (effectiveModel) {
         cliArgs.push('--model', effectiveModel);
       }
 
-      cliArgs.push('-p', fullPrompt);
+      cliArgs.push('-p', applyGuardrails(fullPrompt, buildSecurityRules(perms, { readOnly: true })));
 
       const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
       const result = await executeAgy(cliArgs, {

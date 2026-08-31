@@ -128,7 +128,7 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 
 ## 🔧 MCP Tools Reference
 
-Fourteen tools exposed via the MCP server — eleven `agy_*` tools plus three `telegram_*` bridge tools:
+Fifteen tools exposed via the MCP server — twelve `agy_*` tools plus three `telegram_*` bridge tools:
 
 | Tool | Mode | Default Timeout | Description |
 |------|------|-----------------|-------------|
@@ -136,6 +136,7 @@ Fourteen tools exposed via the MCP server — eleven `agy_*` tools plus three `t
 | `agy_plan` | read-only | 15m | Step-by-step architectural / implementation plan without modifying files |
 | `agy_review` | read-only | 20m | Adversarial code review on git diffs or specific files |
 | `agy_audit` | read-only | 25m | Rigorous adversarial audit with severity rubric (BLOCKER, MAJOR, MINOR) |
+| `agy_research` | read-only | 20m | Deep web research with cited sources — requires the `network` capability, errors out if denied |
 | `agy_session_summary` | read-only | 15m | Parse session JSONL and generate structured summary doc with Gemini |
 | `agy_voice_stream` | conversational | persistent (no fixed timeout) | Manage a long-lived, streaming `agy.exe` process for low-latency voice chat ("Modo Charla") — the backend behind `voice-chat/` |
 | `agy_narrate` | audio TTS | 3m | Spoken audio update of latest checkpoint via Voicebox (zero Claude tokens) |
@@ -175,6 +176,10 @@ Fourteen tools exposed via the MCP server — eleven `agy_*` tools plus three `t
 | `deny_paths` | `string[]` | `[".env*", "**/*.key", "**/*.pem"]` | Paths forbidden from access |
 | `deny_commands` | `string[]` | `["git push*", "git reset --hard*", "npm publish*", "rm -rf /*"]` | Shell commands prohibited |
 | `sandbox` | `boolean` | `false` | Enables native terminal sandbox (`--sandbox`) |
+
+Denying `"network"` blocks web search and URL fetching, and makes `agy_research` fail with an explicit error instead of answering from memory.
+
+**Scope:** the policy applies to every delegating tool — `agy_run` plus the read-only ones (`agy_plan`, `agy_review`, `agy_audit`, `agy_research`, `agy_session_summary`). The read-only tools are locked to `--mode plan`, so `edit` is denied there regardless of policy, but `commands`, `network`, `deny_paths`, `deny_commands` and `sandbox` are enforced — which matters, because plan mode by itself does *not* stop a subagent from reading `.env` or running `git push`. Each tool's output footer prints the policy it actually ran under.
 
 ### Per-Call Example
 
@@ -374,13 +379,23 @@ Delegate deep web research and live doc searches directly to Antigravity, which 
 
 Returns a structured report with an Executive Summary, Key Findings, Cited Source URLs, and direct relevance to your current project.
 
+Backed by the `agy_research` MCP tool, which is read-only and requires the `network` capability. If `network` is denied (or absent from `allow`), the tool returns an explicit error rather than producing a report from the model's memory — a research report with citations it never actually fetched is worse than no report.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `topic` | `string` | *required* | The research topic or question |
+| `project_context` | `string` | — | How this relates to your project, to focus the Relevance section |
+| `recency` | `string` | — | Source recency constraint (e.g. `"past 6 months"`); older sources get flagged |
+| `conversation_id` | `string` | — | Resume a research thread for follow-ups without re-running the search |
+| `permissions` | `object` | — | Per-call policy override (read-only regardless) |
+
 ---
 
 ## 📦 Components
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (14 tools) |
+| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (15 tools) |
 | | `mcp-server/lib/sentence-chunker.js` | Groups streamed `text_delta` fragments into complete sentences for TTS |
 | **Subagent** | `agents/antigravity.md` | Autonomous subagent definition (`antigravity:Antigravity`) |
 | **Skills** | `skills/antigravity/SKILL.md` | Context-aware delegation guidelines |
