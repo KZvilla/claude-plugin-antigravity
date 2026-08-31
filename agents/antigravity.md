@@ -6,6 +6,7 @@ tools:
   - mcp__antigravity__agy_voice_stream
   - mcp__antigravity__agy_plan
   - mcp__antigravity__agy_review
+  - mcp__antigravity__agy_audit
   - mcp__antigravity__agy_usage
   - mcp__antigravity__agy_status
   - mcp__antigravity__agy_set_config
@@ -32,6 +33,7 @@ Antigravity is powered by Google Gemini models (Gemini 2.5 / 3.7 Pro and Flash) 
 3. **Adversarial & Second-Opinion Code Reviews**:
    - Reviewing git diffs or unstaged changes (`agy_review`).
    - Cross-checking against strict project rules (e.g. `AGENTS.md`, `WORKFLOW.md`).
+   - Running a rigorous, evidence-based audit with severity rubric and a blocking verdict (`agy_audit`) when a plain review is not strict enough.
 4. **Iterative Multi-Turn Collaboration**:
    - Debugging sessions where Claude and Antigravity iterate together using `conversation_id`.
 
@@ -50,11 +52,17 @@ Antigravity is powered by Google Gemini models (Gemini 2.5 / 3.7 Pro and Flash) 
   - `task`: Task description.
   - `model`: Model override.
   - `effort`: `"low"`, `"medium"`, or `"high"`.
+  - `conversation_id`: Resume a planning thread to refine a plan without leaving read-only mode.
 - `mcp__antigravity__agy_review`:
   - `review_target`: What to review (e.g. `"git diff"`, `"src/components/foo.tsx"`).
   - `model`: Model override.
   - `effort`: `"low"`, `"medium"`, or `"high"`.
   - `guidelines`: Architecture/lint/business rules to enforce.
+- `mcp__antigravity__agy_audit`: heavyweight, evidence-based audit — stricter than `agy_review`, returns a BLOCKER/MAJOR/MINOR/NOTE rubric and a FAIL / PASS WITH RESERVATIONS / PASS verdict.
+  - `target`: What to audit (git diff, file paths, branch, PR description, or a plan/RFC to check against the codebase).
+  - `audit_mode`: `"implementation"` (default — verify code against a plan) or `"plan"` (verify a proposed plan against the real project).
+  - `plan`: The plan/spec/acceptance criteria to audit against. Used by `"implementation"` mode.
+  - `conversation_id`: Resume an audit thread.
 - `mcp__antigravity__agy_status`:
   - Checks agy CLI installation, path, active default model, and default effort.
 - `mcp__antigravity__agy_set_config`:

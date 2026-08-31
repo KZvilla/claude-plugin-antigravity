@@ -128,7 +128,7 @@ curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/m
 
 ## 🔧 MCP Tools Reference
 
-Eleven tools exposed via the MCP server:
+Fourteen tools exposed via the MCP server — eleven `agy_*` tools plus three `telegram_*` bridge tools:
 
 | Tool | Mode | Default Timeout | Description |
 |------|------|-----------------|-------------|
@@ -143,6 +143,9 @@ Eleven tools exposed via the MCP server:
 | `agy_usage` | — | — | Session token telemetry, context window saturation, model limits, quota health |
 | `agy_status` | — | — | Binary path, CLI version, active model/effort defaults, permission policies |
 | `agy_set_config` | — | — | Persist model, effort, timeout, or permission preferences |
+| `telegram_notify` | outbound | — | Push a notification (with optional file attachment) to your phone — see [Telegram Bridge Setup](#-telegram-bridge-setup-manual--never-automated) |
+| `telegram_ask` | Human-in-the-Loop | 5m | Ask a question with tappable choice buttons and block until you answer on your phone |
+| `telegram_send_voice` | outbound audio | — | Send an audio file (or the latest Voicebox generation) as a native voice note |
 
 ### `agy_run` — Full Parameters
 
@@ -155,7 +158,7 @@ Eleven tools exposed via the MCP server:
 | `permissions` | `object` | — | Granular ALLOW/DENY policies (see below) |
 | `conversation_id` | `string` | — | Resume a previous conversation |
 | `continue_session` | `boolean` | — | Continue the most recent conversation (`-c`) |
-| `timeout_minutes` | `number` | `10` | Max runtime in minutes |
+| `timeout_minutes` | `number` | `15` | Max runtime in minutes |
 | `cwd` | `string` | — | Working directory |
 | `dangerously_skip_permissions` | `boolean` | `true` | Run headlessly without interactive prompts |
 
@@ -375,7 +378,7 @@ Returns a structured report with an Executive Summary, Key Findings, Cited Sourc
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (11 tools) |
+| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (14 tools) |
 | | `mcp-server/lib/sentence-chunker.js` | Groups streamed `text_delta` fragments into complete sentences for TTS |
 | **Subagent** | `agents/antigravity.md` | Autonomous subagent definition (`antigravity:Antigravity`) |
 | **Skills** | `skills/antigravity/SKILL.md` | Context-aware delegation guidelines |

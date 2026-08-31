@@ -399,6 +399,10 @@ const TOOLS = [
           enum: ['low', 'medium', 'high'],
           description: 'Reasoning effort level. Defaults to "high".'
         },
+        conversation_id: {
+          type: 'string',
+          description: 'Previous conversation ID to resume/continue an ongoing planning thread (e.g. to refine a plan without leaving read-only mode).'
+        },
         timeout_minutes: {
           type: 'number',
           description: 'Timeout in minutes. Defaults to 15.'
@@ -593,7 +597,7 @@ const TOOLS = [
         },
         output_path: {
           type: 'string',
-          description: 'Custom file path for the summary. Defaults to .claude/session-summaries/<date>-<session-id-short>.md'
+          description: 'Custom file path for the summary. Must resolve inside the project root or ~/.claude. Defaults to ~/.claude/session-summaries/<date>-<session-id-short>.md'
         },
         focus: {
           type: 'string',
@@ -2366,6 +2370,10 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         cliArgs.push('--model', effectiveModel);
       }
 
+      if (args.conversation_id) {
+        cliArgs.push('--conversation', args.conversation_id);
+      }
+
       cliArgs.push('-p', planPrompt);
 
       const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
@@ -2375,7 +2383,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
       });
 
       const resData = result.data || {};
-      const conversationId = resData.conversation_id || '';
+      const conversationId = resData.conversation_id || args.conversation_id || '';
       const duration = resData.duration_seconds || 0;
 
       if (resData.usage) {
@@ -2400,7 +2408,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
       if (effectiveModel) formatted += ` | Model: \`${effectiveModel}\``;
       formatted += ` | Mode: \`plan\` (read-only enforced) | Timeout: \`${timeoutMin}m\``;
       if (conversationId) {
-        formatted += `\nConversation ID: \`${conversationId}\` (use \`agy_run\` with this ID to begin execution)`;
+        formatted += `\nConversation ID: \`${conversationId}\` (pass as \`conversation_id\` to refine this plan, or to \`agy_run\` to begin execution)`;
       }
 
       return {
