@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Bot, InlineKeyboard } from 'grammy';
 import { autoRetry } from '@grammyjs/auto-retry';
-import { runAgyTask, getAgyStatus } from './executor.js';
+import { runAgyTask, getAgyStatus, resolveWorkspace, resolveExtraDirs } from './executor.js';
 import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk, formatElapsed } from './formatter.js';
 import {
   getConversationId,
@@ -377,6 +377,8 @@ bot.command('status', async (ctx) => {
 • *Binario:* \`${status.binPath}\`
 • *Versión:* \`${status.version}\`
 • *Workspace:* \`${status.workspaceDir}\`
+${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.join(', ')}\`
+` : ''}
 • *Sesión chat:* ${convId ? `\`${convId}\`` : '_Sin conversación activa_'}
 • *Cola de tareas:* ${queueLen} pendientes (Procesando: ${isProcessingTask ? 'Sí' : 'No'})
 
@@ -551,7 +553,16 @@ console.log('------------------------------------------------------------');
 console.log('🤖 Antigravity Telegram Bridge');
 console.log(`• PID: ${process.pid}`);
 console.log(`• Usuarios autorizados: ${Array.from(ALLOWED_USER_IDS).join(', ') || 'NINGUNO (Modo Bloqueo)'}`);
-console.log(`• Workspace: ${process.env.WORKSPACE_DIR || path.resolve(__dirname, '..')}`);
+console.log(`• Workspace: ${resolveWorkspace()}${process.env.WORKSPACE_DIR ? '' : '  (sin WORKSPACE_DIR: es el cwd del proceso)'}`);
+const extraDirs = resolveExtraDirs();
+if (extraDirs.length > 0) {
+  console.log(`• Directorios extra: ${extraDirs.join(', ')}`);
+}
+if (!fs.existsSync(resolveWorkspace())) {
+  console.error(`[FATAL] El workspace ${resolveWorkspace()} no existe. Créalo o corrige WORKSPACE_DIR en .env.`);
+  releaseLock();
+  process.exit(1);
+}
 console.log('• Conexión: Long Polling saliente (Compatible con CGNAT)');
 console.log('------------------------------------------------------------');
 

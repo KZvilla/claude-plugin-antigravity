@@ -13,7 +13,7 @@ process.env.TELEGRAM_BRIDGE_STATE_FILE = TEST_STATE_FILE;
 
 const FAKE_TOKEN = '1234567890:AAFakeTokenForTestingOnly_DoNotUse';
 
-const { resolveAgyBin, getAgyStatus, loadPolicy } = await import('./executor.js');
+const { resolveAgyBin, getAgyStatus, loadPolicy, resolveWorkspace, resolveExtraDirs } = await import('./executor.js');
 const { splitMessage, markdownToTelegramHtml, escapeHtml, formatElapsed } = await import('./formatter.js');
 const state = await import('./state.js');
 const queue = await import('./queue.js');
@@ -271,6 +271,35 @@ assert.strictEqual(recuperada, tareaViva, 'La cola guarda la referencia, no una 
 assert.strictEqual(recuperada.statusMessageId, 4242, 'Las mutaciones posteriores al encolado se ven');
 assert(recuperada.enqueuedAt, 'enqueueTask anota cuándo se encoló');
 console.log('✔ Test 16: la cola preserva la identidad de la tarea');
+
+// Test 17: el workspace es una fuente única de verdad y no depende del cwd.
+// El banner de bot.js resolvía la raíz del repo y el executor usaba
+// process.cwd(), que con `npm --prefix telegram-bridge start` es otra carpeta:
+// el bot decía un directorio y agy trabajaba en otro.
+const wsPrevio = process.env.WORKSPACE_DIR;
+const dirsPrevio = process.env.AGY_ADD_DIRS;
+const dirA = os.tmpdir();
+const dirB = path.dirname(TEST_STATE_FILE);
+
+process.env.WORKSPACE_DIR = dirA;
+assert.strictEqual(resolveWorkspace(), path.resolve(dirA), 'WORKSPACE_DIR manda sobre el cwd');
+
+delete process.env.WORKSPACE_DIR;
+assert.strictEqual(resolveWorkspace(), path.resolve(process.cwd()), 'Sin WORKSPACE_DIR cae al cwd');
+
+process.env.AGY_ADD_DIRS = `  ${dirA} , , ${dirB}  `;
+assert.deepStrictEqual(
+  resolveExtraDirs(),
+  [path.resolve(dirA), path.resolve(dirB)],
+  'AGY_ADD_DIRS se limpia, se resuelve y descarta los vacíos'
+);
+
+delete process.env.AGY_ADD_DIRS;
+assert.deepStrictEqual(resolveExtraDirs(), [], 'Sin AGY_ADD_DIRS no hay extras');
+
+if (wsPrevio !== undefined) process.env.WORKSPACE_DIR = wsPrevio;
+if (dirsPrevio !== undefined) process.env.AGY_ADD_DIRS = dirsPrevio;
+console.log('✔ Test 17: resolveWorkspace() y resolveExtraDirs()');
 
 // Limpieza: solo el directorio temporal de test
 try {

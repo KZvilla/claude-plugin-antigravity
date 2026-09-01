@@ -62,6 +62,29 @@ const SIGKILL_GRACE_MS = 5000;
 // Tope para consultar la versión del binario sin congelar el event loop.
 const AGY_VERSION_TIMEOUT_MS = 5000;
 
+/**
+ * Directorio de trabajo de las tareas. Fuente única de verdad: `bot.js` lo usa
+ * para el banner y el executor para lanzar `agy`, que antes discrepaban — el
+ * banner resolvía la raíz del repo y el executor usaba `process.cwd()`, que con
+ * `npm --prefix telegram-bridge start` es la carpeta del bridge.
+ */
+export function resolveWorkspace() {
+  return path.resolve(process.env.WORKSPACE_DIR || process.cwd());
+}
+
+/**
+ * Directorios extra que `agy` puede leer y escribir, de `AGY_ADD_DIRS`.
+ * Permite acotar `WORKSPACE_DIR` a un sandbox y abrir un repo concreto solo
+ * cuando hace falta, en lugar de ampliar el workspace entero.
+ */
+export function resolveExtraDirs() {
+  return (process.env.AGY_ADD_DIRS || '')
+    .split(',')
+    .map((d) => d.trim())
+    .filter(Boolean)
+    .map((d) => path.resolve(d));
+}
+
 function parseBool(value, fallback = false) {
   if (value === undefined || value === null || value === '') return fallback;
   return /^(1|true|yes|on)$/i.test(String(value).trim());
@@ -72,7 +95,7 @@ function parseBool(value, fallback = false) {
  * defaults < ~/.claude/antigravity.json < <cwd>/.claude/antigravity.json < entorno.
  * Así el bridge y el MCP no divergen cuando el usuario ajusta su política.
  */
-export function loadPolicy(cwd = process.env.WORKSPACE_DIR || process.cwd()) {
+export function loadPolicy(cwd = resolveWorkspace()) {
   const policy = {
     denyCommands: [...DEFAULT_DENY_COMMANDS],
     denyPaths: [...DEFAULT_DENY_PATHS],
@@ -129,7 +152,7 @@ export function runAgyTask(options = {}) {
     effort = process.env.AGY_EFFORT || 'high',
     timeoutMinutes = parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     conversationId = null,
-    cwd = process.env.WORKSPACE_DIR || process.cwd(),
+    cwd = resolveWorkspace(),
     sandbox = undefined,
     onSpawn = null
   } = options;
@@ -150,6 +173,13 @@ export function runAgyTask(options = {}) {
   // Único control de permisos real que ofrece el CLI, además de `--mode plan`.
   if (useSandbox) {
     cliArgs.push('--sandbox');
+  }
+
+  // Workspace explícito: sin esto `agy` depende del directorio desde el que se
+  // lanzó el proceso, y el usuario no tiene forma de saber cuál es.
+  cliArgs.push('--add-dir', cwd);
+  for (const dir of resolveExtraDirs()) {
+    if (dir !== cwd) cliArgs.push('--add-dir', dir);
   }
 
   if (model) {
@@ -330,7 +360,7 @@ function getAgyVersion() {
 /**
  * Consulta la versión e información del ejecutable de Antigravity
  */
-export function getAgyStatus(cwd = process.env.WORKSPACE_DIR || process.cwd()) {
+export function getAgyStatus(cwd = resolveWorkspace()) {
   const version = getAgyVersion();
 
   const policy = loadPolicy(cwd);
@@ -339,6 +369,7 @@ export function getAgyStatus(cwd = process.env.WORKSPACE_DIR || process.cwd()) {
     binPath: AGY_BIN,
     version,
     workspaceDir: cwd,
+    extraDirs: resolveExtraDirs(),
     denyCommands: policy.denyCommands,
     denyPaths: policy.denyPaths,
     configFile: policy.configFile,
