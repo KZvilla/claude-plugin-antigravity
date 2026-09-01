@@ -9,7 +9,11 @@
   },
   "scripts": {
     "start": "node bot.js",
-    "test": "node test-bridge.js"
+    "test": "node test-bridge.js",
+    "daemon": "powershell -NoProfile -ExecutionPolicy Bypass -File daemon.ps1 status",
+    "daemon:install": "powershell -NoProfile -ExecutionPolicy Bypass -File daemon.ps1 install",
+    "daemon:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File daemon.ps1 uninstall",
+    "daemon:logs": "powershell -NoProfile -ExecutionPolicy Bypass -File daemon.ps1 logs"
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
