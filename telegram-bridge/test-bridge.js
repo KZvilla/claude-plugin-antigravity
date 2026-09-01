@@ -13,7 +13,7 @@ process.env.TELEGRAM_BRIDGE_STATE_FILE = TEST_STATE_FILE;
 
 const FAKE_TOKEN = '1234567890:AAFakeTokenForTestingOnly_DoNotUse';
 
-const { resolveAgyBin, getAgyStatus } = await import('./executor.js');
+const { resolveAgyBin, getAgyStatus, loadPolicy } = await import('./executor.js');
 const { splitMessage } = await import('./formatter.js');
 const state = await import('./state.js');
 const queue = await import('./queue.js');
@@ -117,6 +117,40 @@ assert(!persisted.includes('"token"'), 'state.json NO debe contener ningún camp
 assert(!persisted.includes('"queue"'), 'state.json ya no persiste la cola de tareas');
 assert.strictEqual(typeof state.enqueueTask, 'undefined', 'state.js ya no debe exponer la cola');
 console.log('✔ Test 8: el estado en disco está libre de secretos');
+
+// Test 9: la política se carga de .claude/antigravity.json con la misma
+// precedencia que el servidor MCP, y el entorno la sobreescribe.
+const policyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-bridge-policy-'));
+fs.mkdirSync(path.join(policyDir, '.claude'), { recursive: true });
+fs.writeFileSync(
+  path.join(policyDir, '.claude', 'antigravity.json'),
+  JSON.stringify({ permissions: { deny_commands: ['docker *'], sandbox: true } }),
+  'utf8'
+);
+
+const basePolicy = loadPolicy(policyDir);
+assert.deepStrictEqual(basePolicy.denyCommands, ['docker *'], 'deny_commands sale del fichero de política');
+assert.strictEqual(basePolicy.sandbox, true, 'sandbox sale del fichero de política');
+assert(basePolicy.denyPaths.includes('.env*'), 'Las claves ausentes conservan el valor por defecto');
+assert.strictEqual(
+  basePolicy.configFile,
+  path.join(policyDir, '.claude', 'antigravity.json'),
+  'Debe reportar de dónde salió la política'
+);
+
+process.env.AGY_SANDBOX = 'false';
+assert.strictEqual(loadPolicy(policyDir).sandbox, false, 'AGY_SANDBOX debe ganar sobre el fichero');
+delete process.env.AGY_SANDBOX;
+fs.rmSync(policyDir, { recursive: true, force: true });
+console.log('✔ Test 9: loadPolicy() respeta fichero y entorno');
+
+// Test 10: getAgyStatus distingue lo que se aplica de lo que solo se sugiere.
+// Es lo que impide que /status vuelva a prometer una protección inexistente.
+assert.strictEqual(status.enforcement.denyCommands, 'prompt', 'deny_commands solo se sugiere al modelo');
+assert.strictEqual(status.enforcement.denyPaths, 'prompt', 'deny_paths solo se sugiere al modelo');
+assert.strictEqual(typeof status.enforcement.sandbox, 'boolean', 'sandbox es un control real, booleano');
+assert.strictEqual(status.enforcement.skipPermissions, true, 'el bridge siempre auto-aprueba herramientas');
+console.log('✔ Test 10: getAgyStatus() declara qué se aplica y qué solo se sugiere');
 
 // Limpieza: solo el directorio temporal de test
 try {

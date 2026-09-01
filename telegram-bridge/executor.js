@@ -1,6 +1,7 @@
 import { spawn, execFileSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 
 /**
  * Resuelve la ruta del binario agy.exe de Antigravity
@@ -37,9 +38,68 @@ export function resolveAgyBin() {
 
 const AGY_BIN = resolveAgyBin();
 
-// Políticas de seguridad por defecto (heredadas del estándar del servidor MCP)
+// ==============================================================================
+// Política de permisos
+// ==============================================================================
+//
+// IMPORTANTE — qué se aplica de verdad y qué no:
+//
+//   `agy --help` (v1.1.22) NO expone ningún flag de política por ruta ni por
+//   comando. Los únicos controles reales del CLI son `--sandbox` (restricciones
+//   de terminal) y `--mode plan` (sesión de solo lectura). `deny_paths` y
+//   `deny_commands` se inyectan como texto delante del prompt: son una
+//   instrucción al modelo, no un control que el sistema pueda hacer cumplir.
+//
+// Se conservan porque reducen el riesgo en la práctica y porque mantienen la
+// paridad con el servidor MCP, pero `getAgyStatus()` los marca como
+// «sugeridos» para que `/status` no prometa una protección que no existe.
+
 const DEFAULT_DENY_COMMANDS = ['git push*', 'git reset --hard*', 'npm publish*', 'rm -rf /*'];
 const DEFAULT_DENY_PATHS = ['.env*', '**/*.key', '**/*.pem'];
+
+function parseBool(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(String(value).trim());
+}
+
+/**
+ * Carga la política efectiva con la misma precedencia que el servidor MCP:
+ * defaults < ~/.claude/antigravity.json < <cwd>/.claude/antigravity.json < entorno.
+ * Así el bridge y el MCP no divergen cuando el usuario ajusta su política.
+ */
+export function loadPolicy(cwd = process.env.WORKSPACE_DIR || process.cwd()) {
+  const policy = {
+    denyCommands: [...DEFAULT_DENY_COMMANDS],
+    denyPaths: [...DEFAULT_DENY_PATHS],
+    sandbox: false,
+    configFile: null
+  };
+
+  const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  const candidates = [
+    homeDir ? path.join(homeDir, '.claude', 'antigravity.json') : null,
+    path.join(cwd, '.claude', 'antigravity.json')
+  ].filter(Boolean);
+
+  for (const file of candidates) {
+    if (!fs.existsSync(file)) continue;
+    try {
+      const perms = JSON.parse(fs.readFileSync(file, 'utf8')).permissions;
+      if (!perms) continue;
+      if (Array.isArray(perms.deny_commands)) policy.denyCommands = perms.deny_commands;
+      if (Array.isArray(perms.deny_paths)) policy.denyPaths = perms.deny_paths;
+      if (perms.sandbox !== undefined) policy.sandbox = Boolean(perms.sandbox);
+      policy.configFile = file;
+    } catch (err) {
+      console.error(`[executor] No se pudo leer ${file}: ${err.message}. Se ignora.`);
+    }
+  }
+
+  // El entorno gana: permite endurecer el bridge sin tocar la política del MCP.
+  policy.sandbox = parseBool(process.env.AGY_SANDBOX, policy.sandbox);
+
+  return policy;
+}
 
 /**
  * Ejecuta una tarea en Antigravity CLI de forma segura y estructurada
@@ -52,6 +112,7 @@ const DEFAULT_DENY_PATHS = ['.env*', '**/*.key', '**/*.pem'];
  * @param {number} [options.timeoutMinutes=15] Timeout en minutos
  * @param {string} [options.conversationId] ID para continuar conversación multiturno
  * @param {string} [options.cwd] Directorio de trabajo
+ * @param {boolean} [options.sandbox] Fuerza (o desactiva) `--sandbox` para esta tarea
  */
 export function runAgyTask(options = {}) {
   const {
@@ -61,9 +122,12 @@ export function runAgyTask(options = {}) {
     effort = process.env.AGY_EFFORT || 'high',
     timeoutMinutes = parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     conversationId = null,
-    cwd = process.env.WORKSPACE_DIR || process.cwd()
+    cwd = process.env.WORKSPACE_DIR || process.cwd(),
+    sandbox = undefined
   } = options;
 
+  const policy = loadPolicy(cwd);
+  const useSandbox = sandbox === undefined ? policy.sandbox : Boolean(sandbox);
   const timeoutMs = (timeoutMinutes + 1) * 60 * 1000;
 
   // Construcción de argumentos CLI
@@ -74,6 +138,11 @@ export function runAgyTask(options = {}) {
     '--mode', mode,
     '--effort', effort
   ];
+
+  // Único control de permisos real que ofrece el CLI, además de `--mode plan`.
+  if (useSandbox) {
+    cliArgs.push('--sandbox');
+  }
 
   if (model) {
     cliArgs.push('--model', model);
@@ -100,7 +169,7 @@ export function runAgyTask(options = {}) {
     let stderr = '';
     let killed = false;
 
-    console.log(`[executor] Ejecutando: ${AGY_BIN} (modo: ${mode}, conv: ${conversationId || 'nueva'}, cwd: ${cwd})`);
+    console.log(`[executor] Ejecutando: ${AGY_BIN} (modo: ${mode}, sandbox: ${useSandbox ? 'sí' : 'no'}, conv: ${conversationId || 'nueva'}, cwd: ${cwd})`);
 
     const child = spawn(AGY_BIN, cliArgs, {
       cwd,
@@ -198,11 +267,24 @@ export function getAgyStatus(cwd = process.env.WORKSPACE_DIR || process.cwd()) {
     } catch {}
   }
 
+  const policy = loadPolicy(cwd);
+
   return {
     binPath: AGY_BIN,
     version,
     workspaceDir: cwd,
-    denyCommands: DEFAULT_DENY_COMMANDS,
-    denyPaths: DEFAULT_DENY_PATHS
+    denyCommands: policy.denyCommands,
+    denyPaths: policy.denyPaths,
+    configFile: policy.configFile,
+    // Cómo se aplica cada control. `/status` lo usa para no presentar una
+    // sugerencia al modelo como si fuese una política del sistema.
+    enforcement: {
+      // Reales: los impone el CLI.
+      sandbox: policy.sandbox,
+      skipPermissions: true,
+      // Solo sugeridos: viajan en el prompt, nada impide desobedecerlos.
+      denyCommands: 'prompt',
+      denyPaths: 'prompt'
+    }
   };
 }

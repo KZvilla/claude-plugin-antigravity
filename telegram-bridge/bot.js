@@ -251,12 +251,12 @@ Puente móvil autónomo conectado a tu entorno local.
 • \`/plan <instrucción>\` — Genera un plan de acción de solo lectura con botón para aprobarlo.
 • \`/run <instrucción>\` — Ejecuta tareas permitiendo edición de código y tests.
 • \`/resume <instrucción>\` — Continúa la sesión de trabajo actual.
-• \`/status\` — Consulta estado del binario, versión y sesión activa.
+• \`/status\` — Consulta estado del binario, versión, sesión activa y política de permisos.
 • \`/reset\` — Reinicia la conversación y olvida el contexto actual.
 
 *Sesión activa:* ${convId ? `\`${convId}\`` : '_Ninguna (el próximo mensaje abrirá una nueva)_'}
 
-_También puedes escribir tu consulta directamente como texto común y se ejecutará en la sesión activa._`;
+_El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero verás qué se haría y decides con el botón «Ejecutar cambios». Para escribir directamente sin ese paso, usa \`/run\`._`;
 
   await ctx.reply(helpText, { parse_mode: 'Markdown' });
 });
@@ -272,8 +272,16 @@ bot.command('status', async (ctx) => {
 • *Workspace:* \`${status.workspaceDir}\`
 • *Sesión chat:* ${convId ? `\`${convId}\`` : '_Sin conversación activa_'}
 • *Cola de tareas:* ${queueLen} pendientes (Procesando: ${isProcessingTask ? 'Sí' : 'No'})
-• *Comandos prohibidos:* \`${status.denyCommands.join(', ')}\`
-• *Rutas protegidas:* \`${status.denyPaths.join(', ')}\``;
+
+🔒 *Controles efectivos* (los impone el CLI)
+• *Sandbox de terminal:* ${status.enforcement.sandbox ? '`activo`' : '`inactivo` — actívalo con `AGY_SANDBOX=true`'}
+• *Aprobación de herramientas:* \`--dangerously-skip-permissions\` (auto-aprobada)
+• *Texto libre:* entra en modo \`plan\`; escribir requiere pulsar «Ejecutar cambios»
+
+⚠️ *Guardrails solo sugeridos al modelo* (no exigibles: \`agy\` no expone flags de política por ruta o comando)
+• *Comandos desaconsejados:* \`${status.denyCommands.join(', ')}\`
+• *Rutas desaconsejadas:* \`${status.denyPaths.join(', ')}\`
+• *Política cargada de:* ${status.configFile ? `\`${status.configFile}\`` : '_valores por defecto_'}`;
 
   await ctx.reply(msg, { parse_mode: 'Markdown' });
 });
@@ -359,7 +367,11 @@ bot.on('message:text', async (ctx) => {
     return ctx.reply('Comando no reconocido. Usa /help para ver las opciones disponibles.');
   }
 
-  await dispatchTask(ctx, text, 'accept-edits');
+  // Modo `plan` por defecto: un mensaje mal escrito, un autocorrector o un toque
+  // accidental en el historial no debe modificar el repositorio. El paso a
+  // escritura es siempre explícito, vía el botón «Ejecutar cambios» del plan
+  // o vía /run.
+  await dispatchTask(ctx, text, 'plan');
 });
 
 // ==============================================================================
