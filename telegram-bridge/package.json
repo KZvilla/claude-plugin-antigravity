@@ -4,6 +4,9 @@
   "description": "Zero-cost Telegram bot bridge for Antigravity CLI and Claude Code over CGNAT",
   "type": "module",
   "main": "bot.js",
+  "engines": {
+    "node": ">=20.12"
+  },
   "scripts": {
     "start": "node bot.js",
     "test": "node test-bridge.js"

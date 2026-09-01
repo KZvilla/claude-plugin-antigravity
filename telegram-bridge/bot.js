@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Bot, InlineKeyboard } from 'grammy';
 import { autoRetry } from '@grammyjs/auto-retry';
 import { runAgyTask, getAgyStatus } from './executor.js';
-import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk } from './formatter.js';
+import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk, formatElapsed } from './formatter.js';
 import {
   getConversationId,
   setConversationId,
@@ -32,6 +32,15 @@ if (fs.existsSync(envLocal)) {
   if (typeof process.loadEnvFile === 'function') {
     process.loadEnvFile(envRoot);
   }
+}
+
+// `process.loadEnvFile` existe desde Node 20.12 / 21.7. En una versión anterior
+// no se carga nada y el fallo se manifiesta como «Falta TELEGRAM_BOT_TOKEN»,
+// que apunta al .env en lugar de al runtime.
+if (typeof process.loadEnvFile !== 'function') {
+  console.error(`[FATAL] Node ${process.versions.node} es demasiado antiguo: se requiere Node >= 20.12.`);
+  console.error('El bridge carga el .env con process.loadEnvFile, disponible desde 20.12 / 21.7.');
+  process.exit(1);
 }
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -214,12 +223,32 @@ async function processTaskQueue() {
   const { ctx, chatId, prompt, mode, conversationId } = task;
 
   // Intervalo de acción typing mientras piensa Antigravity
+  const startedAt = Date.now();
   let typingInterval = null;
+  let progressInterval = null;
+
+  // Un único mensaje de estado que se va editando. Para una tarea de 2 a 15
+  // minutos, `typing` cada 4,5 s no dice si algo avanza o si se colgó.
+  const updateProgress = async (prefix) => {
+    if (!task.statusMessageId) return;
+    const texto = `${prefix} · ${formatElapsed((Date.now() - startedAt) / 1000)}`;
+    try {
+      await bot.api.editMessageText(chatId, task.statusMessageId, texto);
+    } catch {
+      // «message is not modified» y el mensaje borrado por el usuario son
+      // esperables; ninguno merece ruido.
+    }
+  };
+
   try {
     await bot.api.sendChatAction(chatId, 'typing').catch(() => {});
     typingInterval = setInterval(() => {
       bot.api.sendChatAction(chatId, 'typing').catch(() => {});
     }, 4500);
+
+    const etiqueta = mode === 'plan' ? '🧠 Generando plan' : '⚙️ Ejecutando tarea';
+    await updateProgress(etiqueta);
+    progressInterval = setInterval(() => { updateProgress(etiqueta); }, 15000);
 
     const result = await runAgyTask({
       prompt,
@@ -230,6 +259,10 @@ async function processTaskQueue() {
 
     clearInterval(typingInterval);
     typingInterval = null;
+    clearInterval(progressInterval);
+    progressInterval = null;
+
+    await updateProgress(result.success ? '✅ Completado en' : '⚠️ Terminado con error tras');
 
     if (result.cancelled) {
       // El aviso ya lo dio /cancel; aquí solo se cierra el ciclo.
@@ -264,6 +297,7 @@ async function processTaskQueue() {
     await notifyChat(chatId, `❌ Ocurrió un error inesperado al procesar la tarea: ${err.message}`);
   } finally {
     if (typingInterval) clearInterval(typingInterval);
+    if (progressInterval) clearInterval(progressInterval);
     cancelCurrent = null;
     currentTask = null;
     isProcessingTask = false;
@@ -277,20 +311,35 @@ async function processTaskQueue() {
 /**
  * Encola o despacha una tarea hacia Antigravity
  */
-async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = null) {
+async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = null, { freshSession = false } = {}) {
   const chatId = ctx.chat.id;
-  const activeConvId = forceConvId !== null ? forceConvId : getConversationId(chatId);
+  let activeConvId = forceConvId !== null ? forceConvId : getConversationId(chatId);
 
-  if (isProcessingTask) {
-    const pos = enqueueTask({ ctx, chatId, prompt, mode, conversationId: activeConvId });
-    await ctx.reply(`⏳ Antigravity está ocupado con otra tarea. Tu solicitud ha sido encolada en la posición #${pos}.`);
-    return;
+  if (freshSession && forceConvId === null) {
+    // `/run` arranca en limpio: se olvida la sesión previa del chat para que el
+    // executor no pase --conversation y agy abra una nueva.
+    clearConversationId(chatId);
+    activeConvId = null;
+  }
+  const task = { ctx, chatId, prompt, mode, conversationId: activeConvId, statusMessageId: null };
+
+  const encolada = isProcessingTask;
+  const pos = enqueueTask(task);
+
+  // El mensaje inicial es el que luego se edita con el tiempo transcurrido, así
+  // que se guarda su id en la propia tarea.
+  const aviso = encolada
+    ? `⏳ Antigravity está ocupado con otra tarea. Tu solicitud queda en la posición #${pos}.`
+    : (mode === 'plan' ? '🧠 Generando plan arquitectónico...' : '⚙️ Ejecutando tarea con Antigravity...');
+
+  try {
+    const sent = await ctx.reply(aviso);
+    task.statusMessageId = sent?.message_id ?? null;
+  } catch (err) {
+    console.error(`[dispatch] No se pudo enviar el aviso inicial: ${err.message}`);
   }
 
-  // Despachar inmediatamente
-  enqueueTask({ ctx, chatId, prompt, mode, conversationId: activeConvId });
-  await ctx.reply(mode === 'plan' ? '🧠 Generando plan arquitectónico...' : '⚙️ Ejecutando tarea con Antigravity...');
-  runQueue();
+  if (!encolada) runQueue();
 }
 
 // ==============================================================================
@@ -305,7 +354,7 @@ Puente móvil autónomo conectado a tu entorno local.
 
 *Comandos disponibles:*
 • \`/plan <instrucción>\` — Genera un plan de acción de solo lectura con botón para aprobarlo.
-• \`/run <instrucción>\` — Ejecuta tareas permitiendo edición de código y tests.
+• \`/run <instrucción>\` — Abre una sesión nueva y ejecuta, permitiendo edición de código y tests.
 • \`/resume <instrucción>\` — Continúa la sesión de trabajo actual.
 • \`/status\` — Consulta estado del binario, versión, sesión activa y política de permisos.
 • \`/queue\` — Muestra la tarea en curso y las encoladas.
@@ -316,7 +365,7 @@ Puente móvil autónomo conectado a tu entorno local.
 
 _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero verás qué se haría y decides con el botón «Ejecutar cambios». Para escribir directamente sin ese paso, usa \`/run\`._`;
 
-  await ctx.reply(helpText, { parse_mode: 'Markdown' });
+  await sendSafeChunk(ctx, helpText);
 });
 
 bot.command('status', async (ctx) => {
@@ -352,23 +401,28 @@ bot.command('reset', async (ctx) => {
 bot.command('plan', async (ctx) => {
   const prompt = ctx.match?.trim();
   if (!prompt) {
-    return ctx.reply('⚠️ Por favor indica la tarea a planificar. Ejemplo:\n`/plan Analizar el sistema de login y proponer refactor`', { parse_mode: 'Markdown' });
+    return sendSafeChunk(ctx, '⚠️ Por favor indica la tarea a planificar. Ejemplo:\n`/plan Analizar el sistema de login y proponer refactor`');
   }
   await dispatchTask(ctx, prompt, 'plan');
 });
 
+// `/run` abre sesión nueva y `/resume` continúa la activa. Antes eran
+// indistinguibles: ambos reutilizaban el conversationId del chat.
 bot.command('run', async (ctx) => {
   const prompt = ctx.match?.trim();
   if (!prompt) {
-    return ctx.reply('⚠️ Por favor indica la tarea a ejecutar. Ejemplo:\n`/run Corregir los imports en index.js`', { parse_mode: 'Markdown' });
+    return sendSafeChunk(ctx, '⚠️ Por favor indica la tarea a ejecutar. Ejemplo:\n`/run Corregir los imports en index.js`');
   }
-  await dispatchTask(ctx, prompt, 'accept-edits');
+  await dispatchTask(ctx, prompt, 'accept-edits', null, { freshSession: true });
 });
 
 bot.command('resume', async (ctx) => {
   const prompt = ctx.match?.trim();
   if (!prompt) {
-    return ctx.reply('⚠️ Por favor indica qué deseas continuar en la sesión. Ejemplo:\n`/resume Ahora ejecuta las pruebas unitarias`', { parse_mode: 'Markdown' });
+    return sendSafeChunk(ctx, '⚠️ Por favor indica qué deseas continuar en la sesión. Ejemplo:\n`/resume Ahora ejecuta las pruebas unitarias`');
+  }
+  if (!getConversationId(ctx.chat.id)) {
+    return ctx.reply('No hay sesión activa que continuar. Usa /run para abrir una nueva.');
   }
   await dispatchTask(ctx, prompt, 'accept-edits');
 });
@@ -434,7 +488,7 @@ bot.on('callback_query:data', async (ctx) => {
       try {
         await ctx.editMessageReplyMarkup({ reply_markup: undefined });
       } catch {}
-      await ctx.reply(`🔘 *Respuesta registrada:* \`${selected}\`\nEl agente continuará su tarea en tu equipo.`, { parse_mode: 'Markdown' });
+      await sendSafeChunk(ctx, `🔘 *Respuesta registrada:* \`${selected}\`\nEl agente continuará su tarea en tu equipo.`);
     } else {
       await ctx.answerCallbackQuery({ text: 'Esta consulta ya no está activa o expiró.' });
     }
@@ -445,7 +499,7 @@ bot.on('callback_query:data', async (ctx) => {
     const convId = data.replace('exec_plan:', '');
     await ctx.answerCallbackQuery({ text: 'Aprobado: Iniciando ejecución...' });
     await ctx.editMessageReplyMarkup({ reply_markup: undefined }); // Quitar botones
-    await ctx.reply('🚀 *Plan Aprobado*: Procediendo a implementar los cambios...', { parse_mode: 'Markdown' });
+    await sendSafeChunk(ctx, '🚀 *Plan Aprobado*: Procediendo a implementar los cambios...');
 
     await dispatchTask(
       ctx,

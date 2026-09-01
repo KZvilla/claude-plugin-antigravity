@@ -17,13 +17,17 @@ const queue = [];
 
 /**
  * Agrega una tarea al final de la cola.
+ *
+ * Guarda la MISMA referencia que recibe (solo le añade `enqueuedAt`), no una
+ * copia: el llamante necesita seguir mutándola después de encolar — por
+ * ejemplo para anotar el `statusMessageId` en cuanto Telegram devuelve el id
+ * del mensaje de progreso.
+ *
  * @returns {number} posición de la tarea en la cola (1-indexada)
  */
 export function enqueueTask(task) {
-  queue.push({
-    ...task,
-    enqueuedAt: new Date().toISOString()
-  });
+  task.enqueuedAt = new Date().toISOString();
+  queue.push(task);
   return queue.length;
 }
 

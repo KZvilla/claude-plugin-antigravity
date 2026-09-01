@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerPendingAsk, getPendingAsk, expirePendingAsk } from './state.js';
+import { splitMessage, markdownToTelegramHtml } from './formatter.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,8 +34,49 @@ const ALLOWED_USER_IDS = rawAllowedIds.split(',').map(s => s.trim()).filter(Bool
  */
 export function getDefaultChatId(targetChatId = null) {
   if (targetChatId) return String(targetChatId);
+
+  // Con varios IDs autorizados, mandar siempre al primero es una decisión
+  // arbitraria y silenciosa. TELEGRAM_NOTIFY_CHAT_ID permite fijar el destino;
+  // si no está y hay ambigüedad, se avisa en lugar de elegir en silencio.
+  const configured = (process.env.TELEGRAM_NOTIFY_CHAT_ID || '').trim();
+  if (configured) return configured;
+
+  if (ALLOWED_USER_IDS.length > 1) {
+    console.error(
+      `[notify] Hay ${ALLOWED_USER_IDS.length} IDs en ALLOWED_USER_IDS y ninguno elegido: ` +
+      `se usa el primero (${ALLOWED_USER_IDS[0]}). Fija TELEGRAM_NOTIFY_CHAT_ID para decidirlo.`
+    );
+  }
   if (ALLOWED_USER_IDS.length > 0) return ALLOWED_USER_IDS[0];
+
   throw new Error('No hay usuarios configurados en ALLOWED_USER_IDS ni se especificó un targetChatId.');
+}
+
+/**
+ * Envía un texto troceándolo si supera el límite de Telegram, en HTML escapado
+ * y con degradación a texto plano. Antes se enviaba de una pieza: un mensaje de
+ * más de 4096 caracteres —posible en un agy_narrate o en un reporte de error—
+ * fallaba en la API en vez de trocearse.
+ */
+async function sendChunkedMessage(chatId, text, extra = {}) {
+  const chunks = splitMessage(text);
+  const sent = [];
+
+  for (const chunk of chunks) {
+    try {
+      sent.push(await telegramApiCall('sendMessage', {
+        chat_id: chatId,
+        text: markdownToTelegramHtml(chunk),
+        parse_mode: 'HTML',
+        ...extra
+      }));
+    } catch (err) {
+      console.error(`[notify] Telegram rechazó el HTML (${err.message}). Reintentando en texto plano.`);
+      sent.push(await telegramApiCall('sendMessage', { chat_id: chatId, text: chunk, ...extra }));
+    }
+  }
+
+  return sent.length === 1 ? sent[0] : sent;
 }
 
 /**
@@ -128,26 +170,15 @@ export async function sendTelegramNotification(options = {}) {
 
   // Si se adjunta un archivo, enviarlo como documento con caption
   if (filePath && fs.existsSync(filePath)) {
+    // El caption tiene su propio límite de 1024 y no se trocea.
     return await telegramUploadCall('sendDocument', 'document', filePath, {
       chat_id: chatId,
-      caption: formattedText.slice(0, 1024),
-      parse_mode: 'Markdown'
+      caption: markdownToTelegramHtml(formattedText).slice(0, 1024),
+      parse_mode: 'HTML'
     });
   }
 
-  try {
-    return await telegramApiCall('sendMessage', {
-      chat_id: chatId,
-      text: formattedText,
-      parse_mode: 'Markdown'
-    });
-  } catch (err) {
-    // Degradación a texto plano si hay caracteres no escapados en Markdown
-    return await telegramApiCall('sendMessage', {
-      chat_id: chatId,
-      text: formattedText
-    });
-  }
+  return await sendChunkedMessage(chatId, formattedText);
 }
 
 /**
@@ -246,8 +277,8 @@ export async function askTelegramQuestion(options = {}) {
 
   const sentMsg = await telegramApiCall('sendMessage', {
     chat_id: chatId,
-    text,
-    parse_mode: 'Markdown',
+    text: markdownToTelegramHtml(text),
+    parse_mode: 'HTML',
     reply_markup: {
       inline_keyboard: inlineKeyboard
     }

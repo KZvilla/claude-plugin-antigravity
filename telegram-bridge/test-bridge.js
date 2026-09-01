@@ -14,7 +14,7 @@ process.env.TELEGRAM_BRIDGE_STATE_FILE = TEST_STATE_FILE;
 const FAKE_TOKEN = '1234567890:AAFakeTokenForTestingOnly_DoNotUse';
 
 const { resolveAgyBin, getAgyStatus, loadPolicy } = await import('./executor.js');
-const { splitMessage } = await import('./formatter.js');
+const { splitMessage, markdownToTelegramHtml, escapeHtml, formatElapsed } = await import('./formatter.js');
 const state = await import('./state.js');
 const queue = await import('./queue.js');
 const { Api, Context } = await import('grammy');
@@ -33,15 +33,34 @@ console.log('✔ Test 2: getAgyStatus() ->', status.version);
 assert(status.binPath, 'Debe retornar binPath');
 assert(Array.isArray(status.denyCommands), 'Debe tener denyCommands');
 
-// Test 3: Formateador y división de mensajes
+// Test 3: división de mensajes. La aserción anterior (`chunks[0].includes('```')`)
+// pasaba trivialmente porque el propio texto de prueba lleva fences: lo que
+// importa es que TODO trozo quede con los fences equilibrados y dentro del límite.
 const shortText = 'Hola mundo!';
 assert.strictEqual(splitMessage(shortText, 50).length, 1, 'Texto corto no se divide');
 
-const textWithCode = 'Inicio del mensaje\n```javascript\nconst a = 1;\nconst b = 2;\nconst c = 3;\n```\nFinal';
-const chunks = splitMessage(textWithCode, 40);
-console.log(`✔ Test 3: splitMessage dividió texto en ${chunks.length} partes`);
-assert(chunks.length >= 2, 'Debe dividirse en al menos 2 partes con límite 40');
-assert(chunks[0].includes('```'), 'El primer chunk debe contener cierre de bloque si quedó abierto');
+const fencesEquilibrados = (chunk) => ((chunk.match(/```/g) || []).length % 2) === 0;
+const sinTrozosVacios = (cs) => cs.every((c) => c.replace(/```[^\n]*/g, '').trim().length > 0);
+
+const casosSplit = {
+  // El fence de apertura es justo la línea que desborda: cerrar el trozo
+  // anterior dejaría un fence huérfano de un bloque que nunca se abrió.
+  'apertura desborda': ['x'.repeat(35) + '\n```js\ncode aqui\n```\nfin', 40],
+  // Una sola línea más larga que el límite, dentro de un bloque.
+  'linea gigante': ['```js\n' + 'z'.repeat(120) + '\n```', 50],
+  // El texto termina dentro de un bloque sin cerrar.
+  'termina abierto': ['a'.repeat(30) + '\n```js\n' + 'b'.repeat(30), 40],
+  'texto plano largo': [Array.from({ length: 12 }, (_, i) => `Linea ${i} con algo de texto.`).join('\n'), 60]
+};
+
+for (const [nombre, [texto, limite]] of Object.entries(casosSplit)) {
+  const cs = splitMessage(texto, limite);
+  assert(cs.length >= 2, `${nombre}: debe dividirse`);
+  assert(cs.every(fencesEquilibrados), `${nombre}: todo trozo con fences equilibrados`);
+  assert(cs.every((c) => c.length <= limite), `${nombre}: ningún trozo supera el límite`);
+  assert(sinTrozosVacios(cs), `${nombre}: sin trozos que sean solo un bloque vacío`);
+}
+console.log(`✔ Test 3: splitMessage equilibra fences en ${Object.keys(casosSplit).length} casos límite`);
 
 // Test 4: Persistencia de estado
 const testChatId = 999999999;
@@ -196,6 +215,62 @@ assert(state.getPendingAsk('ask-vivo'), 'Un ask pendiente NUNCA se purga');
 assert.strictEqual(state.getPendingAsk('ask-caduca'), null, 'El expirado se purga');
 assert.strictEqual(state.getPendingAsk('ask-test-1'), null, 'El respondido se purga');
 console.log('✔ Test 13: asks se expiran y se recolectan');
+
+// Test 14: el formateo a HTML es determinista y nunca produce marcado inválido.
+assert.strictEqual(escapeHtml('a < b & c > d'), 'a &lt; b &amp; c &gt; d', 'Escapa los tres caracteres');
+assert.strictEqual(
+  markdownToTelegramHtml('<script>alert(1)</script>'),
+  '&lt;script&gt;alert(1)&lt;/script&gt;',
+  'El HTML del usuario se escapa, no se interpreta'
+);
+assert.strictEqual(markdownToTelegramHtml('*negrita* y _cursiva_'), '<b>negrita</b> y <i>cursiva</i>');
+assert.strictEqual(markdownToTelegramHtml('**doble** tambien'), '<b>doble</b> tambien');
+assert.strictEqual(markdownToTelegramHtml('con `codigo` dentro'), 'con <code>codigo</code> dentro');
+assert.strictEqual(
+  markdownToTelegramHtml('el `a < b` escapa'),
+  'el <code>a &lt; b</code> escapa',
+  'El código en línea también se escapa'
+);
+
+// Lo que rompía el Markdown legado: marcadores sueltos. Ahora salen literales.
+for (const suelto of ['foo_bar sin pareja', 'un * asterisco suelto', 'guion_bajo_medio', 'a ** b']) {
+  const html = markdownToTelegramHtml(suelto);
+  assert(!html.includes('<b>') && !html.includes('<i>'), `Marcador suelto literal: ${suelto}`);
+}
+
+const conBloque = markdownToTelegramHtml('texto\n```js\nif (a < b && c) {}\n```');
+assert(
+  conBloque.includes('<pre><code class="language-js">if (a &lt; b &amp;&amp; c) {}</code></pre>'),
+  `El bloque de código se escapa y se etiqueta: ${conBloque}`
+);
+assert(
+  markdownToTelegramHtml('```py\nprint(1)').includes('</code></pre>'),
+  'Un bloque sin cerrar se cierra implícitamente'
+);
+
+// Ninguna etiqueta abierta puede quedar sin cerrar en la salida.
+const abiertas = (conBloque.match(/<[a-z]+[^>]*>/g) || []).length;
+const cerradas = (conBloque.match(/<\/[a-z]+>/g) || []).length;
+assert.strictEqual(abiertas, cerradas, 'Toda etiqueta emitida se cierra');
+console.log('✔ Test 14: markdownToTelegramHtml es determinista y escapa siempre');
+
+// Test 15: formatElapsed, usado por el mensaje de progreso editable.
+assert.strictEqual(formatElapsed(0), '0s');
+assert.strictEqual(formatElapsed(45), '45s');
+assert.strictEqual(formatElapsed(65), '1m 05s');
+assert.strictEqual(formatElapsed(3600), '60m 00s');
+console.log('✔ Test 15: formatElapsed');
+
+// Test 16: la cola guarda la MISMA referencia, no una copia. De eso depende que
+// dispatchTask pueda anotar el statusMessageId después de encolar.
+const tareaViva = { ctx, chatId: testChatId, prompt: 'p', mode: 'plan', statusMessageId: null };
+queue.enqueueTask(tareaViva);
+tareaViva.statusMessageId = 4242;
+const recuperada = queue.dequeueTask();
+assert.strictEqual(recuperada, tareaViva, 'La cola guarda la referencia, no una copia');
+assert.strictEqual(recuperada.statusMessageId, 4242, 'Las mutaciones posteriores al encolado se ven');
+assert(recuperada.enqueuedAt, 'enqueueTask anota cuándo se encoló');
+console.log('✔ Test 16: la cola preserva la identidad de la tarea');
 
 // Limpieza: solo el directorio temporal de test
 try {
