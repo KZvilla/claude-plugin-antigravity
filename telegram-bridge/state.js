@@ -4,32 +4,34 @@ import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const STATE_FILE = path.join(__dirname, 'state.json');
+// Sobreescribible para que los tests no operen sobre el estado real del usuario.
+const STATE_FILE = process.env.TELEGRAM_BRIDGE_STATE_FILE
+  ? path.resolve(process.env.TELEGRAM_BRIDGE_STATE_FILE)
+  : path.join(__dirname, 'state.json');
 
-const DEFAULT_STATE = {
-  chats: {},
-  queue: [],
-  pendingAsks: {}
-};
+function emptyState() {
+  return { chats: {}, pendingAsks: {} };
+}
 
 /**
  * Carga el estado persistido desde state.json
  */
 export function loadState() {
   if (!fs.existsSync(STATE_FILE)) {
-    return { ...DEFAULT_STATE, chats: {}, queue: [], pendingAsks: {} };
+    return emptyState();
   }
   try {
     const raw = fs.readFileSync(STATE_FILE, 'utf8');
     const parsed = JSON.parse(raw);
+    // `queue` es un campo legado: la cola vive ahora en memoria (queue.js) y se
+    // descarta al leer para no rehidratar Contexts muertos ni tokens antiguos.
     return {
       chats: parsed.chats || {},
-      queue: Array.isArray(parsed.queue) ? parsed.queue : [],
       pendingAsks: parsed.pendingAsks || {}
     };
   } catch (err) {
     console.error(`[state] Error leyendo state.json: ${err.message}. Reinicializando.`);
-    return { ...DEFAULT_STATE, chats: {}, queue: [], pendingAsks: {} };
+    return emptyState();
   }
 }
 
@@ -80,38 +82,6 @@ export function clearConversationId(chatId) {
     state.chats[idStr].updatedAt = new Date().toISOString();
     saveState(state);
   }
-}
-
-/**
- * Agrega una tarea a la cola
- */
-export function enqueueTask(task) {
-  const state = loadState();
-  state.queue.push({
-    ...task,
-    enqueuedAt: new Date().toISOString()
-  });
-  saveState(state);
-  return state.queue.length;
-}
-
-/**
- * Extrae la siguiente tarea de la cola
- */
-export function dequeueTask() {
-  const state = loadState();
-  if (state.queue.length === 0) return null;
-  const task = state.queue.shift();
-  saveState(state);
-  return task;
-}
-
-/**
- * Retorna la longitud actual de la cola
- */
-export function getQueueLength() {
-  const state = loadState();
-  return state.queue.length;
 }
 
 /**

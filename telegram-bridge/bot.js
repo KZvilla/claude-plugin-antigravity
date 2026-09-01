@@ -8,12 +8,10 @@ import {
   getConversationId,
   setConversationId,
   clearConversationId,
-  enqueueTask,
-  dequeueTask,
-  getQueueLength,
   resolvePendingAsk,
   getPendingAsk
 } from './state.js';
+import { enqueueTask, dequeueTask, getQueueLength } from './queue.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -98,6 +96,12 @@ process.on('uncaughtException', (err) => {
   releaseLock();
   process.exit(1);
 });
+// Node >= 15 termina el proceso ante una promesa rechazada sin manejador. Para un
+// bot de larga duración eso convierte cualquier fallo puntual de red o de la API
+// de Telegram en una caída total: se registra y se sigue sirviendo.
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION]', reason);
+});
 
 // ==============================================================================
 // 3. Inicialización del Bot e Infraestructura de Cola (Concurrency = 1)
@@ -116,6 +120,39 @@ bot.use(async (ctx, next) => {
 });
 
 /**
+ * Envía un mensaje por `bot.api` sin depender de un `Context` vivo y sin lanzar
+ * nunca. Es la vía de reporte de errores: si el fallo original fue justamente el
+ * `ctx`, usar `ctx.reply` para avisar lo enmascara y tumba el proceso.
+ */
+async function notifyChat(chatId, text, extra = {}) {
+  try {
+    return await bot.api.sendMessage(chatId, text, extra);
+  } catch (err) {
+    if (extra.parse_mode) {
+      // Reintento en texto plano: el fallo puede venir del parser de Markdown.
+      try {
+        return await bot.api.sendMessage(chatId, text, { ...extra, parse_mode: undefined });
+      } catch (plainErr) {
+        console.error(`[NOTIFY ERROR] chat ${chatId}: ${plainErr.message}`);
+        return null;
+      }
+    }
+    console.error(`[NOTIFY ERROR] chat ${chatId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Arranca el consumidor de la cola sin devolver una promesa pendiente al
+ * llamante. Todo fallo queda contenido aquí.
+ */
+function runQueue() {
+  processTaskQueue().catch((err) => {
+    console.error('[QUEUE ERROR]', err);
+  });
+}
+
+/**
  * Procesa la cola de tareas secuencialmente
  */
 async function processTaskQueue() {
@@ -129,9 +166,9 @@ async function processTaskQueue() {
   // Intervalo de acción typing mientras piensa Antigravity
   let typingInterval = null;
   try {
-    await ctx.replyWithChatAction('typing');
+    await bot.api.sendChatAction(chatId, 'typing').catch(() => {});
     typingInterval = setInterval(() => {
-      ctx.replyWithChatAction('typing').catch(() => {});
+      bot.api.sendChatAction(chatId, 'typing').catch(() => {});
     }, 4500);
 
     const result = await runAgyTask({
@@ -140,7 +177,8 @@ async function processTaskQueue() {
       conversationId
     });
 
-    if (typingInterval) clearInterval(typingInterval);
+    clearInterval(typingInterval);
+    typingInterval = null;
 
     if (result.success) {
       if (result.conversationId) {
@@ -165,17 +203,17 @@ async function processTaskQueue() {
       if (result.conversationId) {
         errMsg += `\n\n*ID de conversación activa:* \`${result.conversationId}\``;
       }
-      await ctx.reply(errMsg, { parse_mode: 'Markdown' });
+      await notifyChat(chatId, errMsg, { parse_mode: 'Markdown' });
     }
   } catch (err) {
-    if (typingInterval) clearInterval(typingInterval);
     console.error('[TASK ERROR]', err);
-    await ctx.reply(`❌ Ocurrió un error inesperado al procesar la tarea: ${err.message}`);
+    await notifyChat(chatId, `❌ Ocurrió un error inesperado al procesar la tarea: ${err.message}`);
   } finally {
+    if (typingInterval) clearInterval(typingInterval);
     isProcessingTask = false;
     // Si quedan tareas en cola, procesar la siguiente
     if (getQueueLength() > 0) {
-      setImmediate(processTaskQueue);
+      setImmediate(runQueue);
     }
   }
 }
@@ -196,7 +234,7 @@ async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = nu
   // Despachar inmediatamente
   enqueueTask({ ctx, chatId, prompt, mode, conversationId: activeConvId });
   await ctx.reply(mode === 'plan' ? '🧠 Generando plan arquitectónico...' : '⚙️ Ejecutando tarea con Antigravity...');
-  processTaskQueue();
+  runQueue();
 }
 
 // ==============================================================================
