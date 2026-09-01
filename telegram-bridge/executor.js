@@ -57,6 +57,11 @@ const AGY_BIN = resolveAgyBin();
 const DEFAULT_DENY_COMMANDS = ['git push*', 'git reset --hard*', 'npm publish*', 'rm -rf /*'];
 const DEFAULT_DENY_PATHS = ['.env*', '**/*.key', '**/*.pem'];
 
+// Margen entre SIGTERM y SIGKILL al abortar una tarea.
+const SIGKILL_GRACE_MS = 5000;
+// Tope para consultar la versión del binario sin congelar el event loop.
+const AGY_VERSION_TIMEOUT_MS = 5000;
+
 function parseBool(value, fallback = false) {
   if (value === undefined || value === null || value === '') return fallback;
   return /^(1|true|yes|on)$/i.test(String(value).trim());
@@ -113,6 +118,8 @@ export function loadPolicy(cwd = process.env.WORKSPACE_DIR || process.cwd()) {
  * @param {string} [options.conversationId] ID para continuar conversación multiturno
  * @param {string} [options.cwd] Directorio de trabajo
  * @param {boolean} [options.sandbox] Fuerza (o desactiva) `--sandbox` para esta tarea
+ * @param {(cancel: () => boolean) => void} [options.onSpawn] Recibe una función para
+ *        abortar esta tarea. Permite implementar /cancel sin exponer el ChildProcess.
  */
 export function runAgyTask(options = {}) {
   const {
@@ -123,7 +130,8 @@ export function runAgyTask(options = {}) {
     timeoutMinutes = parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     conversationId = null,
     cwd = process.env.WORKSPACE_DIR || process.cwd(),
-    sandbox = undefined
+    sandbox = undefined,
+    onSpawn = null
   } = options;
 
   const policy = loadPolicy(cwd);
@@ -167,7 +175,24 @@ export function runAgyTask(options = {}) {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
-    let killed = false;
+    let settled = false;
+    let killTimer = null;
+
+    /**
+     * SIGTERM y, si el hijo lo ignora, SIGKILL. Antes solo se enviaba SIGTERM y
+     * se resolvía la promesa de inmediato, dejando posiblemente un agy.exe
+     * huérfano consumiendo cuota y CPU.
+     */
+    const terminate = (child) => {
+      try { child.kill('SIGTERM'); } catch {}
+      killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          console.warn('[executor] El proceso ignoró SIGTERM. Enviando SIGKILL.');
+          try { child.kill('SIGKILL'); } catch {}
+        }
+      }, SIGKILL_GRACE_MS);
+      killTimer.unref?.();
+    };
 
     console.log(`[executor] Ejecutando: ${AGY_BIN} (modo: ${mode}, sandbox: ${useSandbox ? 'sí' : 'no'}, conv: ${conversationId || 'nueva'}, cwd: ${cwd})`);
 
@@ -178,8 +203,9 @@ export function runAgyTask(options = {}) {
     });
 
     const timer = setTimeout(() => {
-      killed = true;
-      try { child.kill('SIGTERM'); } catch {}
+      if (settled) return;
+      settled = true;
+      terminate(child);
       resolve({
         success: false,
         error: `La tarea en Antigravity superó el tiempo límite de ${timeoutMinutes} minutos.`,
@@ -188,6 +214,24 @@ export function runAgyTask(options = {}) {
         stderr
       });
     }, timeoutMs);
+
+    if (typeof onSpawn === 'function') {
+      onSpawn(() => {
+        if (settled) return false;
+        settled = true;
+        clearTimeout(timer);
+        terminate(child);
+        resolve({
+          success: false,
+          cancelled: true,
+          error: 'Tarea cancelada por el usuario.',
+          conversationId,
+          stdout,
+          stderr
+        });
+        return true;
+      });
+    }
 
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString('utf8');
@@ -199,6 +243,8 @@ export function runAgyTask(options = {}) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      if (settled) return;
+      settled = true;
       resolve({
         success: false,
         error: `Error al iniciar ${AGY_BIN}: ${err.message}`,
@@ -210,7 +256,9 @@ export function runAgyTask(options = {}) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (killed) return;
+      if (killTimer) clearTimeout(killTimer);
+      if (settled) return;
+      settled = true;
 
       let parsed = null;
       try {
@@ -254,18 +302,36 @@ export function runAgyTask(options = {}) {
   });
 }
 
+// La versión no cambia entre mensajes, y `execFileSync` sin timeout congela el
+// event loop: si el binario tarda o se cuelga, el bot deja de responder al long
+// polling. Se cachea y se acota el tiempo.
+let versionCache = null;
+
+function getAgyVersion() {
+  if (versionCache !== null) return versionCache;
+
+  const opts = { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: AGY_VERSION_TIMEOUT_MS };
+  let version = 'Desconocida';
+  try {
+    version = execFileSync(AGY_BIN, ['--version'], opts).trim();
+  } catch {
+    try {
+      version = execFileSync(AGY_BIN, ['help'], opts).split(/\r?\n/)[0].trim();
+    } catch {
+      // No se cachea el fallo: puede ser transitorio (binario actualizándose).
+      return 'Desconocida (no se pudo consultar el binario)';
+    }
+  }
+
+  versionCache = version;
+  return version;
+}
+
 /**
  * Consulta la versión e información del ejecutable de Antigravity
  */
 export function getAgyStatus(cwd = process.env.WORKSPACE_DIR || process.cwd()) {
-  let version = 'Desconocida';
-  try {
-    version = execFileSync(AGY_BIN, ['--version'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-  } catch {
-    try {
-      version = execFileSync(AGY_BIN, ['help'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).split('\n')[0].trim();
-    } catch {}
-  }
+  const version = getAgyVersion();
 
   const policy = loadPolicy(cwd);
 

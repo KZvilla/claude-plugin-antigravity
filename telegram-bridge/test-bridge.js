@@ -152,6 +152,51 @@ assert.strictEqual(typeof status.enforcement.sandbox, 'boolean', 'sandbox es un 
 assert.strictEqual(status.enforcement.skipPermissions, true, 'el bridge siempre auto-aprueba herramientas');
 console.log('✔ Test 10: getAgyStatus() declara qué se aplica y qué solo se sugiere');
 
+// Test 11: escritura atómica — no debe quedar ningún .tmp ni .lock huérfano,
+// y el contenido en disco debe ser siempre JSON completo y parseable.
+state.setConversationId(testChatId, 'conv-atomica');
+const stateDir = path.dirname(TEST_STATE_FILE);
+const residuos = fs.readdirSync(stateDir).filter((f) => f.endsWith('.tmp') || f.endsWith('.lock'));
+assert.deepStrictEqual(residuos, [], `No debe quedar residuo de escritura: ${residuos.join(', ')}`);
+assert.doesNotThrow(
+  () => JSON.parse(fs.readFileSync(TEST_STATE_FILE, 'utf8')),
+  'El estado en disco siempre debe ser JSON completo'
+);
+console.log('✔ Test 11: escritura atómica sin residuos');
+
+// Test 12: caché por mtime — una escritura externa debe invalidarla.
+assert.strictEqual(state.getConversationId(testChatId), 'conv-atomica', 'Lectura cacheada');
+const onDisk = JSON.parse(fs.readFileSync(TEST_STATE_FILE, 'utf8'));
+onDisk.chats[String(testChatId)].lastConversationId = 'conv-externa';
+fs.writeFileSync(TEST_STATE_FILE, JSON.stringify(onDisk, null, 2), 'utf8');
+assert.strictEqual(
+  state.getConversationId(testChatId),
+  'conv-externa',
+  'La caché debe invalidarse cuando otro proceso escribe el fichero'
+);
+console.log('✔ Test 12: la caché se invalida por mtime');
+
+// Test 13: ciclo de vida y recolección de asks.
+state.registerPendingAsk('ask-vivo', { question: 'q', options: ['a'], chatId: testChatId, messageId: 1 });
+state.registerPendingAsk('ask-caduca', { question: 'q', options: ['a'], chatId: testChatId, messageId: 2 });
+
+const expirado = state.expirePendingAsk('ask-caduca');
+assert.strictEqual(expirado.status, 'expired', 'El timeout debe marcar expired');
+assert(expirado.expiredAt, 'Debe registrar cuándo expiró');
+assert.strictEqual(state.expirePendingAsk('ask-caduca'), null, 'No se vuelve a expirar lo ya cerrado');
+
+const respondido = state.resolvePendingAsk('ask-test-1', 'Sí', testChatId);
+assert.strictEqual(respondido.status, 'answered', 'resolvePendingAsk marca answered');
+
+// Con retención 0 se van los cerrados; el pendiente se queda: puede haber un
+// notify.js esperándolo.
+const purgados = state.purgeAsks(0);
+assert.strictEqual(purgados, 2, `Debe purgar los 2 asks cerrados, purgó ${purgados}`);
+assert(state.getPendingAsk('ask-vivo'), 'Un ask pendiente NUNCA se purga');
+assert.strictEqual(state.getPendingAsk('ask-caduca'), null, 'El expirado se purga');
+assert.strictEqual(state.getPendingAsk('ask-test-1'), null, 'El respondido se purga');
+console.log('✔ Test 13: asks se expiran y se recolectan');
+
 // Limpieza: solo el directorio temporal de test
 try {
   fs.rmSync(path.dirname(TEST_STATE_FILE), { recursive: true, force: true });

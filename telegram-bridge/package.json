@@ -9,6 +9,7 @@
     "test": "node test-bridge.js"
   },
   "dependencies": {
+    "@grammyjs/auto-retry": "^2.0.2",
     "grammy": "^1.35.0"
   },
   "keywords": [

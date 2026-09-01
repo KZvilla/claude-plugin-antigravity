@@ -1,9 +1,11 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Bot, InlineKeyboard } from 'grammy';
+import { autoRetry } from '@grammyjs/auto-retry';
 import { runAgyTask, getAgyStatus } from './executor.js';
-import { replyWithSmartChunks, formatExecutionMeta } from './formatter.js';
+import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk } from './formatter.js';
 import {
   getConversationId,
   setConversationId,
@@ -11,7 +13,7 @@ import {
   resolvePendingAsk,
   getPendingAsk
 } from './state.js';
-import { enqueueTask, dequeueTask, getQueueLength } from './queue.js';
+import { enqueueTask, dequeueTask, getQueueLength, getQueueSnapshot, clearQueue } from './queue.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,35 +56,72 @@ if (ALLOWED_USER_IDS.size === 0) {
 // ==============================================================================
 const LOCK_FILE = path.join(__dirname, 'bridge.lock');
 
+/**
+ * Lee el lockfile en el formato actual (JSON con metadatos) o en el legado
+ * (solo el PID en texto). Devuelve null si no hay lock legible.
+ */
+function readLock() {
+  try {
+    const raw = fs.readFileSync(LOCK_FILE, 'utf8').trim();
+    if (!raw) return null;
+    if (raw.startsWith('{')) {
+      const parsed = JSON.parse(raw);
+      return Number.isInteger(parsed.pid) ? parsed : null;
+    }
+    const pid = parseInt(raw, 10);
+    return Number.isInteger(pid) ? { pid, startedAt: null, bootId: null } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Identificador del arranque del sistema, en resolución de minuto. Si no
+ * coincide con el del lock, el PID pertenece a otra sesión del SO y no dice
+ * nada: `process.kill(pid, 0)` sobre un PID reciclado da un falso positivo y
+ * el bot se negaría a arrancar con un mensaje engañoso.
+ */
+function currentBootId() {
+  return String(Math.floor((Date.now() - os.uptime() * 1000) / 60000));
+}
+
 function acquireLock() {
-  if (fs.existsSync(LOCK_FILE)) {
+  const lock = readLock();
+
+  if (lock) {
+    const sameBoot = lock.bootId !== null && lock.bootId === currentBootId();
+    let alive = false;
     try {
-      const lockPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-      if (lockPid && !isNaN(lockPid)) {
-        // Verificar si el proceso con ese PID sigue corriendo
-        try {
-          process.kill(lockPid, 0); // Señal 0 comprueba existencia sin matar
-          console.error(`[LOCK ERROR] Ya existe otra instancia del bot en ejecución (PID: ${lockPid}).`);
-          console.error('Telegram rechaza múltiples peticiones getUpdates concurrentes (HTTP 409 Conflict).');
-          process.exit(1);
-        } catch (e) {
-          // El PID no existe (cierre abrupto previo), sobreescribir lock
-          console.log(`[lock] Se encontró un lockfile huérfano del PID ${lockPid}. Adquiriendo nuevo lock.`);
-        }
-      }
+      process.kill(lock.pid, 0); // Señal 0 comprueba existencia sin matar
+      alive = true;
     } catch {}
+
+    if (alive && sameBoot) {
+      console.error(`[LOCK ERROR] Ya existe otra instancia del bot en ejecución (PID: ${lock.pid}, desde ${lock.startedAt || 'desconocido'}).`);
+      console.error('Telegram rechaza múltiples peticiones getUpdates concurrentes (HTTP 409 Conflict).');
+      process.exit(1);
+    }
+
+    if (alive) {
+      console.log(`[lock] El PID ${lock.pid} existe pero es de otra sesión del sistema (PID reciclado). Adquiriendo nuevo lock.`);
+    } else {
+      console.log(`[lock] Se encontró un lockfile huérfano del PID ${lock.pid}. Adquiriendo nuevo lock.`);
+    }
   }
 
-  fs.writeFileSync(LOCK_FILE, String(process.pid), 'utf8');
+  fs.writeFileSync(LOCK_FILE, JSON.stringify({
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    bootId: currentBootId(),
+    exe: process.execPath
+  }), 'utf8');
 }
 
 function releaseLock() {
   try {
-    if (fs.existsSync(LOCK_FILE)) {
-      const lockPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-      if (lockPid === process.pid) {
-        fs.unlinkSync(LOCK_FILE);
-      }
+    const lock = readLock();
+    if (lock && lock.pid === process.pid) {
+      fs.unlinkSync(LOCK_FILE);
     }
   } catch {}
 }
@@ -107,7 +146,17 @@ process.on('unhandledRejection', (reason) => {
 // 3. Inicialización del Bot e Infraestructura de Cola (Concurrency = 1)
 // ==============================================================================
 const bot = new Bot(TELEGRAM_BOT_TOKEN);
+
+// Respeta `retry_after` de Telegram de forma transparente en cada llamada a la
+// API. Sin esto, un 429 se propaga como error de la tarea y el usuario pierde
+// la respuesta por una limitación temporal de tasa.
+bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 60 }));
+
 let isProcessingTask = false;
+// Tarea en ejecución y forma de abortarla. `cancelCurrent` lo entrega el
+// executor al lanzar el proceso hijo.
+let currentTask = null;
+let cancelCurrent = null;
 
 // Whitelist Middleware: descarta cualquier mensaje no autorizado silenciosamente
 bot.use(async (ctx, next) => {
@@ -161,6 +210,7 @@ async function processTaskQueue() {
   if (!task) return;
 
   isProcessingTask = true;
+  currentTask = task;
   const { ctx, chatId, prompt, mode, conversationId } = task;
 
   // Intervalo de acción typing mientras piensa Antigravity
@@ -174,13 +224,17 @@ async function processTaskQueue() {
     const result = await runAgyTask({
       prompt,
       mode,
-      conversationId
+      conversationId,
+      onSpawn: (cancel) => { cancelCurrent = cancel; }
     });
 
     clearInterval(typingInterval);
     typingInterval = null;
 
-    if (result.success) {
+    if (result.cancelled) {
+      // El aviso ya lo dio /cancel; aquí solo se cierra el ciclo.
+      console.log('[task] Tarea cancelada por el usuario.');
+    } else if (result.success) {
       if (result.conversationId) {
         setConversationId(chatId, result.conversationId);
       }
@@ -210,6 +264,8 @@ async function processTaskQueue() {
     await notifyChat(chatId, `❌ Ocurrió un error inesperado al procesar la tarea: ${err.message}`);
   } finally {
     if (typingInterval) clearInterval(typingInterval);
+    cancelCurrent = null;
+    currentTask = null;
     isProcessingTask = false;
     // Si quedan tareas en cola, procesar la siguiente
     if (getQueueLength() > 0) {
@@ -252,6 +308,8 @@ Puente móvil autónomo conectado a tu entorno local.
 • \`/run <instrucción>\` — Ejecuta tareas permitiendo edición de código y tests.
 • \`/resume <instrucción>\` — Continúa la sesión de trabajo actual.
 • \`/status\` — Consulta estado del binario, versión, sesión activa y política de permisos.
+• \`/queue\` — Muestra la tarea en curso y las encoladas.
+• \`/cancel\` — Aborta la tarea en curso y vacía la cola.
 • \`/reset\` — Reinicia la conversación y olvida el contexto actual.
 
 *Sesión activa:* ${convId ? `\`${convId}\`` : '_Ninguna (el próximo mensaje abrirá una nueva)_'}
@@ -283,7 +341,7 @@ bot.command('status', async (ctx) => {
 • *Rutas desaconsejadas:* \`${status.denyPaths.join(', ')}\`
 • *Política cargada de:* ${status.configFile ? `\`${status.configFile}\`` : '_valores por defecto_'}`;
 
-  await ctx.reply(msg, { parse_mode: 'Markdown' });
+  await sendSafeChunk(ctx, msg);
 });
 
 bot.command('reset', async (ctx) => {
@@ -315,6 +373,41 @@ bot.command('resume', async (ctx) => {
   await dispatchTask(ctx, prompt, 'accept-edits');
 });
 
+bot.command('cancel', async (ctx) => {
+  const discarded = clearQueue();
+  const cancelled = typeof cancelCurrent === 'function' ? cancelCurrent() : false;
+
+  if (!cancelled && discarded === 0) {
+    return ctx.reply('No hay ninguna tarea en curso ni encolada que cancelar.');
+  }
+
+  const partes = [];
+  if (cancelled) partes.push('tarea en curso abortada (SIGTERM, y SIGKILL si no responde)');
+  if (discarded > 0) partes.push(`${discarded} tarea(s) encolada(s) descartada(s)`);
+  await ctx.reply(`🛑 Cancelado: ${partes.join(' y ')}.`);
+});
+
+bot.command('queue', async (ctx) => {
+  const pending = getQueueSnapshot();
+
+  if (!currentTask && pending.length === 0) {
+    return ctx.reply('📭 No hay nada en curso ni en cola.');
+  }
+
+  const lineas = [];
+  if (currentTask) {
+    lineas.push(`▶️ *En curso* (modo \`${currentTask.mode}\`, desde ${currentTask.enqueuedAt})`);
+    lineas.push(`   ${currentTask.prompt.slice(0, 80)}`);
+  }
+  pending.forEach((t, i) => {
+    lineas.push(`${i + 1}. modo \`${t.mode}\` — ${t.promptPreview}`);
+  });
+  lineas.push('');
+  lineas.push("_Usa_ `/cancel` _para abortar lo actual y vaciar la cola._");
+
+  await sendSafeChunk(ctx, lineas.join('\n'));
+});
+
 // Manejador de botones interactivos (Inline Keyboards)
 bot.on('callback_query:data', async (ctx) => {
   const data = ctx.callbackQuery.data;
@@ -325,6 +418,14 @@ bot.on('callback_query:data', async (ctx) => {
     const askId = parts[1];
     const optionIndex = parseInt(parts[2], 10);
     const pending = getPendingAsk(askId);
+
+    if (pending && pending.status !== 'pending') {
+      await ctx.answerCallbackQuery({
+        text: pending.status === 'answered' ? 'Esta consulta ya fue respondida.' : 'Esta consulta expiró.'
+      });
+      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+      return;
+    }
 
     if (pending && pending.options && pending.options[optionIndex] !== undefined) {
       const selected = pending.options[optionIndex];
@@ -378,9 +479,17 @@ bot.on('message:text', async (ctx) => {
 // 5. Gestión de Errores Globales y Arranque (Long Polling)
 // ==============================================================================
 bot.catch((err) => {
-  console.error('[grammY Error]', err.message);
-  if (err.error_code === 429) {
-    console.warn(`[RATE LIMIT] Telegram 429. Esperando ${err.parameters?.retry_after || 5}s...`);
+  // grammY entrega un BotError que ENVUELVE el error original: el código HTTP
+  // vive en err.error.error_code, no en err.error_code. La comprobación
+  // anterior era código muerto.
+  const inner = err?.error ?? err;
+  console.error('[grammY Error]', err?.message || inner?.message || err);
+
+  if (inner?.error_code === 429) {
+    const retryAfter = inner.parameters?.retry_after ?? 5;
+    console.warn(`[RATE LIMIT] Telegram 429 (retry_after: ${retryAfter}s). autoRetry reintentará solo.`);
+  } else if (inner?.error_code) {
+    console.error(`[Telegram API] error_code=${inner.error_code} description="${inner.description || ''}"`);
   }
 });
 
@@ -392,8 +501,21 @@ console.log(`• Workspace: ${process.env.WORKSPACE_DIR || path.resolve(__dirnam
 console.log('• Conexión: Long Polling saliente (Compatible con CGNAT)');
 console.log('------------------------------------------------------------');
 
+// El fallo de arranque SÍ es fatal y debe llevar su propio catch: la red de
+// seguridad `unhandledRejection` está pensada para errores en caliente, y sin
+// esto un token inválido dejaría el proceso vivo pero sordo, sin decir nada.
 bot.start({
   onStart: (botInfo) => {
     console.log(`✅ Bot conectado exitosamente como @${botInfo.username}`);
   }
+}).catch((err) => {
+  const inner = err?.error ?? err;
+  console.error('[FATAL] No se pudo iniciar el long polling:', inner?.description || err?.message || err);
+  if (inner?.error_code === 401) {
+    console.error('Token rechazado por Telegram. Revisa TELEGRAM_BOT_TOKEN en telegram-bridge/.env.');
+  } else if (inner?.error_code === 409) {
+    console.error('Otra instancia está haciendo getUpdates con este mismo token.');
+  }
+  releaseLock();
+  process.exit(1);
 });

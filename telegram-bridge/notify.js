@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { registerPendingAsk, getPendingAsk } from './state.js';
+import { registerPendingAsk, getPendingAsk, expirePendingAsk } from './state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -282,6 +282,12 @@ export async function askTelegramQuestion(options = {}) {
 
       if (Date.now() - startTime >= maxWaitMs) {
         clearInterval(interval);
+
+        // Marcar la consulta como expirada. Sin esto queda como `pending` para
+        // siempre: el recolector no la toca y un botón pulsado más tarde la
+        // resolvería sobre una espera que ya nadie escucha.
+        expirePendingAsk(askId);
+
         // Quitar botones de Telegram por expiración
         try {
           telegramApiCall('editMessageReplyMarkup', {
