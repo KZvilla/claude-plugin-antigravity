@@ -99,7 +99,12 @@ export function loadPolicy(cwd = resolveWorkspace()) {
   const policy = {
     denyCommands: [...DEFAULT_DENY_COMMANDS],
     denyPaths: [...DEFAULT_DENY_PATHS],
-    sandbox: false,
+    // Activo por defecto. Verificado empíricamente: `--sandbox` bloquea las
+    // ESCRITURAS fuera del workspace y permite las de dentro. Sin él,
+    // `--dangerously-skip-permissions` deja a `agy` escribir en todo el disco y
+    // WORKSPACE_DIR es decorativo: fija el cwd, no un límite.
+    // No bloquea las LECTURAS fuera del workspace; eso no es exigible.
+    sandbox: true,
     configFile: null
   };
 
@@ -170,7 +175,8 @@ export function runAgyTask(options = {}) {
     '--effort', effort
   ];
 
-  // Único control de permisos real que ofrece el CLI, además de `--mode plan`.
+  // Único control de permisos real que ofrece el CLI, además de `--mode plan`:
+  // acota las escrituras al workspace. Desactivable con AGY_SANDBOX=false.
   if (useSandbox) {
     cliArgs.push('--sandbox');
   }

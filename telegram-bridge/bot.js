@@ -229,9 +229,9 @@ async function processTaskQueue() {
 
   // Un único mensaje de estado que se va editando. Para una tarea de 2 a 15
   // minutos, `typing` cada 4,5 s no dice si algo avanza o si se colgó.
-  const updateProgress = async (prefix) => {
+  const updateProgress = async (prefix, separador = ' · ') => {
     if (!task.statusMessageId) return;
-    const texto = `${prefix} · ${formatElapsed((Date.now() - startedAt) / 1000)}`;
+    const texto = `${prefix}${separador}${formatElapsed((Date.now() - startedAt) / 1000)}`;
     try {
       await bot.api.editMessageText(chatId, task.statusMessageId, texto);
     } catch {
@@ -262,7 +262,9 @@ async function processTaskQueue() {
     clearInterval(progressInterval);
     progressInterval = null;
 
-    await updateProgress(result.success ? '✅ Completado en' : '⚠️ Terminado con error tras');
+    // El separador « · » es para el mensaje vivo («Generando plan · 23s»); el
+    // texto final ya lleva su propia preposición y quedaba «Completado en · 23s».
+    await updateProgress(result.success ? '✅ Completado en' : '⚠️ Terminado con error tras', ' ');
 
     if (result.cancelled) {
       // El aviso ya lo dio /cancel; aquí solo se cierra el ciclo.
