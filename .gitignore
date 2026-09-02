@@ -32,5 +32,8 @@ antigravity-sessions.json
 # Telegram bridge state & locks
 telegram-bridge/state.json
 telegram-bridge/*.lock
+# Lanzador generado por daemon.ps1 install: rutas absolutas de esta maquina.
+telegram-bridge/daemon-hidden.vbs
+telegram-bridge/daemon.log
 state.json
 *.lock

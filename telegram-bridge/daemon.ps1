@@ -13,6 +13,9 @@
 #
 #   .\daemon.ps1 install -Visible   Igual, pero dejando la consola a la vista
 #
+# Por defecto la tarea arranca el bot a traves de daemon-hidden.vbs, un
+# lanzador de wscript.exe que no tiene ventana. Ver Write-HiddenShim.
+#
 # Se ejecuta con el usuario actual y SOLO con la sesión iniciada: `agy` necesita
 # las credenciales del usuario y Voicebox vive en %APPDATA%. Ejecutarlo como
 # SYSTEM rompería ambas cosas, así que no se ofrece esa opción.
@@ -45,6 +48,7 @@ $BridgeDir  = $PSScriptRoot
 $BotScript  = Join-Path $BridgeDir 'bot.js'
 $LockFile   = Join-Path $BridgeDir 'bridge.lock'
 $LogFile    = Join-Path $BridgeDir 'daemon.log'
+$ShimFile   = Join-Path $BridgeDir 'daemon-hidden.vbs'
 $MaxLogBytes = 5MB
 
 function Info ($msg) { Write-Host "[bridge] $msg" -ForegroundColor Cyan }
@@ -103,6 +107,65 @@ function Get-BridgeTask {
     Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 }
 
+<#
+    Espera a que muera el proceso del bot anotado en el lockfile y limpia el
+    lockfile huerfano. Stop-ScheduledTask es asincrono y en Windows mata el
+    arbol a lo bruto, asi que el handler de salida de Node no llega a borrar su
+    lock: sin esto, la instancia nueva ve un lock vivo, se niega a arrancar y la
+    tarea queda en Ready con resultado 1.
+#>
+function Wait-BotStopped ([int]$TimeoutSeconds = 15) {
+    $lock = Get-LockInfo
+    if (-not $lock) { return }
+
+    $limite = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $limite) {
+        if (-not (Get-Process -Id $lock.pid -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 250
+    }
+
+    if (Get-Process -Id $lock.pid -ErrorAction SilentlyContinue) {
+        Warn "El proceso $($lock.pid) sigue vivo tras $TimeoutSeconds s. Se fuerza el cierre."
+        try { Stop-Process -Id $lock.pid -Force -ErrorAction Stop } catch {}
+        Start-Sleep -Milliseconds 500
+    }
+
+    if ((Test-Path $LockFile) -and -not (Get-Process -Id $lock.pid -ErrorAction SilentlyContinue)) {
+        Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
+        Info "Lockfile huerfano del PID $($lock.pid) retirado."
+    }
+}
+
+<#
+    Lanzador oculto. Task Scheduler no sabe esconder la consola de su accion, y
+    el principal S4U -que si la esconde- exige privilegios de administrador
+    para registrarse ("Acceso denegado" sin elevacion). wscript.exe no tiene
+    ventana propia y con bWaitOnReturn = True sigue vivo mientras dure el bot,
+    de modo que la tarea lo sigue tratando como su proceso y RestartCount
+    conserva el sentido.
+#>
+function Write-HiddenShim ([string]$NodePath) {
+    $comando  = 'cmd.exe /c ""{0}" "{1}" >> "{2}" 2>&1"' -f $NodePath, $BotScript, $LogFile
+    $escapado = $comando.Replace('"', '""')
+
+    # Here-string, no una lista de concatenaciones: dentro de @( ... ) la coma
+    # tiene mas precedencia que el +, asi que 'a' + $x + 'b' no concatena
+    # cadenas, concatena arrays, y cada trozo acababa en su propia linea del
+    # .vbs. El resultado era un literal sin cerrar y wscript.exe abria un dialogo
+    # de error que se queda esperando para siempre.
+    $vbs = @"
+' Generado por daemon.ps1 - no editar a mano; install lo reescribe.
+' Arranca el bridge sin ventana de consola. Ver Write-HiddenShim.
+Set sh = CreateObject("WScript.Shell")
+sh.CurrentDirectory = "$BridgeDir"
+code = sh.Run("$escapado", 0, True)
+WScript.Quit(code)
+"@
+
+    # ASCII deliberado: el motor de VBScript no lleva bien un BOM UTF-8.
+    [System.IO.File]::WriteAllText($ShimFile, $vbs, [System.Text.Encoding]::ASCII)
+}
+
 function Get-LockInfo {
     if (-not (Test-Path $LockFile)) { return $null }
     try {
@@ -120,15 +183,28 @@ function Invoke-Install {
         # Detener antes de borrar: si el bot sigue vivo, el nuevo arranque choca
         # contra su propio bridge.lock y la tarea entra en bucle de reintentos.
         try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch {}
-        Start-Sleep -Seconds 1
+        Wait-BotStopped
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
 
     # Task Scheduler no redirige la salida, así que se envuelve en cmd.exe para
-    # conservar un log: sin él, un daemon que falla no deja rastro alguno.
-    $argument = '/c ""{0}" "{1}" >> "{2}" 2>&1"' -f $nodePath, $BotScript, $LogFile
+    # conservar un log: sin él, un daemon que falla no deja rastro alguno. Ese
+    # cmd.exe es justo la ventana vacia que se ve en el escritorio, asi que por
+    # defecto va dentro de un lanzador de wscript.exe, que no tiene ventana.
+    $oculto = -not $Visible
+    if ($oculto -and -not (Get-Command wscript.exe -ErrorAction SilentlyContinue)) {
+        Warn 'wscript.exe no esta disponible; se registra con ventana visible.'
+        $oculto = $false
+    }
 
-    $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $argument -WorkingDirectory $BridgeDir
+    if ($oculto) {
+        Write-HiddenShim -NodePath $nodePath
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' `
+            -Argument ('"{0}"' -f $ShimFile) -WorkingDirectory $BridgeDir
+    } else {
+        $argument = '/c ""{0}" "{1}" >> "{2}" 2>&1"' -f $nodePath, $BotScript, $LogFile
+        $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $argument -WorkingDirectory $BridgeDir
+    }
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 
     $settings = New-ScheduledTaskSettingsSet `
@@ -143,41 +219,17 @@ function Invoke-Install {
 
     # Sin -RunLevel Highest: el bridge no necesita privilegios elevados y
     # dárselos ampliaría el alcance de una cuenta de Telegram comprometida.
-    #
-    # LogonType: 'Interactive' hereda el escritorio del usuario, y eso deja una
-    # ventana de cmd.exe vacia y permanente en pantalla durante toda la vida del
-    # bot. 'S4U' corre igualmente como el usuario y con su perfil cargado
-    # (%APPDATA%, ~/.gemini), pero en una sesion sin escritorio: sin ventana.
-    # El disparador sigue siendo AtLogOn, asi que la semantica no cambia: el
-    # bridge solo arranca con la sesion iniciada.
-    $userId = "$env:USERDOMAIN\$env:USERNAME"
-    $logonType = if ($Visible) { 'Interactive' } else { 'S4U' }
+    # Interactive, no S4U: S4U esconderia la consola por si solo, pero
+    # registrarlo exige privilegios de administrador ("Acceso denegado" sin
+    # elevacion), y este script no debe pedir elevacion para nada. La ventana se
+    # resuelve en la accion, con el lanzador de wscript.exe.
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
 
-    $registrar = {
-        param($tipo)
-        $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType $tipo
-        Register-ScheduledTask -TaskName $TaskName `
-            -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
-            -Description 'Antigravity Telegram Bridge - long polling saliente, compatible con CGNAT.' | Out-Null
-    }
+    Register-ScheduledTask -TaskName $TaskName `
+        -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
+        -Description 'Antigravity Telegram Bridge - long polling saliente, compatible con CGNAT.' | Out-Null
 
-    # S4U exige el permiso "Iniciar sesion como proceso por lotes". Suele estar
-    # concedido, pero si falta, registrar falla: mejor una ventana de mas que un
-    # daemon que no existe.
-    try {
-        & $registrar $logonType
-    } catch {
-        if ($logonType -eq 'S4U') {
-            Warn "No se pudo registrar en modo oculto (S4U): $($_.Exception.Message)"
-            Warn 'Se registra con sesion interactiva; veras una ventana de consola.'
-            $logonType = 'Interactive'
-            & $registrar $logonType
-        } else {
-            throw
-        }
-    }
-
-    if ($logonType -eq 'S4U') {
+    if ($oculto) {
         Ok "Tarea '$TaskName' registrada (arranca al iniciar sesión, sin ventana)."
     } else {
         Ok "Tarea '$TaskName' registrada (arranca al iniciar sesión, con ventana visible)."
@@ -192,7 +244,9 @@ function Invoke-Install {
 function Invoke-Uninstall {
     if (-not (Get-BridgeTask)) { Warn "La tarea '$TaskName' no está registrada."; return }
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Wait-BotStopped
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    if (Test-Path $ShimFile) { Remove-Item $ShimFile -Force -ErrorAction SilentlyContinue }
     Ok "Tarea '$TaskName' eliminada."
     Info "El log y el .env se conservan."
 }
