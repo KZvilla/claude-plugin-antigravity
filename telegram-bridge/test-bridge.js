@@ -14,7 +14,7 @@ process.env.TELEGRAM_BRIDGE_STATE_FILE = TEST_STATE_FILE;
 const FAKE_TOKEN = '1234567890:AAFakeTokenForTestingOnly_DoNotUse';
 
 const { resolveAgyBin, getAgyStatus, loadPolicy, resolveWorkspace, resolveExtraDirs } = await import('./executor.js');
-const { splitMessage, markdownToTelegramHtml, escapeHtml, formatElapsed } = await import('./formatter.js');
+const { splitMessage, markdownToTelegramHtml, escapeHtml, formatElapsed, finalProgressLabel } = await import('./formatter.js');
 const state = await import('./state.js');
 const queue = await import('./queue.js');
 const { Api, Context } = await import('grammy');
@@ -274,6 +274,14 @@ assert.strictEqual(formatElapsed(3600), '1h 00m');
 // El caso que disparó el arreglo: 18733.2s de sesión acumulada.
 assert.strictEqual(formatElapsed(18733.2), '5h 12m');
 console.log('✔ Test 15: formatElapsed');
+
+// Test 18: una cancelación tiene etiqueta propia. Compartía la del fallo, así
+// que /cancel dejaba el mensaje en «⚠️ Terminado con error tras 21s» y parecía
+// que la tarea había reventado sola.
+assert.strictEqual(finalProgressLabel({ cancelled: true, success: false }), '🛑 Cancelado tras');
+assert.strictEqual(finalProgressLabel({ success: true }), '✅ Completado en');
+assert.strictEqual(finalProgressLabel({ success: false }), '⚠️ Terminado con error tras');
+console.log('✔ Test 18: finalProgressLabel distingue cancelación de error');
 
 // Test 16: la cola guarda la MISMA referencia, no una copia. De eso depende que
 // dispatchTask pueda anotar el statusMessageId después de encolar.

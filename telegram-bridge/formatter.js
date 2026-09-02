@@ -259,6 +259,16 @@ export function formatExecutionMeta(resData, durationSeconds, conversationId, mo
 }
 
 /**
+ * Etiqueta del mensaje de progreso una vez terminada la tarea. La cancelación
+ * necesita la suya: no es éxito, pero tampoco un fallo del que informar.
+ */
+export function finalProgressLabel(result) {
+  if (result && result.cancelled) return '🛑 Cancelado tras';
+  if (result && result.success) return '✅ Completado en';
+  return '⚠️ Terminado con error tras';
+}
+
+/**
  * Formatea una duración en segundos como `45s`, `2m 34s` o `5h 12m`. Sin el
  * tramo de horas, una sesión larga se leía como `312m 13s`.
  */

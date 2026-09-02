@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Bot, InlineKeyboard } from 'grammy';
 import { autoRetry } from '@grammyjs/auto-retry';
 import { runAgyTask, getAgyStatus, resolveWorkspace, resolveExtraDirs } from './executor.js';
-import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk, formatElapsed } from './formatter.js';
+import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk, formatElapsed, finalProgressLabel } from './formatter.js';
 import {
   getConversationId,
   setConversationId,
@@ -264,7 +264,9 @@ async function processTaskQueue() {
 
     // El separador « · » es para el mensaje vivo («Generando plan · 23s»); el
     // texto final ya lleva su propia preposición y quedaba «Completado en · 23s».
-    await updateProgress(result.success ? '✅ Completado en' : '⚠️ Terminado con error tras', ' ');
+    // Una cancelación no es éxito, pero tampoco un error: sin su propia etiqueta
+    // se anunciaba como «Terminado con error» y parecía que algo había fallado.
+    await updateProgress(finalProgressLabel(result), ' ');
 
     if (result.cancelled) {
       // El aviso ya lo dio /cancel; aquí solo se cierra el ciclo.
