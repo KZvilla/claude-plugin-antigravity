@@ -271,8 +271,33 @@ function renderProgressBar(percent, length = 16) {
   return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${p.toFixed(1)}%`;
 }
 
+// `agy models` ya no sirve solo Gemini: tambien Claude y GPT-OSS. La version
+// anterior tomaba cualquier nombre sin "pro" por Gemini Flash, asi que
+// `claude-sonnet-4-6` se reportaba como «Google Gemini Flash» con 1M de
+// contexto -- una cifra inventada presentada como dato.
+//
+// Las ventanas de Gemini estan documentadas por Antigravity (Flash ~1M, Pro
+// ~2M, ambos hasta 64k de salida). Para el resto no tenemos cifra fiable, y
+// preferimos decir que no la sabemos antes que rellenarla.
 function getModelSpecs(modelName) {
   const m = (modelName || '').toLowerCase();
+
+  if (m.includes('claude')) {
+    return {
+      name: modelName,
+      contextWindow: null,
+      maxOutput: null,
+      description: 'Anthropic Claude, served through Antigravity'
+    };
+  }
+  if (m.includes('gpt') || m.includes('oss')) {
+    return {
+      name: modelName,
+      contextWindow: null,
+      maxOutput: null,
+      description: 'GPT-OSS, served through Antigravity'
+    };
+  }
   if (m.includes('pro')) {
     return {
       name: modelName || 'gemini-3.1-pro',
@@ -2193,8 +2218,9 @@ async function handleToolCall(name, args) {
       out += `**🤖 Active Model Configuration:**\n`;
       out += `- Model: \`${specs.name}\` (${specs.description})\n`;
       out += `- Default Reasoning Effort: \`${config.defaultEffort || 'high'}\`\n`;
-      out += `- Context Window: \`${formatTokens(specs.contextWindow)} tokens\`\n`;
-      out += `- Max Output Tokens: \`${formatTokens(specs.maxOutput)} tokens\`\n`;
+      // Sin cifra fiable se dice, no se rellena.
+      out += `- Context Window: ${specs.contextWindow ? `\`${formatTokens(specs.contextWindow)} tokens\`` : '_not published for this model_'}\n`;
+      out += `- Max Output Tokens: ${specs.maxOutput ? `\`${formatTokens(specs.maxOutput)} tokens\`` : '_not published for this model_'}\n`;
       out += `- Session Default Timeout: \`${config.defaultTimeoutMinutes}m\` (20m for reviews)\n`;
       out += `- Quota / API Health: **${usageData.quota_status}**\n\n`;
 
@@ -2208,10 +2234,14 @@ async function handleToolCall(name, args) {
       out += `- Total Reasoning Time: **${formatDuration(s.total_duration_seconds)}**\n\n`;
 
       if (last && last.usage) {
-        const lastPercent = specs.contextWindow ? ((last.usage.total_tokens / specs.contextWindow) * 100) : 0;
         out += `**🎯 Last Invocation (${last.tool}):**\n`;
         out += `- Model: \`${last.model}\` | Effort: \`${last.effort}\`\n`;
-        out += `- Total Tokens: **\`${formatTokens(last.usage.total_tokens)}\`** ${renderProgressBar(lastPercent)} of context window\n`;
+        // Sin ventana conocida no hay porcentaje: una barra al 0% se lee como
+        // «no has consumido nada», que es peor que no mostrarla.
+        const saturacion = specs.contextWindow
+          ? ` ${renderProgressBar((last.usage.total_tokens / specs.contextWindow) * 100)} of context window`
+          : '';
+        out += `- Total Tokens: **\`${formatTokens(last.usage.total_tokens)}\`**${saturacion}\n`;
         out += `- Deep Thinking: \`${formatTokens(last.usage.thinking_tokens)}\` tokens\n`;
         out += `- Cached Tokens: \`${formatTokens(last.usage.cache_read_tokens)}\` tokens\n`;
         out += `- Duration: ${formatDuration(last.duration_seconds)}\n`;
