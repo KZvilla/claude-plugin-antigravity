@@ -221,11 +221,17 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-# Entrecomillado: systemd separa por espacios, asi que un clon en una ruta
-# como "~/mis proyectos/..." produciria un ExecStart donde la segunda mitad
-# del directorio se toma por otro argumento. Con comillas se admite cualquier
-# ruta, y no estorban cuando no hay espacios.
-WorkingDirectory="$BRIDGE_DIR"
+# Ojo con las comillas: NO se aplican igual en todos los ajustes.
+#
+#   WorkingDirectory= toma el valor literal, sin interpretar comillas. Si se
+#   entrecomilla, la comilla pasa a formar parte de la ruta y systemd rechaza
+#   la unidad con "path is not absolute". Va en crudo, y un espacio en la ruta
+#   no molesta porque el valor es el resto de la linea.
+#
+#   ExecStart= si es una linea de comandos y se divide por espacios, asi que
+#   ahi las comillas son obligatorias: sin ellas, un clon en "~/mis proyectos/"
+#   partiria la ruta en dos argumentos.
+WorkingDirectory=$BRIDGE_DIR
 ExecStart="$node_path" "$BOT_SCRIPT"
 Restart=on-failure
 RestartSec=10
@@ -234,8 +240,7 @@ RestartSec=10
 # Sin esto, resolveAgyBin() hace 'which agy', no lo encuentra, y las tareas
 # fallan con "agy no esta en el PATH" aunque en la terminal funcione. Es el
 # fallo mas probable de este arranque, y el mas confuso.
-Environment=PATH=$node_dir:$agy_dir%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=HOME=%h
+Environment="PATH=$node_dir:$agy_dir%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # La salida va al journal: 'daemon.sh logs' la lee con journalctl. No se
 # redirige a un fichero a proposito; ver la cabecera de este script.

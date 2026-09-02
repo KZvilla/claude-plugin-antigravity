@@ -143,11 +143,11 @@ async function main() {
 
       // El fallo mas probable del primer arranque en Linux: sin PATH explicito,
       // resolveAgyBin() no encuentra agy aunque funcione en la terminal.
-      const lineaPath = (service.match(/^Environment=PATH=.*/m) || [''])[0];
+      const lineaPath = (service.match(/^Environment=.*PATH=.*/m) || [''])[0];
       const lineaExec = (service.match(/^ExecStart=.*/m) || [''])[0];
 
-      check('fija un PATH explicito', /^Environment=PATH=/m.test(service), service.slice(0, 200));
-      check('el PATH empieza por un directorio absoluto', /^Environment=PATH=\/[^:\n]+:/m.test(service), lineaPath);
+      check('fija un PATH explicito', /^Environment="PATH=/m.test(service), service.slice(0, 200));
+      check('el PATH empieza por un directorio absoluto', /^Environment="PATH=\/[^:\n]+:/m.test(service), lineaPath);
 
       // LA comprobacion que importa, y la que la version anterior de este test
       // no podia hacer porque llamaba a write_unit con argumentos limpios:
@@ -155,16 +155,32 @@ async function main() {
       // llevaba "[OK] Node v22.15.1" delante, y systemd rechazaba la unidad
       // con "Executable name contains special characters".
       const sinDiagnosticos = (s) => !/\[OK\]|\[bridge\]|\[!\]|\[ERROR\]|Node v/.test(s);
-      // Entrecomillado obligatorio: systemd separa argumentos por espacios, y un
-      // clon en "~/mis proyectos/..." partiria la ruta en dos.
+
+      // Las comillas NO se aplican igual en todos los ajustes de systemd, y
+      // equivocarse rompe la unidad de dos maneras distintas:
+      //
+      //   ExecStart= es una linea de comandos, se divide por espacios. SIN
+      //   comillas, un clon en "~/mis proyectos/" parte la ruta en dos.
+      //
+      //   WorkingDirectory= toma el valor literal. CON comillas, la comilla
+      //   entra en la ruta y systemd rechaza con "path is not absolute".
+      //
+      // Las dos reglas se afirman aqui porque cada una se descubrio rompiendo
+      // la otra.
       check('ExecStart son exactamente dos rutas entrecomilladas',
         /^ExecStart="[^"]+" "[^"]+"$/m.test(service), lineaExec);
+      check('ExecStart apunta a bot.js', /^ExecStart="[^"]+" "[^"]*bot\.js"$/m.test(service), lineaExec);
       check('ExecStart no lleva diagnosticos dentro', sinDiagnosticos(lineaExec), lineaExec);
       check('el PATH no lleva diagnosticos dentro', sinDiagnosticos(lineaPath), lineaPath);
-      check('ExecStart apunta a bot.js', /^ExecStart="[^"]+" "[^"]*bot\.js"$/m.test(service), lineaExec);
 
-      check('WorkingDirectory va entrecomillado', /^WorkingDirectory="[^"]*telegram-bridge"$/m.test(service),
-        (service.match(/^WorkingDirectory=.*/m) || [''])[0]);
+      const lineaWD = (service.match(/^WorkingDirectory=.*/m) || [''])[0];
+      check('WorkingDirectory NO va entrecomillado', /^WorkingDirectory=[^"]/.test(lineaWD), lineaWD);
+      check('WorkingDirectory es una ruta absoluta', /^WorkingDirectory=(\/|[A-Za-z]:\/)/.test(lineaWD), lineaWD);
+      check('WorkingDirectory apunta al bridge', /telegram-bridge$/.test(lineaWD), lineaWD);
+
+      // Environment= si interpreta comillas, y con ellas admite un PATH con
+      // espacios. Es la forma que documenta systemd: Environment="VAR=valor".
+      check('Environment va entrecomillado entero', /^Environment="PATH=[^"]+"$/m.test(service), lineaPath);
       check('reinicia solo ante fallo', /^Restart=on-failure$/m.test(service));
       check('la salida va al journal', /^StandardOutput=journal$/m.test(service));
       check('se instala en default.target', /WantedBy=default\.target/.test(unidad));
