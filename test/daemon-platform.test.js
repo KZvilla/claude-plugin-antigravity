@@ -59,6 +59,14 @@ async function main() {
     for (const verbo of ['install', 'uninstall', 'start', 'stop', 'status', 'logs']) {
       check(`daemon.sh implementa '${verbo}'`, new RegExp(`^\\s*${verbo}\\)`, 'm').test(sh));
     }
+    // La lista de candidatos del .env no puede reescribirse a mano en el
+    // script: si diverge de bridgeEnvCandidates(), el daemon informa de un
+    // fichero mientras el bot carga otro. Se le pregunta a paths.js.
+    check('no duplica la lista de candidatos del .env',
+      !/BRIDGE_DIR\/\.\.\/\.env/.test(sh), 'daemon.sh reescribe a mano las rutas del .env');
+    check('consulta paths.js para el .env', /bridgeEnvCandidates/.test(sh));
+    check('avisa de un .env de menor precedencia', /IGNORA|NO se usa/.test(sh));
+
     check('usa systemd --user, no una unidad de sistema', /systemctl --user/.test(sh));
     check('los logs van al journal', /journalctl --user/.test(sh));
     check('avisa sobre linger', /enable-linger/.test(sh));

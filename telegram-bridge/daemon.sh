@@ -125,16 +125,44 @@ test_prerequisites() {
   [ -f "$BOT_SCRIPT" ] || fail "No se encuentra $BOT_SCRIPT"
 
   # El .env no se exige: puede estar en el directorio de datos duradero, que es
-  # justo lo que recomienda BE-008. Solo se informa de donde saldria.
-  local env_encontrado=''
-  for cand in "$BRIDGE_DIR/.env" "$BRIDGE_DIR/../.env" "$DATA_DIR/.env"; do
-    if [ -f "$cand" ]; then env_encontrado="$cand"; break; fi
-  done
-  if [ -n "$env_encontrado" ]; then
-    info "Configuracion en $env_encontrado"
-  else
+  # justo lo que recomienda BE-008. Solo se informa de cual se usaria.
+  #
+  # La lista de candidatos NO se reescribe aqui: se le pregunta a paths.js, que
+  # es la que el bot consulta de verdad. Una copia a mano en este script podria
+  # divergir de la del codigo, y entonces el daemon informaria de un fichero
+  # mientras el bot carga otro — precisamente el tipo de desfase silencioso que
+  # este bridge lleva toda una revision eliminando.
+  #
+  # Se imprimen TODOS los que existen, no solo el ganador: dos .env a la vez es
+  # una situacion real (un clon con uno propio mas el duradero) y saber cual
+  # pierde importa tanto como saber cual gana.
+  local env_reporte
+  env_reporte="$(cd "$BRIDGE_DIR" && node --input-type=module -e '
+    import fs from "node:fs";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+    const dir = process.cwd();
+    const paths = await import(pathToFileURL(path.join(dir, "paths.js")).href);
+    const existen = paths.bridgeEnvCandidates(dir).filter((f) => fs.existsSync(f));
+    if (existen.length === 0) { console.log("NINGUNO"); }
+    else {
+      console.log("USA\t" + existen[0]);
+      for (const f of existen.slice(1)) console.log("IGNORA\t" + f);
+    }
+  ' 2>/dev/null || true)"
+
+  if [ -z "$env_reporte" ] || [ "$env_reporte" = "NINGUNO" ]; then
     warn "No se encontro ningun .env. El bot arrancara y fallara al conectar."
     warn "Colocalo en $DATA_DIR/.env (sobrevive a claude plugin update)."
+  else
+    while IFS=$'\t' read -r tipo ruta; do
+      [ -z "$ruta" ] && continue
+      if [ "$tipo" = "USA" ]; then
+        info "Credenciales: $ruta"
+      else
+        warn "Hay otro .env que NO se usa (menor precedencia): $ruta"
+      fi
+    done <<< "$env_reporte"
   fi
 
   # `agy` se busca aqui para poder meter SU directorio en el PATH de la unidad.
