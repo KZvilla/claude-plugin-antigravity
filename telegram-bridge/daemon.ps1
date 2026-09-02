@@ -46,7 +46,24 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 $TaskName   = 'AntigravityTelegramBridge'
 $BridgeDir  = $PSScriptRoot
 $BotScript  = Join-Path $BridgeDir 'bot.js'
-$LockFile   = Join-Path $BridgeDir 'bridge.lock'
+<#
+    El lock vive en el directorio de datos del usuario, no junto al codigo: su
+    cometido es "un solo getUpdates por token en esta maquina", y el bridge
+    puede existir en dos carpetas a la vez (el checkout de desarrollo y el
+    plugin instalado). Debe coincidir con resolveBridgeDataDir() de paths.js.
+
+    Se conserva la ruta antigua como reserva para poder informar del estado de
+    un bot de la version anterior que siga vivo.
+#>
+$DataDir      = if ($env:TELEGRAM_BRIDGE_DATA_DIR) {
+    $env:TELEGRAM_BRIDGE_DATA_DIR
+} else {
+    $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME 'AppData\Local' }
+    Join-Path $base 'antigravity-telegram-bridge'
+}
+$LockFile     = Join-Path $DataDir 'bridge.lock'
+$LegacyLock   = Join-Path $BridgeDir 'bridge.lock'
+if (-not (Test-Path $LockFile) -and (Test-Path $LegacyLock)) { $LockFile = $LegacyLock }
 $LogFile    = Join-Path $BridgeDir 'daemon.log'
 $ShimFile   = Join-Path $BridgeDir 'daemon-hidden.vbs'
 $MaxLogBytes = 5MB
@@ -236,6 +253,9 @@ function Invoke-Install {
     }
     Info "Log: $LogFile"
 
+    # Invoke-Install arrancaba la tarea saltandose la rotacion que si hace
+    # Invoke-Start, de modo que reinstalar sobre un log enorme lo dejaba crecer.
+    Invoke-RotateLog
     Start-ScheduledTask -TaskName $TaskName
     Start-Sleep -Seconds 3
     Invoke-Status
@@ -251,13 +271,27 @@ function Invoke-Uninstall {
     Info "El log y el .env se conservan."
 }
 
+<#
+    Rotación por renombrado. Solo es segura ANTES de arrancar el bot: mientras
+    corre, quien tiene abierto el log es el cmd.exe de la redireccion, y el
+    rename falla (o peor, el handle sigue al fichero renombrado y daemon.log
+    deja de recibir nada). Durante la ejecucion la rotacion la hace el propio
+    bot copiando y truncando; ver telegram-bridge/logrotate.js.
+
+    Esto cubre los arranques por daemon.ps1. El trigger AtLogOn no pasa por
+    aqui: ese caso lo cubre la rotacion en proceso.
+#>
+function Invoke-RotateLog {
+    if ((Test-Path $LogFile) -and ((Get-Item $LogFile).Length -gt $MaxLogBytes)) {
+        Move-Item $LogFile "$LogFile.old" -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $LogFile)) { Info "Log rotado a $LogFile.old" }
+        else { Warn 'No se pudo rotar el log (en uso). Lo hara el bot al arrancar.' }
+    }
+}
+
 function Invoke-Start {
     if (-not (Get-BridgeTask)) { Fail "La tarea no está registrada. Ejecuta: .\daemon.ps1 install" }
-    # Rotación simple: el bot escribe cada tarea, y un log sin tope crece sin fin.
-    if ((Test-Path $LogFile) -and ((Get-Item $LogFile).Length -gt $MaxLogBytes)) {
-        Move-Item $LogFile "$LogFile.old" -Force
-        Info "Log rotado a $LogFile.old"
-    }
+    Invoke-RotateLog
     Start-ScheduledTask -TaskName $TaskName
     Ok 'Tarea arrancada.'
 }

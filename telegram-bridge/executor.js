@@ -1,7 +1,19 @@
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import {
+  loadPolicy,
+  resolveWorkspace,
+  resolveExtraDirs,
+  sanitizeEnv,
+  redactSecrets
+} from './policy.js';
+
+// La política vive en `policy.js` para que `notify.js` pueda leerla sin cargar
+// este módulo (ver la cabecera de policy.js). Se reexporta porque `bot.js`, los
+// tests y el servidor MCP la importan históricamente desde aquí.
+export { loadPolicy, resolveWorkspace, resolveExtraDirs } from './policy.js';
 
 /**
  * Resuelve la ruta del binario agy.exe de Antigravity
@@ -38,106 +50,139 @@ export function resolveAgyBin() {
 
 const AGY_BIN = resolveAgyBin();
 
-// ==============================================================================
-// Política de permisos
-// ==============================================================================
-//
-// IMPORTANTE — qué se aplica de verdad y qué no:
-//
-//   `agy --help` (v1.1.22) NO expone ningún flag de política por ruta ni por
-//   comando. Los únicos controles reales del CLI son `--sandbox` (restricciones
-//   de terminal) y `--mode plan` (sesión de solo lectura). `deny_paths` y
-//   `deny_commands` se inyectan como texto delante del prompt: son una
-//   instrucción al modelo, no un control que el sistema pueda hacer cumplir.
-//
-// Se conservan porque reducen el riesgo en la práctica y porque mantienen la
-// paridad con el servidor MCP, pero `getAgyStatus()` los marca como
-// «sugeridos» para que `/status` no prometa una protección que no existe.
-
-const DEFAULT_DENY_COMMANDS = ['git push*', 'git reset --hard*', 'npm publish*', 'rm -rf /*'];
-const DEFAULT_DENY_PATHS = ['.env*', '**/*.key', '**/*.pem'];
-
-// Margen entre SIGTERM y SIGKILL al abortar una tarea.
+// Margen entre la terminación suave y la forzada al abortar una tarea.
 const SIGKILL_GRACE_MS = 5000;
 // Tope para consultar la versión del binario sin congelar el event loop.
 const AGY_VERSION_TIMEOUT_MS = 5000;
+// Tamaño de prompt a partir del cual se vuelca a un fichero en vez de pasarlo
+// como argumento. Mismo valor que `PROMPT_ARG_LIMIT` del servidor MCP.
+const PROMPT_ARG_LIMIT = 24000;
 
 /**
- * Directorio de trabajo de las tareas. Fuente única de verdad: `bot.js` lo usa
- * para el banner y el executor para lanzar `agy`, que antes discrepaban — el
- * banner resolvía la raíz del repo y el executor usaba `process.cwd()`, que con
- * `npm --prefix telegram-bridge start` es la carpeta del bridge.
+ * Termina el proceso hijo y, en Windows, TODO su árbol de descendientes.
+ *
+ * Por qué no basta `child.kill()` en Windows: no existen señales POSIX, y libuv
+ * traduce tanto SIGTERM como SIGKILL a `TerminateProcess` sobre el manejador de
+ * `agy.exe` y solo sobre él. Si `agy` había lanzado `npm test`, un servidor
+ * local o un script de Python, esos nietos quedan desvinculados y siguen vivos
+ * ocupando puertos, bloqueando ficheros y consumiendo CPU.
+ *
+ * `taskkill /T` es lo único que recorre el árbol. Se intenta primero sin `/F`
+ * —que pide el cierre y permite a un hijo con ventana guardar estado— y solo se
+ * fuerza pasado el margen. Ojo con la expectativa: en Windows no hay
+ * terminación «suave» real para un proceso de consola, así que en la práctica
+ * el que cierra casi siempre es el `/F`; la primera pasada existe para los
+ * descendientes que sí saben atender un cierre. Nada de esto retrasa al
+ * usuario: `terminate()` no se espera, la promesa de la tarea resuelve enseguida.
  */
-export function resolveWorkspace() {
-  return path.resolve(process.env.WORKSPACE_DIR || process.cwd());
-}
-
-/**
- * Directorios extra que `agy` puede leer y escribir, de `AGY_ADD_DIRS`.
- * Permite acotar `WORKSPACE_DIR` a un sandbox y abrir un repo concreto solo
- * cuando hace falta, en lugar de ampliar el workspace entero.
- */
-export function resolveExtraDirs() {
-  return (process.env.AGY_ADD_DIRS || '')
-    .split(',')
-    .map((d) => d.trim())
-    .filter(Boolean)
-    .map((d) => path.resolve(d));
-}
-
-function parseBool(value, fallback = false) {
-  if (value === undefined || value === null || value === '') return fallback;
-  return /^(1|true|yes|on)$/i.test(String(value).trim());
-}
-
-/**
- * Carga la política efectiva con la misma precedencia que el servidor MCP:
- * defaults < ~/.claude/antigravity.json < <cwd>/.claude/antigravity.json < entorno.
- * Así el bridge y el MCP no divergen cuando el usuario ajusta su política.
- */
-export function loadPolicy(cwd = resolveWorkspace()) {
-  const policy = {
-    denyCommands: [...DEFAULT_DENY_COMMANDS],
-    denyPaths: [...DEFAULT_DENY_PATHS],
-    // Inactivo por defecto, y NO es un límite de rutas. `agy --help` lo describe
-    // como «terminal restrictions», y medido en Windows:
-    //   - la herramienta de escritura de archivos escribe fuera del workspace
-    //     igual con `--sandbox` que sin él;
-    //   - los comandos de terminal pasan por ShellExecute con elevación, o sea
-    //     un UAC por comando: si se cancela el comando falla, y si se acepta se
-    //     ejecuta como administrador.
-    // Activarlo por defecto sería peor que no hacerlo: no añade frontera y
-    // entrena al usuario a conceder admin a algo disparado desde Telegram.
-    // Se deja configurable, pero el límite real sigue siendo `--mode plan`.
-    sandbox: false,
-    configFile: null
-  };
-
-  const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
-  const candidates = [
-    homeDir ? path.join(homeDir, '.claude', 'antigravity.json') : null,
-    path.join(cwd, '.claude', 'antigravity.json')
-  ].filter(Boolean);
-
-  for (const file of candidates) {
-    if (!fs.existsSync(file)) continue;
-    try {
-      const perms = JSON.parse(fs.readFileSync(file, 'utf8')).permissions;
-      if (!perms) continue;
-      if (Array.isArray(perms.deny_commands)) policy.denyCommands = perms.deny_commands;
-      if (Array.isArray(perms.deny_paths)) policy.denyPaths = perms.deny_paths;
-      if (perms.sandbox !== undefined) policy.sandbox = Boolean(perms.sandbox);
-      policy.configFile = file;
-    } catch (err) {
-      console.error(`[executor] No se pudo leer ${file}: ${err.message}. Se ignora.`);
-    }
+function terminateTree(child, { onForce } = {}) {
+  if (process.platform === 'win32' && child.pid) {
+    execFile('taskkill', ['/pid', String(child.pid), '/T'], () => {});
+    const forceTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        onForce?.();
+        execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
+      }
+    }, SIGKILL_GRACE_MS);
+    forceTimer.unref?.();
+    return forceTimer;
   }
 
-  // El entorno gana: permite endurecer el bridge sin tocar la política del MCP.
-  policy.sandbox = parseBool(process.env.AGY_SANDBOX, policy.sandbox);
-
-  return policy;
+  // POSIX: SIGTERM al grupo si lo hay, y SIGKILL si lo ignora.
+  try { child.kill('SIGTERM'); } catch {}
+  const forceTimer = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      onForce?.();
+      try { child.kill('SIGKILL'); } catch {}
+    }
+  }, SIGKILL_GRACE_MS);
+  forceTimer.unref?.();
+  return forceTimer;
 }
+
+/**
+ * Si el prompt no cabe cómodamente en un argumento de línea de comandos, lo
+ * vuelca a un fichero y deja en su lugar un puntero que le dice a `agy` que lo
+ * lea. Portado de `offloadLargePrompt` del servidor MCP.
+ *
+ * Alcance real: `CreateProcessW` corta en 32.767 caracteres la línea COMPLETA.
+ * Un mensaje de Telegram no pasa de 4096, así que por el camino del bot esto no
+ * se dispara nunca; existe para los llamantes directos de `runAgyTask` (tests,
+ * futuros adjuntos entrantes) y para que el bridge no diverja del MCP.
+ *
+ * Contrapartida a tener presente: el volcado añade `--add-dir <tmpdir>`, es
+ * decir amplía el conjunto de directorios que `agy` puede leer y escribir. Se
+ * limita a un directorio recién creado y vacío, y se borra al terminar.
+ */
+/**
+ * Antepone al prompt los guardrails derivados de la política EFECTIVA.
+ *
+ * Se lee de `policy.*`, no de las constantes por defecto. Antes se inyectaban
+ * los defaults mientras `/status` mostraba `policy.*`: lo que el usuario
+ * escribía en su `antigravity.json` se anunciaba en el chat pero no llegaba
+ * nunca al modelo, que es el único capaz de atenderlo. Como los guardrails son
+ * el único mecanismo que existe —aunque solo sea una sugerencia—, esa
+ * discrepancia dejaba la configuración sin ningún efecto.
+ *
+ * Función aparte para poder afirmarlo en un test sin lanzar `agy`.
+ */
+export function buildGuardrailedPrompt(policy, prompt) {
+  return [
+    `[SECURITY & PERMISSION GUARDRAILS ENFORCED BY USER POLICY]`,
+    `- FORBIDDEN PATHS: ${policy.denyPaths.join(', ')}`,
+    `- FORBIDDEN COMMANDS: ${policy.denyCommands.join(', ')}`,
+    `If any requested action violates these rules, refuse that specific action and explain the restriction.\n`,
+    `[TASK INSTRUCTIONS]`,
+    prompt
+  ].join('\n');
+}
+
+export function offloadLargePrompt(args) {
+  const i = args.indexOf('-p');
+  if (i === -1 || i + 1 >= args.length) return { args, cleanup: () => {} };
+
+  const prompt = args[i + 1];
+  if (typeof prompt !== 'string' || prompt.length <= PROMPT_ARG_LIMIT) {
+    return { args, cleanup: () => {} };
+  }
+
+  let dir;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-prompt-'));
+    const file = path.join(dir, 'PROMPT.md');
+    fs.writeFileSync(file, prompt, 'utf8');
+
+    const puntero = [
+      'Your instructions for this task did not fit in a command-line argument,',
+      'so they were written to this file:',
+      '',
+      file,
+      '',
+      'Read that file COMPLETELY, from the first line to the last, before doing',
+      'anything else. Its contents are your prompt: follow them exactly as if',
+      'they had been typed here. Do not ask for confirmation and do not stop at',
+      'a partial read - produce the final answer the file asks for.'
+    ].join('\n');
+
+    const nuevos = [...args];
+    nuevos[i + 1] = puntero;
+    nuevos.push('--add-dir', dir);
+
+    console.log(`[executor] Prompt de ${prompt.length} caracteres por encima del limite de argumento; volcado a ${file}`);
+
+    return {
+      args: nuevos,
+      cleanup: () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
+    };
+  } catch (err) {
+    // Si el volcado falla es mejor intentar el spawn igualmente y que sea el
+    // sistema quien se queje, en vez de abortar por un fallo de /tmp.
+    console.error(`[executor] No se pudo volcar el prompt: ${err.message}. Se intenta el spawn directo.`);
+    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
+    return { args, cleanup: () => {} };
+  }
+}
+
 
 /**
  * Ejecuta una tarea en Antigravity CLI de forma segura y estructurada
@@ -200,17 +245,9 @@ export function runAgyTask(options = {}) {
     cliArgs.push('--conversation', conversationId);
   }
 
-  // Inyección de guardrails de seguridad por política
-  const securityGuardrails = [
-    `[SECURITY & PERMISSION GUARDRAILS ENFORCED BY USER POLICY]`,
-    `- FORBIDDEN PATHS: ${DEFAULT_DENY_PATHS.join(', ')}`,
-    `- FORBIDDEN COMMANDS: ${DEFAULT_DENY_COMMANDS.join(', ')}`,
-    `If any requested action violates these rules, refuse that specific action and explain the restriction.\n`,
-    `[TASK INSTRUCTIONS]`,
-    prompt
-  ].join('\n');
+  cliArgs.push('-p', buildGuardrailedPrompt(policy, prompt));
 
-  cliArgs.push('-p', securityGuardrails);
+  const { args: finalArgs, cleanup: limpiarPrompt } = offloadLargePrompt(cliArgs);
 
   return new Promise((resolve) => {
     let stdout = '';
@@ -218,35 +255,30 @@ export function runAgyTask(options = {}) {
     let settled = false;
     let killTimer = null;
 
-    /**
-     * SIGTERM y, si el hijo lo ignora, SIGKILL. Antes solo se enviaba SIGTERM y
-     * se resolvía la promesa de inmediato, dejando posiblemente un agy.exe
-     * huérfano consumiendo cuota y CPU.
-     */
     const terminate = (child) => {
-      try { child.kill('SIGTERM'); } catch {}
-      killTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          console.warn('[executor] El proceso ignoró SIGTERM. Enviando SIGKILL.');
-          try { child.kill('SIGKILL'); } catch {}
-        }
-      }, SIGKILL_GRACE_MS);
-      killTimer.unref?.();
+      killTimer = terminateTree(child, {
+        onForce: () => console.warn('[executor] El proceso no cerró por las buenas. Forzando el árbol.')
+      });
     };
 
     console.log(`[executor] Ejecutando: ${AGY_BIN} (modo: ${mode}, sandbox: ${useSandbox ? 'sí' : 'no'}, conv: ${conversationId || 'nueva'}, cwd: ${cwd})`);
 
     const startedAt = Date.now();
-    const child = spawn(AGY_BIN, cliArgs, {
+    // Entorno saneado: `agy` corre con `--dangerously-skip-permissions` y puede
+    // ejecutar comandos, así que heredar `TELEGRAM_BOT_TOKEN` equivale a
+    // publicarlo — un `echo` bastaría, y su salida vuelve al chat. Las
+    // herramientas salientes no se rompen: `notify.js` lee el `.env` de disco.
+    const child = spawn(AGY_BIN, finalArgs, {
       cwd,
       shell: false,
-      env: { ...process.env }
+      env: sanitizeEnv()
     });
 
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       terminate(child);
+      limpiarPrompt();
       resolve({
         success: false,
         error: `La tarea en Antigravity superó el tiempo límite de ${timeoutMinutes} minutos.`,
@@ -262,6 +294,7 @@ export function runAgyTask(options = {}) {
         settled = true;
         clearTimeout(timer);
         terminate(child);
+        limpiarPrompt();
         resolve({
           success: false,
           cancelled: true,
@@ -286,9 +319,10 @@ export function runAgyTask(options = {}) {
       clearTimeout(timer);
       if (settled) return;
       settled = true;
+      limpiarPrompt();
       resolve({
         success: false,
-        error: `Error al iniciar ${AGY_BIN}: ${err.message}`,
+        error: `Error al iniciar ${AGY_BIN}: ${redactSecrets(err.message)}`,
         conversationId,
         stdout,
         stderr
@@ -298,6 +332,7 @@ export function runAgyTask(options = {}) {
     child.on('close', (code) => {
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      limpiarPrompt();
       if (settled) return;
       settled = true;
 
@@ -329,9 +364,9 @@ export function runAgyTask(options = {}) {
         if (parsed && parsed.error) {
           errorMsg = `Error de Antigravity: "${parsed.error}".`;
         } else if (stderr.trim()) {
-          errorMsg += `\nDetalles: ${stderr.trim()}`;
+          errorMsg += `\nDetalles: ${redactSecrets(stderr.trim())}`;
         } else if (stdout.trim()) {
-          errorMsg += `\nSalida: ${stdout.trim()}`;
+          errorMsg += `\nSalida: ${redactSecrets(stdout.trim())}`;
         }
 
         resolve({

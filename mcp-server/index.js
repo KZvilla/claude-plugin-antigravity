@@ -7,7 +7,7 @@
  * Includes granular ALLOW / DENY permissions, robust timeout handling, and telemetry / usage metrics.
  */
 
-const { spawn, execFileSync } = require('node:child_process');
+const { spawn, execFile, execFileSync } = require('node:child_process');
 const readline = require('node:readline');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -1828,6 +1828,40 @@ ${personaSection}
 // argumentos dentro del techo de Windows, que es el mas estrecho.
 const PROMPT_ARG_LIMIT = 24000;
 
+/**
+ * Termina el proceso hijo y, en Windows, todo su arbol de descendientes.
+ *
+ * En Windows no hay senales POSIX: libuv traduce SIGTERM y SIGKILL a
+ * TerminateProcess sobre el manejador de agy.exe y solo sobre el. Si agy habia
+ * lanzado npm test, un servidor local o un script, esos nietos quedan sueltos
+ * ocupando puertos y CPU. taskkill /T es lo unico que recorre el arbol; se
+ * intenta primero sin /F y se fuerza pasado el margen.
+ *
+ * Misma implementacion que telegram-bridge/executor.js: los dos lanzan agy del
+ * mismo modo y arrastraban el mismo huerfano.
+ */
+function terminateTree(child, graceMs = 5000) {
+  if (process.platform === 'win32' && child.pid) {
+    execFile('taskkill', ['/pid', String(child.pid), '/T'], () => {});
+    const t = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
+      }
+    }, graceMs);
+    t.unref?.();
+    return t;
+  }
+
+  try { child.kill('SIGTERM'); } catch {}
+  const t = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+  }, graceMs);
+  t.unref?.();
+  return t;
+}
+
 function offloadLargePrompt(args) {
   const i = args.indexOf('-p');
   if (i === -1 || i + 1 >= args.length) return { args, cleanup: () => {} };
@@ -1994,7 +2028,7 @@ function executeAgy(args, options = {}) {
 
     const timer = setTimeout(() => {
       killed = true;
-      child.kill('SIGTERM');
+      terminateTree(child);
       limpiarPrompt();
       resolve({
         success: false,
@@ -2176,7 +2210,7 @@ function drainVoiceStreamEvents(session) {
 
 function stopVoiceStreamSession(session) {
   try { session.child.stdin.end(); } catch {}
-  try { session.child.kill('SIGTERM'); } catch {}
+  terminateTree(session.child);
   session.status = 'stopped';
 }
 

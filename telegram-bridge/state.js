@@ -1,15 +1,39 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveDataFile } from './paths.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// Sobreescribible para que los tests no operen sobre el estado real del usuario.
-const STATE_FILE = process.env.TELEGRAM_BRIDGE_STATE_FILE
-  ? path.resolve(process.env.TELEGRAM_BRIDGE_STATE_FILE)
-  : path.join(__dirname, 'state.json');
 
-const LOCK_FILE = `${STATE_FILE}.lock`;
+// El estado vive en un directorio de usuario, NO junto al código. `bot.js` y
+// `notify.js` pueden ejecutarse desde copias distintas del bridge —el checkout
+// de desarrollo y el plugin instalado— y con la ruta relativa a `__dirname`
+// cada una escribía su propio `state.json`: el ask que registra notify.js no lo
+// veía el bot que resuelve el botón. Ver paths.js.
+//
+// `TELEGRAM_BRIDGE_STATE_FILE` sigue siendo el override más específico, y es lo
+// que usan los tests para no tocar el estado real del usuario.
+// Perezoso, no en el cuerpo del módulo: `resolveDataFile` crea directorios y
+// migra el fichero heredado, y eso no debe ocurrir por el mero hecho de
+// importar `state.js`. Importar no es usar.
+let _stateFile = null;
+
+/**
+ * Ruta efectiva del estado. La usan el arranque del bot para informarla y los
+ * tests para comprobar dónde se está escribiendo.
+ */
+export function getStateFilePath() {
+  if (_stateFile) return _stateFile;
+  _stateFile = process.env.TELEGRAM_BRIDGE_STATE_FILE
+    ? path.resolve(process.env.TELEGRAM_BRIDGE_STATE_FILE)
+    : resolveDataFile('state.json', __dirname);
+  return _stateFile;
+}
+
+function getLockFilePath() {
+  return `${getStateFilePath()}.lock`;
+}
 
 // Un lock abandonado (proceso muerto a mitad de escritura) se considera obsoleto
 // pasado este tiempo. Una escritura de estado tarda milisegundos.
@@ -19,6 +43,14 @@ const LOCK_STALE_MS = 5000;
 const LOCK_WAIT_MS = 2000;
 // Los asks resueltos o expirados se purgan pasado este tiempo.
 const ASK_RETENTION_HOURS = 24;
+// Plazo de gracia que se añade al vencimiento declarado de un ask antes de
+// darlo por huérfano. Cubre el desfase entre el reloj del proceso que espera y
+// el del que purga, y el último tramo del bucle de sondeo de notify.js.
+const ASK_GRACE_MS = 60 * 1000;
+// Vencimiento de respaldo para asks registrados por una versión anterior, que
+// no llevan `expiresAt`. Muy por encima de cualquier `timeoutSeconds` razonable
+// para no cortar una espera viva.
+const LEGACY_ASK_MAX_AGE_MS = 24 * 3600 * 1000;
 
 function emptyState() {
   return { chats: {}, pendingAsks: {} };
@@ -42,15 +74,15 @@ function acquireStateLock() {
 
   for (;;) {
     try {
-      return fs.openSync(LOCK_FILE, 'wx');
+      return fs.openSync(getLockFilePath(), 'wx');
     } catch (err) {
       if (err.code !== 'EEXIST') {
         console.error(`[state] No se pudo tomar el lock: ${err.message}. Se escribe sin exclusión.`);
         return null;
       }
       try {
-        if (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS) {
-          fs.unlinkSync(LOCK_FILE);
+        if (Date.now() - fs.statSync(getLockFilePath()).mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(getLockFilePath());
           continue;
         }
       } catch {
@@ -68,7 +100,7 @@ function acquireStateLock() {
 function releaseStateLock(fd) {
   if (fd === null) return;
   try { fs.closeSync(fd); } catch {}
-  try { fs.unlinkSync(LOCK_FILE); } catch {}
+  try { fs.unlinkSync(getLockFilePath()); } catch {}
 }
 
 /**
@@ -127,7 +159,7 @@ function parseState(raw) {
  */
 function readStateFromDisk() {
   try {
-    return parseState(fs.readFileSync(STATE_FILE, 'utf8'));
+    return parseState(fs.readFileSync(getStateFilePath(), 'utf8'));
   } catch {
     return emptyState();
   }
@@ -139,7 +171,7 @@ function readStateFromDisk() {
 export function loadState() {
   let raw = null;
   try {
-    raw = fs.readFileSync(STATE_FILE, 'utf8');
+    raw = fs.readFileSync(getStateFilePath(), 'utf8');
   } catch {
     cache = null;
     return emptyState();
@@ -156,10 +188,10 @@ function writeStateToDisk(state) {
   // Escritura atómica: un corte a mitad de un writeFileSync directo deja JSON
   // truncado, y loadState lo reinicializaría a {} perdiendo en silencio todos
   // los conversation_id y asks pendientes. El rename sí es atómico.
-  const tmp = `${STATE_FILE}.${process.pid}.tmp`;
+  const tmp = `${getStateFilePath()}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
-    fs.renameSync(tmp, STATE_FILE);
+    fs.renameSync(tmp, getStateFilePath());
     cache = null; // el contenido cambió; que la próxima lectura lo recoja
   } catch (err) {
     console.error(`[state] Error guardando state.json: ${err.message}`);
@@ -184,16 +216,66 @@ export function saveState(state) {
 // ==============================================================================
 
 /**
- * Elimina los asks resueltos o expirados con más de `retentionHours`.
- * Los `pending` no se tocan: pueden tener un notify.js esperándolos.
+ * ¿Ha vencido ya el plazo de espera de un ask pendiente?
+ *
+ * La condición NO es una antigüedad fija. Un ask lleva su propio vencimiento
+ * (`expiresAt = createdAt + timeoutSeconds`) porque `timeoutSeconds` lo elige
+ * el llamante de `askTelegramQuestion`: con un umbral constante de, digamos,
+ * dos horas, un ask con timeout mayor se marcaría `expired` mientras su
+ * `notify.js` sigue vivo esperándolo. A partir de ahí el botón de Telegram
+ * responde «esta consulta expiró» y no resuelve nada, y el proceso que espera
+ * se queda colgado hasta su propio timeout. El vencimiento declarado es el
+ * único dato que distingue un ask huérfano de uno con dueño.
+ *
+ * @returns {boolean|null} `null` si no hay forma de fecharlo (registro corrupto)
+ */
+function pendingAskVencido(ask, now = Date.now()) {
+  const expiresAt = Date.parse(ask.expiresAt || '');
+  if (!Number.isNaN(expiresAt)) return now > expiresAt + ASK_GRACE_MS;
+
+  // Registro de una versión anterior: se cae al respaldo por antigüedad.
+  const createdAt = Date.parse(ask.createdAt || '');
+  if (!Number.isNaN(createdAt)) return now - createdAt > LEGACY_ASK_MAX_AGE_MS;
+
+  return null;
+}
+
+/**
+ * Recolector de asks. Hace dos cosas:
+ *
+ *  1. Marca `expired` los `pending` cuyo plazo ya venció. Sin esto, un cliente
+ *     (`notify.js`) cerrado a la fuerza antes de su timeout deja el ask en
+ *     `pending` para siempre: el purgador lo saltaba por diseño y la entrada
+ *     no salía nunca de `state.json`.
+ *  2. Elimina los cerrados —`answered` o `expired`— con más de `retentionHours`.
+ *
+ * Un `pending` sin ninguna marca de tiempo utilizable no se puede fechar ni
+ * atribuir a un esperador concreto, así que se elimina: dejarlo era justo la
+ * fuga que se quiere cerrar.
+ *
  * @returns {number} entradas eliminadas
  */
 function purgeStaleAsks(state, retentionHours = ASK_RETENTION_HOURS) {
-  const cutoff = Date.now() - retentionHours * 3600 * 1000;
+  const now = Date.now();
+  const cutoff = now - retentionHours * 3600 * 1000;
   let removed = 0;
 
   for (const [askId, ask] of Object.entries(state.pendingAsks || {})) {
-    if (ask.status === 'pending') continue;
+    if (ask.status === 'pending') {
+      const vencido = pendingAskVencido(ask, now);
+      if (vencido === null) {
+        delete state.pendingAsks[askId];
+        removed++;
+        continue;
+      }
+      if (!vencido) continue;
+      ask.status = 'expired';
+      ask.expiredAt = new Date(now).toISOString();
+      ask.expiredBy = 'gc';
+      // Recién marcado: entra en el periodo de retención, no se borra ahora.
+      continue;
+    }
+
     const closedAt = Date.parse(ask.answeredAt || ask.expiredAt || ask.createdAt || '');
     if (Number.isNaN(closedAt) || closedAt < cutoff) {
       delete state.pendingAsks[askId];
@@ -258,7 +340,8 @@ export function clearConversationId(chatId) {
 /**
  * Registra una pregunta pendiente de aprobación (Human-in-the-loop)
  */
-export function registerPendingAsk(askId, { question, options, chatId, messageId }) {
+export function registerPendingAsk(askId, { question, options, chatId, messageId, timeoutSeconds = 300 }) {
+  const createdAt = Date.now();
   mutateState((state) => {
     state.pendingAsks[askId] = {
       askId,
@@ -266,7 +349,11 @@ export function registerPendingAsk(askId, { question, options, chatId, messageId
       options,
       chatId,
       messageId,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(createdAt).toISOString(),
+      // Vencimiento explícito: es lo que permite al recolector distinguir un
+      // ask huérfano de uno que todavía tiene un proceso esperándolo.
+      expiresAt: new Date(createdAt + timeoutSeconds * 1000).toISOString(),
+      timeoutSeconds,
       status: 'pending', // 'pending' | 'answered' | 'expired'
       answer: null,
       answeredBy: null,
@@ -276,12 +363,21 @@ export function registerPendingAsk(askId, { question, options, chatId, messageId
 }
 
 /**
- * Resuelve una pregunta pendiente cuando el usuario pulsa un botón en Telegram
+ * Resuelve una pregunta pendiente cuando el usuario pulsa un botón en Telegram.
+ *
+ * La comprobación de `status` va DENTRO del ciclo leer-modificar-escribir bajo
+ * lock, no en el llamante. Comprobarla fuera es un TOCTOU: dos pulsaciones
+ * seguidas del mismo botón —o dos clientes— pasaban ambas el filtro y
+ * resolvían dos veces, sobrescribiendo la primera respuesta y notificando dos
+ * veces al usuario.
+ *
+ * @returns {object|null} el ask resuelto, o `null` si no existía o ya no
+ *          estaba `pending` (respuesta previa, expiración o recolección)
  */
 export function resolvePendingAsk(askId, answer, answeredBy = null) {
   return mutateState((state) => {
     const ask = state.pendingAsks[askId];
-    if (!ask) return false;
+    if (!ask || ask.status !== 'pending') return false;
     ask.status = 'answered';
     ask.answer = answer;
     ask.answeredBy = answeredBy;

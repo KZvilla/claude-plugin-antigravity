@@ -11,6 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerPendingAsk, getPendingAsk, expirePendingAsk } from './state.js';
 import { splitMessage, markdownToTelegramHtml, escapeHtml } from './formatter.js';
+import { assertPathAllowed, PolicyViolationError, redactSecrets } from './policy.js';
 
 // Límite propio del caption de Telegram, muy por debajo de los 4096 del texto.
 const CAPTION_LIMIT = 1024;
@@ -74,7 +75,7 @@ async function sendChunkedMessage(chatId, text, extra = {}) {
         ...extra
       }));
     } catch (err) {
-      console.error(`[notify] Telegram rechazó el HTML (${err.message}). Reintentando en texto plano.`);
+      console.error(`[notify] Telegram rechazó el HTML (${redactSecrets(err.message)}). Reintentando en texto plano.`);
       sent.push(await telegramApiCall('sendMessage', { chat_id: chatId, text: chunk, ...extra }));
     }
   }
@@ -111,6 +112,14 @@ async function telegramUploadCall(method, fieldName, filePath, extraParams = {})
   if (!TELEGRAM_BOT_TOKEN) {
     throw new Error('Falta TELEGRAM_BOT_TOKEN en el entorno.');
   }
+
+  // Punto único de aplicación de `deny_paths`. Se comprueba AQUÍ, en la puerta
+  // de salida, y no en cada llamante: cualquier ruta que llegue a subirse pasa
+  // por esta función, así que un camino nuevo no puede saltarse la política por
+  // olvido. Va antes del `existsSync` a propósito — el resultado no debe
+  // depender de si el fichero prohibido existe o no.
+  assertPathAllowed(filePath);
+
   if (!fs.existsSync(filePath)) {
     throw new Error(`Archivo no encontrado: ${filePath}`);
   }
@@ -152,6 +161,16 @@ export async function sendTelegramNotification(options = {}) {
     filePath = null,
     targetChatId = null
   } = typeof options === 'string' ? { message: options } : options;
+
+  // Se valida antes de emitir nada. Si se dejara solo la comprobación de
+  // `telegramUploadCall`, el texto ya habría salido cuando el adjunto se
+  // rechaza, y el usuario vería media notificación sin explicación.
+  //
+  // Límite conocido de este control: cubre el ADJUNTO, no el cuerpo. Un agente
+  // puede leer `.env` con sus propias herramientas y pegar el contenido en
+  // `message`. `deny_paths` reduce la superficie de una llamada descuidada a
+  // esta herramienta; no es un cortafuegos de exfiltración.
+  if (filePath) assertPathAllowed(filePath);
 
   const chatId = getDefaultChatId(targetChatId);
 
@@ -245,7 +264,11 @@ export async function sendTelegramVoice(options = {}) {
       parse_mode: 'Markdown'
     });
   } catch (voiceErr) {
-    console.warn(`[notify] sendVoice falló (${voiceErr.message}). Intentando sendAudio como fallback...`);
+    // Un rechazo por política no es un fallo de formato: reintentar con
+    // sendAudio solo repetiría el mismo bloqueo y ensuciaría el log con un
+    // «fallback» que nunca podía funcionar.
+    if (voiceErr instanceof PolicyViolationError) throw voiceErr;
+    console.warn(`[notify] sendVoice falló (${redactSecrets(voiceErr.message)}). Intentando sendAudio como fallback...`);
     // Fallback a reproductor de audio integrado (sendAudio) para archivos .wav
     uploadResult = await telegramUploadCall('sendAudio', 'audio', resolvedPath, {
       chat_id: chatId,
@@ -261,7 +284,7 @@ export async function sendTelegramVoice(options = {}) {
     try {
       fs.unlinkSync(resolvedPath);
     } catch (delErr) {
-      console.warn(`[notify] No se pudo borrar ${resolvedPath}: ${delErr.message}`);
+      console.warn(`[notify] No se pudo borrar ${resolvedPath}: ${redactSecrets(delErr.message)}`);
     }
   }
 
@@ -302,11 +325,14 @@ export async function askTelegramQuestion(options = {}) {
     }
   });
 
+  // `timeoutSeconds` viaja al estado: el recolector necesita saber cuándo vence
+  // ESTE ask para no darlo por huérfano mientras este proceso sigue esperándolo.
   registerPendingAsk(askId, {
     question,
     options: choices,
     chatId,
-    messageId: sentMsg.message_id
+    messageId: sentMsg.message_id,
+    timeoutSeconds
   });
 
   console.log(`[notify] Esperando respuesta del usuario para consulta "${askId}" (${timeoutSeconds}s máx)...`);
@@ -325,6 +351,23 @@ export async function askTelegramQuestion(options = {}) {
           selected: ask.answer,
           answeredBy: ask.answeredBy,
           answeredAt: ask.answeredAt
+        });
+        return;
+      }
+
+      // El ask puede cerrarse desde fuera: lo expira el recolector de otro
+      // proceso, o desaparece porque `state.json` se reinicializó. Sin esta
+      // rama se seguiría esperando hasta el timeout local contra un registro
+      // que ya nadie puede resolver — y el botón de Telegram, que ve el estado
+      // real, respondería «esta consulta expiró» sin desbloquear nada.
+      if (!ask || ask.status === 'expired') {
+        clearInterval(interval);
+        resolve({
+          answered: false,
+          selected: null,
+          error: ask
+            ? 'La consulta fue marcada como expirada por el recolector de estado antes de recibir respuesta.'
+            : 'La consulta desapareció del estado compartido antes de recibir respuesta.'
         });
         return;
       }
@@ -552,7 +595,7 @@ Uso de notify.js:
         console.log('✅ Mensaje enviado a Telegram.');
       }
     } catch (err) {
-      console.error('❌ Error enviando a Telegram:', err.message);
+      console.error('❌ Error enviando a Telegram:', redactSecrets(err.message));
       process.exit(1);
     }
   })();
