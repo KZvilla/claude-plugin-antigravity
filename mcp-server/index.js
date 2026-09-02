@@ -3710,6 +3710,27 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       const envActivo = envCandidatos.find(f => fs.existsSync(f)) || null;
       const envDuradero = path.join(dataDir, '.env');
 
+      // El .env que usaria el DAEMON, que puede salir de otra copia del codigo
+      // y por tanto de otro fichero. Es el mismo desfase que se arreglo para
+      // state.json, pero en credenciales, y no se ve desde ningun lado: cada
+      // mitad lee el suyo y ninguna sabe de la otra.
+      let envDaemon = null;
+      if (daemonDir) {
+        try {
+          envDaemon = rutas.bridgeEnvCandidates(daemonDir).find(f => fs.existsSync(f)) || null;
+        } catch {}
+      }
+      const norm2 = (p) => p ? path.resolve(p).replace(/\\/g, '/').toLowerCase() : null;
+      const envDistinto = envDaemon && envActivo && norm2(envDaemon) !== norm2(envActivo);
+      let envIguales = null;
+      if (envDistinto) {
+        // Se comparan los BYTES, nunca el contenido: si son copias identicas la
+        // division es inofensiva, y si difieren hay que decirlo sin revelar nada.
+        try {
+          envIguales = fs.readFileSync(envDaemon).equals(fs.readFileSync(envActivo));
+        } catch { envIguales = null; }
+      }
+
       const norm = (p) => p ? path.resolve(p).replace(/\\/g, '/').toLowerCase() : null;
       const mismaCopia = daemonDir ? norm(daemonDir) === norm(bridgeDir) : null;
       const enCopiaGestionada = /(\.claude|claude)\/plugins\/(cache|marketplaces)\//i.test(norm(bridgeDir) || '');
@@ -3743,8 +3764,23 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       }
 
       out += '\n**Credenciales (.env)**\n';
-      out += envActivo ? `- Se usaría: \`${envActivo}\`\n` : '- ⚠️ No se encontró ningún `.env`.\n';
-      if (envActivo && path.resolve(envActivo) !== path.resolve(envDuradero)) {
+      out += envActivo ? `- Herramientas MCP usan: \`${envActivo}\`\n` : '- ⚠️ No se encontró ningún `.env` para las herramientas MCP.\n';
+      if (envDaemon) out += `- Daemon del bot usa: \`${envDaemon}\`\n`;
+
+      if (envDistinto) {
+        out += '- ⚠️ **Cada mitad lee un `.env` distinto.**';
+        if (envIguales === true) {
+          out += ' Ahora mismo son idénticos, así que no hay síntoma —\n';
+          out += '  pero editar uno solo los desincroniza sin que nada lo avise.\n';
+        } else if (envIguales === false) {
+          out += ' **Y su contenido NO coincide.**\n';
+          out += '  Si difieren en el token o en `ALLOWED_USER_IDS`, el bot y las notificaciones\n';
+          out += '  actúan como dos bots distintos. Borra el que sobre y deja solo el duradero.\n';
+        } else {
+          out += ' No se pudo comparar su contenido.\n';
+        }
+        out += `  El duradero, que ambas mitades comparten, es: \`${envDuradero}\`\n`;
+      } else if (envActivo && path.resolve(envActivo) !== path.resolve(envDuradero)) {
         out += `- ℹ️ Ubicación duradera recomendada: \`${envDuradero}\`\n`;
         out += '  (un `.env` dentro del directorio de una versión se pierde en el próximo `claude plugin update`)\n';
       } else if (envActivo) {
