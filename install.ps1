@@ -82,8 +82,8 @@ Write-Host "  Antigravity plugin installed successfully!" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Next steps:" -ForegroundColor Cyan
 Write-Host "    1. In Claude Code, run:  " -NoNewline; Write-Host "/reload-plugins" -ForegroundColor Yellow
-Write-Host "    2. Try:  " -NoNewline; Write-Host "/agy Analiza este proyecto" -ForegroundColor Yellow
-Write-Host "    3. Try:  " -NoNewline; Write-Host "/agy-review" -ForegroundColor Yellow
+Write-Host "    2. Try:  " -NoNewline; Write-Host "/antigravity:run Analiza este proyecto" -ForegroundColor Yellow
+Write-Host "    3. Try:  " -NoNewline; Write-Host "/antigravity:review" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "  Installed at: $InstallDir" -ForegroundColor Cyan
 Write-Host "==============================================================" -ForegroundColor Green

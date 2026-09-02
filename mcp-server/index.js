@@ -864,7 +864,7 @@ const TOOLS = [
         },
         local_playback: {
           type: 'boolean',
-          description: 'When true, plays the audio aloud through your PC speakers (synthesized via POST /generate, then played with the native OS player — never Voicebox /speak, which double-plays). Defaults to false: silent generation, delivered to Telegram without scaring anyone. The /agy-narrate slash command sets this to true, since asking for narration out loud implies hearing it.'
+          description: 'When true, plays the audio aloud through your PC speakers (synthesized via POST /generate, then played with the native OS player — never Voicebox /speak, which double-plays). Defaults to false: silent generation, delivered to Telegram without scaring anyone. The /antigravity:narrate slash command sets this to true, since asking for narration out loud implies hearing it.'
         }
       }
     }
@@ -1653,7 +1653,9 @@ function extractLastCheckpoint(filePath) {
   }
 
   let targetUserMsg = userMessages[userMessages.length - 1];
-  const isOnlyNarrationCommand = targetUserMsg.text.startsWith('/agy-narrate') ||
+  // Acepta el nombre nuevo y el viejo: los registros JSONL de sesiones
+  // anteriores a v0.5.0 llevan `/agy-narrate`, y se siguen leyendo. old-name-ok
+  const isOnlyNarrationCommand = /^\/(antigravity:narrate|agy-narrate)/.test(targetUserMsg.text) ||   // old-name-ok
     (targetUserMsg.text.length < 50 && (targetUserMsg.text.toLowerCase().includes('narra') || targetUserMsg.text.toLowerCase().includes('narrat')));
 
   if (isOnlyNarrationCommand && userMessages.length > 1) {
@@ -2181,7 +2183,7 @@ async function handleToolCall(name, args) {
         out += `*No subagent invocations recorded in this session yet.*\n`;
       }
 
-      out += `\n*Tip: Run \`/agy-usage reset\` or pass \`reset: true\` to clear session counters.*`;
+      out += `\n*Tip: Run \`/antigravity:usage reset\` or pass \`reset: true\` to clear session counters.*`;
 
       return {
         content: [
@@ -3291,7 +3293,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       }
 
       out += `\n> **Cómo usar una voz específica:**\n`;
-      out += `> - Comando: \`/agy-narrate <nombre>\` (ej: \`/agy-narrate aria\` o \`/agy-narrate "Mi voz"\`)\n`;
+      out += `> - Comando: \`/antigravity:narrate <nombre>\` (ej: \`/antigravity:narrate aria\` o \`/antigravity:narrate "Mi voz"\`)\n`;
       out += `> - Con Claude: *"Narra el último checkpoint con [nombre de voz]"*\n`;
 
       return {
