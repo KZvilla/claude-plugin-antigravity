@@ -14,7 +14,11 @@
     "release:check": "node scripts/stamp-release.mjs --check",
     "bridge:daemon": "npm --prefix telegram-bridge run daemon",
     "bridge:daemon:check": "npm --prefix telegram-bridge run daemon:check",
-    "bridge:daemon:install": "npm --prefix telegram-bridge run daemon:install"
+    "bridge:daemon:install": "npm --prefix telegram-bridge run daemon:install",
+    "bridge:daemon:uninstall": "npm --prefix telegram-bridge run daemon:uninstall",
+    "bridge:daemon:start": "npm --prefix telegram-bridge run daemon:start",
+    "bridge:daemon:stop": "npm --prefix telegram-bridge run daemon:stop",
+    "bridge:daemon:logs": "npm --prefix telegram-bridge run daemon:logs"
   },
   "keywords": [
     "claude-code",

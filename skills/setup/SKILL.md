@@ -75,6 +75,15 @@ start it, then re-check. If it reports profiles, the track is done; offer
 Non-default port: `voicebox_url` / `voicebox_port` on the narration tools, or
 persist it with `agy_set_config`.
 
+**Outside Windows**, the *synthesis* goes over HTTP and works anywhere Voicebox
+is listening, but the bridge only knows the on-disk location of the generated
+`.wav` files on Windows (`%APPDATA%\sh.voicebox.app`). On Linux or macOS, voice
+notes therefore fail with a message saying so, immediately rather than after a
+timeout. If they do have Voicebox there, `VOICEBOX_DIR` points at the directory
+containing `generations/` and `captures/`. If they do not, say plainly that this
+track does not apply on their platform and move on — nothing else in the bridge
+depends on it.
+
 ### Track C — Telegram outbound
 
 This is the track with real friction, and the `.env` location is the part people
@@ -117,7 +126,9 @@ Common outcomes worth naming:
 Only needed to message the bot *from* the phone or answer `telegram_ask`.
 Outbound notifications and voice notes work without it.
 
-**Do not run this yourself.** Give them the commands and let them run them:
+**Do not run this yourself.** Give them the commands and let them run them. The
+commands are the same on every platform — a dispatcher picks the right service
+manager:
 
 ```bash
 git clone https://github.com/KZvilla/claude-plugin-antigravity.git
@@ -126,17 +137,38 @@ npm install --prefix telegram-bridge
 npm run bridge:daemon:install
 ```
 
-Explain why it must come from a clone: `daemon.ps1` refuses to install from a
-managed plugin directory, because the scheduled task stores an absolute path.
-Installed from `plugins/cache/…/<version>/`, the daemon would stay pinned to
-that version forever — and since updates do not delete old versions, it would
-keep running stale code with nothing failing to reveal it.
+| Platform | Service manager | Logs |
+|---|---|---|
+| Windows | Task Scheduler, at logon | `telegram-bridge/daemon.log` |
+| Linux | `systemd --user` | `journalctl --user -u lagrange-telegram-bridge` |
+| macOS | **not supported** — `npm run bridge` in a terminal, or write your own launchd unit | — |
+
+Explain why it must come from a clone: the installer refuses to run from a
+managed plugin directory, on both platforms, because the scheduled task and the
+systemd unit each store an **absolute path**. Installed from
+`plugins/cache/…/<version>/`, the daemon would stay pinned to that version
+forever — and since updates do not delete old versions, it would keep running
+stale code with nothing failing to reveal it.
+
+**On Linux, do not skip the linger step.** A `systemd --user` service stops when
+the user's last session ends and does not start at boot. The installer detects
+this and prints the fix, but confirm they ran it:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+Without it the daemon looks fine right after installing and is silently gone
+after the next reboot — which is exactly the sort of failure that gets blamed on
+the bridge rather than on the missing setting.
 
 Credentials and state are shared, so the clone uses the same `.env` and the same
 `state.json` as the installed plugin. They do **not** configure anything twice.
 
-Verify with `telegram_bridge_status`: the task should be `Running` with a live
-PID. Then have them send `/status` to the bot from their phone.
+Verify with `telegram_bridge_status`: the service should be `Running` (Windows)
+or `active` (Linux) with a live PID. Then have them send `/status` to the bot
+from their phone. `npm run bridge:daemon` gives the platform-native view, and on
+Linux additionally reports the linger state.
 
 ## Step 3 — Close honestly
 

@@ -10,11 +10,13 @@
   "scripts": {
     "start": "node bot.js",
     "test": "node test-bridge.js",
-    "daemon:check": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'daemon.ps1').Path,[ref]$null,[ref]$e); if($e){$e|ForEach-Object{Write-Host ('L'+$_.Extent.StartLineNumber+': '+$_.Message)}; exit 1} else {Write-Host 'daemon.ps1: parse OK'}\"",
-    "daemon": "powershell -NoProfile -ExecutionPolicy Bypass -File daemon.ps1 status",
-    "daemon:install": "powershell -NoProfile -ExecutionPolicy Bypass -File daemon.ps1 install",
-    "daemon:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File daemon.ps1 uninstall",
-    "daemon:logs": "powershell -NoProfile -ExecutionPolicy Bypass -File daemon.ps1 logs"
+    "daemon:check": "node daemon.mjs check",
+    "daemon": "node daemon.mjs status",
+    "daemon:install": "node daemon.mjs install",
+    "daemon:uninstall": "node daemon.mjs uninstall",
+    "daemon:logs": "node daemon.mjs logs",
+    "daemon:start": "node daemon.mjs start",
+    "daemon:stop": "node daemon.mjs stop"
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",

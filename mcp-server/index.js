@@ -3650,7 +3650,10 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // apuntar a una copia distinta de la que sirve estas herramientas.
       let daemonDir = null;
       let daemonTaskState = null;
+      let gestorServicios = null;
+
       if (process.platform === 'win32') {
+        gestorServicios = 'Task Scheduler';
         try {
           const ps = execFileSync('powershell', [
             '-NoProfile', '-Command',
@@ -3663,6 +3666,26 @@ Be thorough but concise. Prioritize primary sources and official documentation o
             const m = (args || '').match(/"?([A-Za-z]:[\\/][^"]*?)[\\/]daemon-hidden\.vbs"?/i)
               || (args || '').match(/"?([A-Za-z]:[\\/][^"]*?)[\\/]bot\.js"?/i);
             if (m) daemonDir = m[1];
+          }
+        } catch {}
+      } else if (process.platform === 'linux') {
+        gestorServicios = 'systemd --user';
+        try {
+          // `WorkingDirectory` es la ruta que daemon.sh escribe en la unidad, y
+          // es la que interesa: revela desde que copia del bridge se registro.
+          const out = execFileSync('systemctl', [
+            '--user', 'show', 'lagrange-telegram-bridge.service',
+            '-p', 'ActiveState', '-p', 'WorkingDirectory', '-p', 'LoadState'
+          ], { encoding: 'utf8', timeout: 10000, stdio: ['pipe', 'pipe', 'ignore'] });
+          const campos = Object.fromEntries(
+            out.trim().split(/\r?\n/).map(l => {
+              const i = l.indexOf('=');
+              return i === -1 ? [l, ''] : [l.slice(0, i), l.slice(i + 1)];
+            })
+          );
+          if (campos.LoadState && campos.LoadState !== 'not-found') {
+            daemonTaskState = campos.ActiveState || null;
+            if (campos.WorkingDirectory) daemonDir = campos.WorkingDirectory;
           }
         } catch {}
       }
@@ -3695,12 +3718,17 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
       out += '**Daemon**\n';
       if (daemonTaskState) {
-        out += `- Tarea programada: \`${daemonTaskState}\`\n`;
+        out += `- Servicio (${gestorServicios}): \`${daemonTaskState}\`\n`;
         out += `- Bot en ejecución: ${botVivo ? `✅ PID ${lock.pid} (desde ${lock.startedAt || 'desconocido'})` : '❌ no hay proceso vivo'}\n`;
-      } else if (process.platform === 'win32') {
-        out += '- Tarea programada: _no registrada_ (`npm run bridge:daemon:install` desde un clon)\n';
+      } else if (gestorServicios) {
+        out += `- Servicio (${gestorServicios}): _no registrado_ (\`npm run bridge:daemon:install\` desde un clon)\n`;
+        if (botVivo) {
+          out += `- Bot en ejecución: ✅ PID ${lock.pid} — arrancado a mano, no por el gestor de servicios\n`;
+        }
       } else {
-        out += '- Tarea programada: _solo se consulta en Windows_\n';
+        // macOS y cualquier otra: el bridge funciona, solo que sin daemon.
+        out += `- Servicio: _no hay gestor soportado en ${process.platform}_ (arráncalo con \`npm run bridge\`)\n`;
+        out += `- Bot en ejecución: ${botVivo ? `✅ PID ${lock.pid} (desde ${lock.startedAt || 'desconocido'})` : '❌ no hay proceso vivo'}\n`;
       }
 
       out += '\n**Qué código corre cada mitad**\n';

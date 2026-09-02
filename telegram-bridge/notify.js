@@ -403,12 +403,57 @@ export async function askTelegramQuestion(options = {}) {
 }
 
 /**
+ * Directorio de datos de Voicebox, o `null` si esta plataforma no tiene uno.
+ *
+ * Antes las tres funciones de abajo repetían
+ * `process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming')`. Fuera de
+ * Windows `APPDATA` no existe, así que ese fallback construía
+ * `~/AppData/Roaming/sh.voicebox.app` — una ruta que no puede existir en Linux
+ * ni en macOS. El efecto no era un error claro: `waitForVoiceboxGeneration`
+ * daba vueltas noventa segundos sobre una carpeta inventada y luego reportaba
+ * un timeout, culpando a Voicebox de ir lento.
+ *
+ * Ahora la ausencia de soporte se dice de inmediato. `VOICEBOX_DIR` permite
+ * apuntar a una instalación no estándar sin que el bridge tenga que adivinar
+ * rutas de plataformas donde nadie ha comprobado que Voicebox exista.
+ *
+ * @returns {{ base: string|null, searched: string[] }}
+ */
+export function resolveVoiceboxBaseDir() {
+  const explicito = (process.env.VOICEBOX_DIR || '').trim();
+  if (explicito) return { base: path.resolve(explicito), searched: [path.resolve(explicito)] };
+
+  if (process.platform === 'win32') {
+    const homeDir = process.env.USERPROFILE || process.env.HOME || '';
+    const appDataRoaming = process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
+    const base = path.join(appDataRoaming, 'sh.voicebox.app');
+    return { base, searched: [base] };
+  }
+
+  return { base: null, searched: [] };
+}
+
+/**
+ * Mensaje único para cuando no hay directorio de Voicebox. Nombra la causa real
+ * —la plataforma— en lugar de dejar que el fallo parezca de red o de lentitud.
+ */
+function errorVoiceboxNoDisponible() {
+  const { searched } = resolveVoiceboxBaseDir();
+  if (searched.length > 0) {
+    return `No se encontró el directorio de Voicebox. Buscado en: ${searched.join(', ')}. ` +
+      'Comprueba que Voicebox esté instalado, o fija VOICEBOX_DIR.';
+  }
+  return `Las notas de voz de Voicebox solo tienen ruta conocida en Windows (esta plataforma es ${process.platform}). ` +
+    'Si tienes Voicebox aquí, fija VOICEBOX_DIR al directorio que contiene generations/ y captures/. ' +
+    'El resto del bridge —notificaciones y preguntas— funciona igual.';
+}
+
+/**
  * 4. Localiza el archivo de audio más reciente generado por Voicebox
  */
 export function findLatestVoiceboxAudio() {
-  const homeDir = process.env.USERPROFILE || process.env.HOME || '';
-  const appDataRoaming = process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
-  const vbBase = path.join(appDataRoaming, 'sh.voicebox.app');
+  const { base: vbBase } = resolveVoiceboxBaseDir();
+  if (!vbBase) return null;
 
   const candidatesDirs = [
     path.join(vbBase, 'captures'),
@@ -469,9 +514,9 @@ export function findLatestVoiceboxAudio() {
  * 5. Obtiene la lista actual de archivos en la carpeta de generaciones de Voicebox (Snapshot)
  */
 export function getVoiceboxGenerationsSnapshot() {
-  const homeDir = process.env.USERPROFILE || process.env.HOME || '';
-  const appDataRoaming = process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
-  const genDir = path.join(appDataRoaming, 'sh.voicebox.app', 'generations');
+  const { base } = resolveVoiceboxBaseDir();
+  if (!base) return [];
+  const genDir = path.join(base, 'generations');
   if (fs.existsSync(genDir)) {
     try {
       return fs.readdirSync(genDir);
@@ -490,9 +535,12 @@ export async function waitForVoiceboxGeneration(options = {}) {
     timeoutMs = 90000
   } = options;
 
-  const homeDir = process.env.USERPROFILE || process.env.HOME || '';
-  const appDataRoaming = process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
-  const genDir = path.join(appDataRoaming, 'sh.voicebox.app', 'generations');
+  // Se comprueba ANTES de entrar al bucle. Sondear noventa segundos un
+  // directorio que no puede existir y reportar despues un timeout es un fallo
+  // que miente sobre su causa.
+  const { base } = resolveVoiceboxBaseDir();
+  if (!base) throw new Error(errorVoiceboxNoDisponible());
+  const genDir = path.join(base, 'generations');
 
   const beforeSet = new Set(beforeFiles);
   const startTime = Date.now();

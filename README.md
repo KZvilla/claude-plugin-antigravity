@@ -412,6 +412,9 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 | | `skills/adversarial-review/SKILL.md` | Skeptical, evidence-based audit guidelines |
 | | `skills/session-summary/SKILL.md` | Session summary & anti-compaction skill |
 | | `skills/setup/SKILL.md` | Guided setup for Voicebox, Telegram and the daemon — never handles secrets |
+| **Daemon** | `telegram-bridge/daemon.mjs` | Platform dispatcher — same npm command everywhere |
+| | `telegram-bridge/daemon.ps1` | Windows: Task Scheduler, at logon |
+| | `telegram-bridge/daemon.sh` | Linux: `systemd --user`, journald logs |
 | **Commands** | `commands/run.md` | `/lagrange:run <prompt>` |
 | | `commands/plan.md` | `/lagrange:plan <task>` |
 | | `commands/review.md` | `/lagrange:review [target]` |
@@ -558,13 +561,25 @@ npm run bridge
 
 Note that the two copies share their **runtime state** regardless (`state.json` and `bridge.lock` live in the same durable directory), which is what lets an installed `telegram_ask` be answered by a daemon running from a clone.
 
-The bidirectional bot (`telegram-bridge/bot.js`, started with `npm run bridge` from the repo root) is only needed if you want to message the bot *from* your phone to kick off `agy` tasks or answer `telegram_ask` prompts — outbound notifications and voice notes work without it. To keep it running across logins, see `telegram-bridge/daemon.ps1` (`npm run bridge:daemon:install` on Windows).
+The bidirectional bot (`telegram-bridge/bot.js`, started with `npm run bridge` from the repo root) is only needed if you want to message the bot *from* your phone to kick off `agy` tasks or answer `telegram_ask` prompts — outbound notifications and voice notes work without it.
+
+To keep it running across logins, `npm run bridge:daemon:install` — the same command everywhere; a dispatcher picks the service manager:
+
+| Platform | Service manager | Logs | Notes |
+|---|---|---|---|
+| Windows | Task Scheduler, at logon | `telegram-bridge/daemon.log` | — |
+| Linux | `systemd --user` | `journalctl --user -u lagrange-telegram-bridge` | Run `sudo loginctl enable-linger $USER` or it stops at logout and never starts at boot |
+| macOS | **not supported** | — | `npm run bridge` in a terminal, or write your own launchd unit pointing at `bot.js` |
+
+macOS ships no launchd unit on purpose: an untested service manager fails at system boot, when nobody is watching, while the user believes they have a daemon. The limit is declared rather than half-met.
+
+**On Linux, linger is the step people miss.** A `systemd --user` service is tied to the user's login session: without linger it looks healthy right after installing and is silently gone after the next reboot. The installer detects it and prints the fix; `npm run bridge:daemon` reports it too.
 
 #### The daemon must be installed from a clone, not from the plugin copy
 
-`daemon.ps1 install` **refuses to run** from a managed plugin directory (`.claude/plugins/cache/…` or `…/marketplaces/…`), and the reason is worth stating because the failure it prevents is invisible.
+The installer **refuses to run** from a managed plugin directory (`.claude/plugins/cache/…` or `…/marketplaces/…`) — on both Windows and Linux — and the reason is worth stating because the failure it prevents is invisible.
 
-The scheduled task stores an **absolute path**. Each plugin version installs into its own directory, and updating does not delete the old ones — so a daemon registered from `…/lagrange/0.9.1/` stays pinned to 0.9.1 forever. After the next update, the bot runs the old code while the MCP tools run the new one, and *nothing fails*: no error, no warning, just two halves of the same bridge on different code. If old versions were deleted the daemon would crash at logon and you would know; that they survive is exactly what makes this silent.
+The scheduled task and the systemd unit each store an **absolute path**. Each plugin version installs into its own directory, and updating does not delete the old ones — so a daemon registered from `…/lagrange/0.9.1/` stays pinned to 0.9.1 forever. After the next update, the bot runs the old code while the MCP tools run the new one, and *nothing fails*: no error, no warning, just two halves of the same bridge on different code. If old versions were deleted the daemon would crash at startup and you would know; that they survive is exactly what makes this silent.
 
 Run `/lagrange:bridge` at any time to see which copy each half is running, along with daemon state, the effective `.env`, and the shared state paths. (`-Force` bypasses the check if you have a case we did not anticipate.)
 
