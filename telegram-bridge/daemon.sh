@@ -150,8 +150,16 @@ test_prerequisites() {
     warn "Instalalo desde https://antigravity.google/cli y vuelve a ejecutar install."
   fi
 
-  # Dos lineas: node en la primera, agy en la segunda (vacia si no esta).
-  printf '%s\n%s' "$node_path" "$agy_path"
+  # El resultado sale por VARIABLES, no por stdout.
+  #
+  # Devolverlo con printf y capturarlo con $(test_prerequisites) parece
+  # natural, pero esta funcion tambien le habla al usuario con ok/info/warn, y
+  # eso va al mismo stdout. La captura se llevaba las dos cosas: ExecStart acabo
+  # conteniendo "[OK] Node v22..." y systemd rechazo la unidad entera con
+  # "Executable name contains special characters". Una funcion no puede a la vez
+  # informar al usuario y devolver un valor por el mismo canal.
+  PREREQ_NODE_PATH="$node_path"
+  PREREQ_AGY_PATH="$agy_path"
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -213,8 +221,12 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-WorkingDirectory=$BRIDGE_DIR
-ExecStart=$node_path $BOT_SCRIPT
+# Entrecomillado: systemd separa por espacios, asi que un clon en una ruta
+# como "~/mis proyectos/..." produciria un ExecStart donde la segunda mitad
+# del directorio se toma por otro argumento. Con comillas se admite cualquier
+# ruta, y no estorban cuando no hay espacios.
+WorkingDirectory="$BRIDGE_DIR"
+ExecStart="$node_path" "$BOT_SCRIPT"
 Restart=on-failure
 RestartSec=10
 
@@ -240,10 +252,19 @@ invoke_install() {
   [ "$FORCE" -eq 1 ] || assert_directorio_estable
   require_systemd
 
-  local prereq node_path agy_path
-  prereq="$(test_prerequisites)"
-  node_path="$(printf '%s' "$prereq" | sed -n '1p')"
-  agy_path="$(printf '%s' "$prereq" | sed -n '2p')"
+  PREREQ_NODE_PATH=''
+  PREREQ_AGY_PATH=''
+  test_prerequisites
+  local node_path="$PREREQ_NODE_PATH"
+  local agy_path="$PREREQ_AGY_PATH"
+
+  # Cinturon y tirantes: si algo volviera a colar diagnosticos en estas
+  # variables, es mejor negarse a escribir la unidad que producir un ExecStart
+  # corrupto que systemd rechaza con un error que no apunta a la causa.
+  case "$node_path" in
+    /*) ;;
+    *) fail "Ruta de node inesperada: '$node_path'. No se escribe la unidad." ;;
+  esac
 
   if systemctl --user list-unit-files "$UNIT_NAME" --no-legend 2>/dev/null | grep -q .; then
     warn "La unidad '$UNIT_NAME' ya existe. Se vuelve a escribir con la configuracion actual."

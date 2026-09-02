@@ -75,13 +75,31 @@ async function main() {
       '#!/usr/bin/env bash',
       'set -euo pipefail',
       'BRIDGE_DIR="/home/u/repo/telegram-bridge"',
+      // `test_prerequisites` comprueba que exista bot.js, asi que se apunta al
+      // real: lo que se ejercita es el cableado, no un arbol falso.
+      `BRIDGE_DIR="${BRIDGE.replace(/\\/g, '/')}"`,
       'BOT_SCRIPT="$BRIDGE_DIR/bot.js"',
       `UNIT_DIR="${dir.replace(/\\/g, '/')}/unit"`,
       'UNIT_FILE="$UNIT_DIR/lagrange-telegram-bridge.service"',
-      `eval "$(sed -n '/^write_unit()/,/^}/p' "${path.join(BRIDGE, 'daemon.sh').replace(/\\/g, '/')}")"`,
-      // La segunda ruta es la del BINARIO, no el comando renombrado en v0.5.0.
-      // El guardia de nombres no puede distinguirlos, de ahi la marca.
-      'write_unit "/usr/bin/node" "/home/u/.local/bin/agy"', // old-name-ok
+      `DATA_DIR="${dir.replace(/\\/g, '/')}/data"`,
+      "C_INFO=''; C_OK=''; C_WARN=''; C_ERR=''; C_DIM=''; C_OFF=''",
+      // Se cargan las funciones REALES del script, no reimplementaciones.
+      `SCRIPT="${path.join(BRIDGE, 'daemon.sh').replace(/\\/g, '/')}"`,
+      `eval "$(sed -n '/^info()/,/^fail()/p' "$SCRIPT")"`,
+      `eval "$(sed -n '/^test_prerequisites()/,/^}/p' "$SCRIPT")"`,
+      `eval "$(sed -n '/^write_unit()/,/^}/p' "$SCRIPT")"`,
+      // Se ejercita el CABLEADO COMPLETO: test_prerequisites y luego
+      // write_unit con lo que aquella produzca. La primera version de este
+      // test llamaba a write_unit con argumentos limpios hechos a mano, asi
+      // que validaba la plantilla pero no como se obtienen sus argumentos —
+      // y el bug vivia justo ahi: test_prerequisites devolvia la ruta por
+      // stdout, el mismo canal por el que imprime ok/info/warn, de modo que
+      // ExecStart acababa con "[OK] Node v22..." dentro y systemd rechazaba
+      // la unidad. Un test que salta una costura no cubre esa costura.
+      'PREREQ_NODE_PATH=""',
+      'PREREQ_AGY_PATH=""',
+      'test_prerequisites >/dev/null 2>&1 || true',
+      'write_unit "$PREREQ_NODE_PATH" "$PREREQ_AGY_PATH"',
       'cat "$UNIT_FILE"'
     ].join('\n'));
 
@@ -125,12 +143,28 @@ async function main() {
 
       // El fallo mas probable del primer arranque en Linux: sin PATH explicito,
       // resolveAgyBin() no encuentra agy aunque funcione en la terminal.
-      check('fija un PATH explicito', /^Environment=PATH=/m.test(service), service.slice(0, 200));
-      check('el PATH incluye el directorio de node', /Environment=PATH=[^\n]*\/usr\/bin/.test(service));
-      check('el PATH incluye el directorio de agy detectado', /Environment=PATH=[^\n]*\/home\/u\/\.local\/bin/.test(service));
+      const lineaPath = (service.match(/^Environment=PATH=.*/m) || [''])[0];
+      const lineaExec = (service.match(/^ExecStart=.*/m) || [''])[0];
 
-      check('ExecStart usa rutas absolutas', /^ExecStart=\/usr\/bin\/node \/home\/u\/repo\/telegram-bridge\/bot\.js$/m.test(service));
-      check('WorkingDirectory apunta al bridge', /^WorkingDirectory=\/home\/u\/repo\/telegram-bridge$/m.test(service));
+      check('fija un PATH explicito', /^Environment=PATH=/m.test(service), service.slice(0, 200));
+      check('el PATH empieza por un directorio absoluto', /^Environment=PATH=\/[^:\n]+:/m.test(service), lineaPath);
+
+      // LA comprobacion que importa, y la que la version anterior de este test
+      // no podia hacer porque llamaba a write_unit con argumentos limpios:
+      // ExecStart tiene que ser exactamente dos rutas. Con el bug de stdout
+      // llevaba "[OK] Node v22.15.1" delante, y systemd rechazaba la unidad
+      // con "Executable name contains special characters".
+      const sinDiagnosticos = (s) => !/\[OK\]|\[bridge\]|\[!\]|\[ERROR\]|Node v/.test(s);
+      // Entrecomillado obligatorio: systemd separa argumentos por espacios, y un
+      // clon en "~/mis proyectos/..." partiria la ruta en dos.
+      check('ExecStart son exactamente dos rutas entrecomilladas',
+        /^ExecStart="[^"]+" "[^"]+"$/m.test(service), lineaExec);
+      check('ExecStart no lleva diagnosticos dentro', sinDiagnosticos(lineaExec), lineaExec);
+      check('el PATH no lleva diagnosticos dentro', sinDiagnosticos(lineaPath), lineaPath);
+      check('ExecStart apunta a bot.js', /^ExecStart="[^"]+" "[^"]*bot\.js"$/m.test(service), lineaExec);
+
+      check('WorkingDirectory va entrecomillado', /^WorkingDirectory="[^"]*telegram-bridge"$/m.test(service),
+        (service.match(/^WorkingDirectory=.*/m) || [''])[0]);
       check('reinicia solo ante fallo', /^Restart=on-failure$/m.test(service));
       check('la salida va al journal', /^StandardOutput=journal$/m.test(service));
       check('se instala en default.target', /WantedBy=default\.target/.test(unidad));
