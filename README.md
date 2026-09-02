@@ -32,23 +32,16 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 
 ## ⚡ Quick Start
 
-**1. Install** (one command):
-
-**Windows (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.ps1 | iex
-```
-
-**Linux / macOS (Bash):**
-```bash
-curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.sh | bash
-```
-
-**2. Reload plugins** in your Claude Code session:
+**1. Install** - two commands inside Claude Code, any platform:
 
 ```text
-/reload-plugins
+/plugin marketplace add KZvilla/claude-plugin-antigravity
+/plugin install antigravity@kzvilla-antigravity
 ```
+
+**2. Restart Claude Code.** `/reload-plugins` picks up commands, agents and
+skills, but the MCP tool schemas of a running session are the ones registered
+at startup - a restart is what makes `agy_run` and friends appear.
 
 **3. Try it:**
 
@@ -411,13 +404,40 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 | | `commands/agy-research.md` | `/agy-research <topic>` |
 | | `commands/agy-usage.md` | `/agy-usage` |
 | **Voice Chat** | `voice-chat/text_loop.py` / `voice_loop.py` | Real-Time Voice Mode companion scripts (console / real mic + VAD) |
-| **Installers** | `install.ps1` / `install.sh` | 1-command install for all platforms |
+| **Distribution** | `.claude-plugin/marketplace.json` | Marketplace manifest - the recommended install channel |
+| | `install.ps1` / `install.sh` | Script install, kept as a fallback |
 
 ---
 
 ## 🔧 Installation & Setup
 
-### Automated (1-Command)
+### Marketplace (recommended)
+
+Inside a Claude Code session:
+
+```text
+/plugin marketplace add KZvilla/claude-plugin-antigravity
+/plugin install antigravity@kzvilla-antigravity
+```
+
+Or from a terminal:
+
+```bash
+claude plugin marketplace add KZvilla/claude-plugin-antigravity
+claude plugin install antigravity@kzvilla-antigravity
+```
+
+This is the managed path: enable/disable, user vs. project scope, a visible
+version, and updates through `claude plugin marketplace update` instead of a
+`git reset --hard` over your working copy.
+
+### Scripts (fallback)
+
+Kept for environments where the marketplace is not an option. They clone into
+`~/.claude/skills/antigravity` and **overwrite local changes** on update.
+
+<details>
+<summary>Show the script install</summary>
 
 **Windows (PowerShell):**
 ```powershell
@@ -429,22 +449,33 @@ irm https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/ins
 curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.sh | bash
 ```
 
-### Manual Install
-
+**Manual clone:**
 ```bash
 git clone https://github.com/KZvilla/claude-plugin-antigravity.git "$HOME/.claude/skills/antigravity"
 ```
 
-### Post-Install
+</details>
 
-In an active Claude Code session:
-```text
-/reload-plugins
+### Migrating from a script install
+
+The two channels install to different places, so keeping both means Claude Code
+loads the plugin **twice** - duplicate commands, duplicate MCP tools. Remove the
+old clone before installing from the marketplace:
+
+```bash
+rm -rf "$HOME/.claude/skills/antigravity"      # PowerShell: Remove-Item -Recurse -Force "$env:USERPROFILE\.claude\skills\antigravity"
 ```
 
-Verify installation in your terminal:
+If you set up the Telegram bridge, **copy your `.env` out first** - it is
+git-ignored, so it only exists in that directory.
+
+### Post-Install
+
+Restart Claude Code, then verify from a terminal:
+
 ```bash
-claude plugin details antigravity@skills-dir
+claude plugin list
+claude plugin details antigravity@kzvilla-antigravity    # or antigravity@skills-dir for a script install
 ```
 
 ### 🔐 Telegram Bridge Setup (Manual — Never Automated)
@@ -459,9 +490,28 @@ The Telegram tools (`telegram_notify`, `telegram_ask`, `telegram_send_voice`, an
    ```
    (edit `TELEGRAM_BOT_TOKEN` and `ALLOWED_USER_IDS` in the new `.env`)
 
-**Important if you installed via the script above:** `.env` is git-ignored on purpose, so it is never cloned or copied into `~/.claude/skills/antigravity` (or wherever `install.ps1`/`install.sh` placed the plugin) — the installer only fetches what's tracked in git. Create `.env` directly at the **installed** plugin root (`~/.claude/skills/antigravity/.env`), not just in a separate local dev checkout, or outbound Telegram delivery will silently look unconfigured from the live plugin even though it works fine in a manual test run elsewhere.
+#### Where the `.env` has to live
 
-The bidirectional bot (`telegram-bridge/bot.js`, started with `npm run start` inside `telegram-bridge/`) is only needed if you want to message the bot *from* your phone to kick off `agy` tasks or answer `telegram_ask` prompts — outbound notifications and voice notes work without it.
+`.env` is git-ignored on purpose, so no install channel ever brings it along — only tracked files are fetched. It has to sit at the **plugin root of the copy that actually runs**, and where that is depends on how you installed:
+
+| Install channel | Put `.env` at | Survives an update? |
+|---|---|---|
+| Script (`install.ps1` / `install.sh`) | `~/.claude/skills/antigravity/.env` | Yes — the clone is stable, and `.env` is ignored by the `git reset --hard` |
+| Marketplace | `~/.claude/plugins/cache/kzvilla-antigravity/antigravity/<version>/.env` | **No** — the path is versioned, so a new version means a new empty directory |
+| Git clone (development) | `<clone>/.env` | Yes |
+
+A `.env` in a separate dev checkout does nothing for the installed plugin: outbound Telegram delivery will look unconfigured from the live plugin even though a manual test run elsewhere works fine.
+
+Because of the second row, **if you use the Telegram bridge, run it from a git clone**, not from the marketplace cache. The marketplace channel is the right one for the plugin itself (commands, agents, MCP tools); the bridge is a long-running daemon with its own credentials and state, and it wants a stable directory:
+
+```bash
+git clone https://github.com/KZvilla/claude-plugin-antigravity.git
+cd claude-plugin-antigravity
+cp telegram-bridge/.env.example .env    # then fill in the two values
+npm run bridge
+```
+
+The bidirectional bot (`telegram-bridge/bot.js`, started with `npm run bridge` from the repo root) is only needed if you want to message the bot *from* your phone to kick off `agy` tasks or answer `telegram_ask` prompts — outbound notifications and voice notes work without it. To keep it running across logins, see `telegram-bridge/daemon.ps1` (`npm run bridge:daemon:install` on Windows).
 
 ---
 
