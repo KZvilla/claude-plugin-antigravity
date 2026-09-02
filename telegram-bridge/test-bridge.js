@@ -283,6 +283,34 @@ assert.strictEqual(finalProgressLabel({ success: true }), '✅ Completado en');
 assert.strictEqual(finalProgressLabel({ success: false }), '⚠️ Terminado con error tras');
 console.log('✔ Test 18: finalProgressLabel distingue cancelación de error');
 
+// Test 19: el enfasis que envuelve codigo en linea. Se procesaban los tramos a
+// ambos lados del codigo por separado, asi que cada asterisco de
+// *negrita con `codigo` dentro* caia en un tramo distinto, no casaba ninguno y
+// los asteriscos llegaban literales al mensaje.
+assert.strictEqual(
+  markdownToTelegramHtml('*17 commits en `main`, release `v0.4.0` publicada.*'),
+  '<b>17 commits en <code>main</code>, release <code>v0.4.0</code> publicada.</b>',
+  'La negrita debe abarcar el codigo en linea'
+);
+assert.strictEqual(
+  markdownToTelegramHtml('_cursiva con `code` dentro_'),
+  '<i>cursiva con <code>code</code> dentro</i>',
+  'Lo mismo para la cursiva'
+);
+// El centinela interno no debe poder inyectarse desde el texto del usuario.
+assert.strictEqual(
+  markdownToTelegramHtml('\u00000\u0000 y `x`'),
+  '0 y <code>x</code>',
+  'Un centinela escrito por el usuario se descarta'
+);
+assert.strictEqual(
+  markdownToTelegramHtml('`<script>alert(1)</script>`'),
+  '<code>&lt;script&gt;alert(1)&lt;/script&gt;</code>',
+  'El codigo en linea se sigue escapando'
+);
+console.log('✔ Test 19: el enfasis abarca el codigo en linea');
+
+
 // Test 16: la cola guarda la MISMA referencia, no una copia. De eso depende que
 // dispatchTask pueda anotar el statusMessageId después de encolar.
 const tareaViva = { ctx, chatId: testChatId, prompt: 'p', mode: 'plan', statusMessageId: null };

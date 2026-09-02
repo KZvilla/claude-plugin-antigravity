@@ -47,19 +47,20 @@ function emphasisToHtml(escaped) {
  * contenido no debe reinterpretarse), luego el énfasis.
  */
 function inlineToHtml(segment) {
-  const out = [];
-  const codeRe = /`([^`\n]+)`/g;
-  let last = 0;
-  let m;
+  // El código en línea se aparta tras un centinela ANTES de aplicar el énfasis.
+  // Procesar los tramos por separado dejaba cada asterisco de
+  // *negrita con `código` dentro* en un tramo distinto, así que no casaba
+  // ninguno y los asteriscos llegaban literales al mensaje.
+  const codigos = [];
+  const conCentinelas = segment
+    .replace(/\u0000/g, '')
+    .replace(/`([^`\n]+)`/g, (_, codigo) => {
+      codigos.push(codigo);
+      return `\u0000${codigos.length - 1}\u0000`;
+    });
 
-  while ((m = codeRe.exec(segment)) !== null) {
-    out.push(emphasisToHtml(escapeHtml(segment.slice(last, m.index))));
-    out.push(`<code>${escapeHtml(m[1])}</code>`);
-    last = codeRe.lastIndex;
-  }
-  out.push(emphasisToHtml(escapeHtml(segment.slice(last))));
-
-  return out.join('');
+  return emphasisToHtml(escapeHtml(conCentinelas))
+    .replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${escapeHtml(codigos[Number(i)])}</code>`);
 }
 
 /**

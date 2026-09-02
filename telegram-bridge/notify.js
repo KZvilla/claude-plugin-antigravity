@@ -10,7 +10,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerPendingAsk, getPendingAsk, expirePendingAsk } from './state.js';
-import { splitMessage, markdownToTelegramHtml } from './formatter.js';
+import { splitMessage, markdownToTelegramHtml, escapeHtml } from './formatter.js';
+
+// Límite propio del caption de Telegram, muy por debajo de los 4096 del texto.
+const CAPTION_LIMIT = 1024;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -170,10 +173,25 @@ export async function sendTelegramNotification(options = {}) {
 
   // Si se adjunta un archivo, enviarlo como documento con caption
   if (filePath && fs.existsSync(filePath)) {
-    // El caption tiene su propio límite de 1024 y no se trocea.
+    const html = markdownToTelegramHtml(formattedText);
+
+    // El caption no se trocea y tiene su propio límite. Antes se recortaba con
+    // slice(1024): el mensaje llegaba mudo a media frase, sin ninguna señal de
+    // que faltaba texto, y el corte podía caer dentro de una etiqueta y dejar
+    // HTML inválido. Si no cabe, el texto va como mensaje aparte — troceado y
+    // completo — y el documento se manda detrás con un caption mínimo.
+    if (html.length > CAPTION_LIMIT) {
+      await sendChunkedMessage(chatId, formattedText);
+      return await telegramUploadCall('sendDocument', 'document', filePath, {
+        chat_id: chatId,
+        caption: `📎 ${escapeHtml(path.basename(filePath))}`,
+        parse_mode: 'HTML'
+      });
+    }
+
     return await telegramUploadCall('sendDocument', 'document', filePath, {
       chat_id: chatId,
-      caption: markdownToTelegramHtml(formattedText).slice(0, 1024),
+      caption: html,
       parse_mode: 'HTML'
     });
   }
