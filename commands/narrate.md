@@ -1,5 +1,5 @@
 ---
-description: Narrate a spoken voice summary of the latest completed checkpoint or task via Voicebox Text-To-Speech (zero Claude tokens)
+description: Speak a summary of the latest checkpoint out loud via Voicebox TTS
 argument-hint: ["emily" | "diego" | "<voice-name>" | "personality"]
 ---
 
@@ -20,7 +20,7 @@ Instructions:
      * Otherwise -> default to `personality: false` (clean professional tone).
 2. Call the `mcp__antigravity__agy_narrate` tool with `local_playback: true`.
    The tool's own default is `false` (silent generation for background/agentic use), but someone
-   typing `/agy-narrate` is asking to *hear* it, so this command always plays it aloud.
+   typing `/antigravity:narrate` is asking to *hear* it, so this command always plays it aloud.
    Pass `local_playback: false` only if the user explicitly asks to keep the PC silent
    (e.g. "mandámelo solo al teléfono", "sin sonido acá").
 3. The plugin will automatically:

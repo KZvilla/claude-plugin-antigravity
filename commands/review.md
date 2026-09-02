@@ -1,5 +1,5 @@
 ---
-description: Ask Antigravity to perform an adversarial code review of recent changes or diffs
+description: Adversarial code review of a diff, a commit range, or specific files
 argument-hint: [optional review target, default: git diff]
 ---
 

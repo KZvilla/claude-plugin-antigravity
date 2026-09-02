@@ -1,5 +1,5 @@
 ---
-description: Generate a structured summary of the current or recent Claude Code session via Antigravity (Gemini)
+description: Structured summary of this Claude Code session, from its raw JSONL log
 argument-hint: [session_id | "decisions" | "changes" | "debugging"]
 ---
 

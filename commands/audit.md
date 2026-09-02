@@ -1,5 +1,5 @@
 ---
-description: Run a skeptical adversarial audit via Antigravity (heavyweight, evidence-based, structured verdicts)
+description: Heavyweight evidence-based audit — code against its plan, or a plan against the repo
 argument-hint: [target to audit, e.g. "git diff HEAD~3" or a plan/spec text]
 ---
 

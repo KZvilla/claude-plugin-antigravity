@@ -1,5 +1,5 @@
 ---
-description: Show token usage, context saturation, and model limits for Antigravity subagent sessions
+description: Token usage, context saturation, and quota health for Antigravity sessions
 argument-hint: [reset]
 ---
 

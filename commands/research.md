@@ -1,5 +1,5 @@
 ---
-description: Delegate deep web research to Antigravity with citations and structured findings
+description: Deep web research via Antigravity, with citations and structured findings
 argument-hint: <research topic or question>
 ---
 

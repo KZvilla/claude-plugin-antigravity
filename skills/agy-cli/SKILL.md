@@ -1,6 +1,6 @@
 ---
-name: antigravity
-description: Use this skill when delegating tasks to Google Antigravity CLI (agy), running Antigravity as an autonomous subagent, requesting architectural planning with Gemini reasoning, performing second-opinion code reviews, configuring ALLOW/DENY permissions, generating structured session summaries, delegating deep web research, or when the user mentions "ask agy", "run in agy", "delegate to agy", "antigravity plan", or "cross-check with agy".
+name: agy-cli
+description: '[skill, loads itself] Reference for working with the Antigravity CLI. Use this skill when delegating tasks to Google Antigravity CLI (agy), running Antigravity as an autonomous subagent, requesting architectural planning with Gemini reasoning, performing second-opinion code reviews, configuring ALLOW/DENY permissions, generating structured session summaries, delegating deep web research, or when the user mentions "ask agy", "run in agy", "delegate to agy", "antigravity plan", or "cross-check with agy".'
 metadata:
   version: 0.3.0
 ---
@@ -26,7 +26,7 @@ Delegate tasks to Antigravity when:
 4. **Rigorous Audit with a Blocking Verdict**: When a plain review is not strict enough — verifying an implementation against the plan it was supposed to follow, or a proposed plan against the real codebase (`agy_audit`).
 5. **Second Opinion on Tricky Bugs**: When troubleshooting a puzzling bug or flaky test, delegate an investigation to Antigravity with a fresh perspective.
 6. **Session Documentation & Anti-Compaction**: When the conversation gets long or at the end of a session, generate a structured markdown summary (`agy_session_summary`).
-7. **Deep Web Research**: When comprehensive live information with cited sources is required (`agy_research`, or `/agy-research`).
+7. **Deep Web Research**: When comprehensive live information with cited sources is required (`agy_research`, or `/antigravity:research`).
 8. **Spoken Status Updates**: When the user wants to *hear* what happened instead of reading it, or asks which voices are installed (`agy_narrate`, `agy_narrate_voices`).
 9. **Real-Time Voice Conversation**: Backing a live spoken session ("Modo Charla") with a persistent, streaming `agy` process (`agy_voice_stream`). Normally driven by the `voice-chat/` scripts, not called by hand.
 10. **Mobile Notifications & Approvals**: Pushing a notification, asking a blocking question, or sending a voice note to the user's phone (`telegram_notify`, `telegram_ask`, `telegram_send_voice`).

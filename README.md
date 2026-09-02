@@ -20,12 +20,12 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Installation](#-installation--setup)
 - [Slash Commands](#-slash-commands)
 - [MCP Tools Reference](#-mcp-tools-reference)
-- [Voice Checkpoint Narration](#-voice-checkpoint-narration-agy-narrate)
+- [Voice Checkpoint Narration](#-voice-checkpoint-narration-antigravitynarrate)
 - [Real-Time Voice Mode (`voice-chat/`)](#-real-time-voice-mode-voice-chat)
-- [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-agy-summary)
+- [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-antigravitysummary)
 - [Permissions (ALLOW / DENY)](#-granular-permissions-system-allow--deny)
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
-- [Telemetry (`/agy-usage`)](#-telemetry--usage-tracking-agy-usage)
+- [Telemetry (`/antigravity:usage`)](#-telemetry--usage-tracking-antigravityusage)
 - [Components](#-components)
 
 ---
@@ -46,27 +46,27 @@ at startup - a restart is what makes `agy_run` and friends appear.
 **3. Try it:**
 
 ```text
-/agy Analiza este proyecto y describí la arquitectura
+/antigravity:run Analiza este proyecto y describí la arquitectura
 ```
 
 ```text
-/agy-review
+/antigravity:review
 ```
 
 ```text
-/agy-summary
+/antigravity:summary
 ```
 
 ```text
-/agy-narrate
+/antigravity:narrate
 ```
 
 ```text
-/agy-research "Latest patterns for Claude Code plugins in 2026"
+/antigravity:research "Latest patterns for Claude Code plugins in 2026"
 ```
 
 ```text
-/agy-usage
+/antigravity:usage
 ```
 
 ---
@@ -105,15 +105,15 @@ at startup - a restart is what makes `agy_run` and friends appear.
 
 | Command | Description |
 |---------|-------------|
-| `/agy <prompt>` | Delegate any task to Antigravity (read + write) |
-| `/agy-plan <task>` | Generate an architectural plan (read-only, no file changes) |
-| `/agy-review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
-| `/agy-audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
-| `/agy-summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
-| `/agy-narrate [voice/lang]` | Narrate spoken voice summary of the latest task/checkpoint via Voicebox TTS (`emily`, `diego`, `es`, `en`) |
-| `/agy-narrate-voices [lang]` | List all installed Voicebox voice profiles, languages, roles, and service health |
-| `/agy-research <topic>` | Conduct deep web research with cited sources and structured insights |
-| `/agy-usage` | Display token telemetry, context saturation, and quota health |
+| `/antigravity:run <prompt>` | Delegate any task to Antigravity (read + write) |
+| `/antigravity:plan <task>` | Generate an architectural plan (read-only, no file changes) |
+| `/antigravity:review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
+| `/antigravity:audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
+| `/antigravity:summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
+| `/antigravity:narrate [voice/lang]` | Narrate spoken voice summary of the latest task/checkpoint via Voicebox TTS (`emily`, `diego`, `es`, `en`) |
+| `/antigravity:voices [lang]` | List all installed Voicebox voice profiles, languages, roles, and service health |
+| `/antigravity:research <topic>` | Conduct deep web research with cited sources and structured insights |
+| `/antigravity:usage` | Display token telemetry, context saturation, and quota health |
 
 > **Tip:** You can also ask Claude naturally — *"Delegale a agy que resuma esta sesión"*, *"¿Qué voces tengo disponibles?"* o *"Cuando termines, ejecuta la narración con Diego"* — and it will pick the right tool automatically.
 
@@ -243,18 +243,18 @@ export AGY_TIMEOUT_MINUTES="20"
 
 ---
 
-## 📊 Telemetry & Usage Tracking (`/agy-usage`)
+## 📊 Telemetry & Usage Tracking (`/antigravity:usage`)
 
 Antigravity automatically tracks token consumption, context caching efficiency, and context window saturation across all subagent calls.
 
 ```text
-/agy-usage
+/antigravity:usage
 ```
 
 To reset session counters:
 
 ```text
-/agy-usage reset
+/antigravity:usage reset
 ```
 
 ### Metrics Reported
@@ -268,50 +268,50 @@ To reset session counters:
 
 ---
 
-## 📋 Session Summary & Anti-Compaction (`/agy-summary`)
+## 📋 Session Summary & Anti-Compaction (`/antigravity:summary`)
 
 Claude Code's automatic context compaction can be lossy — intermediate decisions, edge cases, and reasoning get dropped as sessions grow. 
 
 Antigravity solves this by reading the raw session JSONL log from `~/.claude/projects/`, pre-processing and stripping noise in Node.js, and feeding the structured transcript to **Gemini's 1M-2M token context window** to generate a persistent Markdown summary with YAML frontmatter.
 
 ```text
-/agy-summary
+/antigravity:summary
 ```
 
 You can also target specific areas:
-- `/agy-summary decisions` — focus on architectural rationale and choices
-- `/agy-summary changes` — focus on modified files and code diffs
-- `/agy-summary debugging` — focus on errors, root causes, and fixes
+- `/antigravity:summary decisions` — focus on architectural rationale and choices
+- `/antigravity:summary changes` — focus on modified files and code diffs
+- `/antigravity:summary debugging` — focus on errors, root causes, and fixes
 
 Summaries are automatically saved to `~/.claude/session-summaries/<YYYY-MM-DD>-<session-id>.md`.
 
 ---
 
-## 🎙️ Voice Checkpoint Narration (`/agy-narrate`)
+## 🎙️ Voice Checkpoint Narration (`/antigravity:narrate`)
 
 Narrate a spoken audio status update upon completing a task or checkpoint via **Voicebox Text-To-Speech (TTS)**.
 
 ### Zero-Claude-Token Architecture
 Claude **does not** generate or summarize the text in its context window. Instead:
-1. Claude simply invokes `/agy-narrate` (or the `agy_narrate` tool).
+1. Claude simply invokes `/antigravity:narrate` (or the `agy_narrate` tool).
 2. The plugin locates Claude Code's session log (`.jsonl`), extracts the latest task checkpoint (user goal, modified files, and final test execution status).
 3. The plugin invokes Gemini CLI (`agy`) with `--effort low` to draft a concise 2-3 sentence conversational spoken script in ~1-2 seconds (using Gemini quota, **0 Claude tokens**).
 4. The plugin sends the text to Voicebox HTTP (`POST /generate`), which synthesizes a `.wav` silently, and then plays that file with the native OS audio player. (It deliberately avoids `POST /speak` — letting Voicebox do its own playback triggers a double-playback bug.)
 
-Running `/agy-narrate` plays the result on your speakers. When `agy_narrate` is called programmatically, local playback is off by default (`local_playback: false`) so background narration doesn't startle anyone — it still reaches your phone if the Telegram bridge is configured.
+Running `/antigravity:narrate` plays the result on your speakers. When `agy_narrate` is called programmatically, local playback is off by default (`local_playback: false`) so background narration doesn't startle anyone — it still reaches your phone if the Telegram bridge is configured.
 
 ### Usage
 
 ```text
-/agy-narrate
+/antigravity:narrate
 ```
 
 With specific voice or language preference:
 ```text
-/agy-narrate emily       # English narration with Emily voice
-/agy-narrate diego       # Spanish narration with Diego Alvarez voice
-/agy-narrate en          # English narration (defaults to Emily)
-/agy-narrate es          # Spanish narration (defaults to Diego Alvarez)
+/antigravity:narrate emily       # English narration with Emily voice
+/antigravity:narrate diego       # Spanish narration with Diego Alvarez voice
+/antigravity:narrate en          # English narration (defaults to Emily)
+/antigravity:narrate es          # Spanish narration (defaults to Diego Alvarez)
 ```
 
 Or ask Claude conversationally:
@@ -337,7 +337,7 @@ La naturalidad y el estilo de la narración en personaje se adaptan automáticam
 - **`description`**: Describe la identidad, acento o tono (ej: *"Comediante uruguayo de internet con voz rasposa"* o *"Locutor profesional español"*).
 - **`personality`**: Define modismos, actitud y muletillas (ej: *"Humor bizarro e irreverente, usa modismos como '¡Sapeee!', 'más bien loquita', festejando con euforia si los tests pasaron"*).
 
-Gemini (`agy`) lee estos campos dinámicamente en tiempo real desde la API de Voicebox. Al activar el modo personaje (con `/agy-narrate <voz> personality` o pidiéndoselo a Claude), el guión adoptará ese personaje manteniendo siempre la veracidad técnica sobre los archivos y tests del proyecto.
+Gemini (`agy`) lee estos campos dinámicamente en tiempo real desde la API de Voicebox. Al activar el modo personaje (con `/antigravity:narrate <voz> personality` o pidiéndoselo a Claude), el guión adoptará ese personaje manteniendo siempre la veracidad técnica sobre los archivos y tests del proyecto.
 
 ---
 
@@ -362,12 +362,12 @@ Run either script with `--help` for the full flag list (TTS engine/model overrid
 
 ---
 
-## 🌐 Deep Web Research (`/agy-research`)
+## 🌐 Deep Web Research (`/antigravity:research`)
 
 Delegate deep web research and live doc searches directly to Antigravity, which leverages Gemini's native search tools and Vertex AI:
 
 ```text
-/agy-research "Best practices for Claude Code hooks and lifecycle events 2026"
+/antigravity:research "Best practices for Claude Code hooks and lifecycle events 2026"
 ```
 
 Returns a structured report with an Executive Summary, Key Findings, Cited Source URLs, and direct relevance to your current project.
@@ -391,18 +391,18 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 | **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (15 tools) |
 | | `mcp-server/lib/sentence-chunker.js` | Groups streamed `text_delta` fragments into complete sentences for TTS |
 | **Subagent** | `agents/antigravity.md` | Autonomous subagent definition (`antigravity:Antigravity`) |
-| **Skills** | `skills/antigravity/SKILL.md` | Context-aware delegation guidelines |
+| **Skills** | `skills/agy-cli/SKILL.md` | Context-aware delegation guidelines |
 | | `skills/adversarial-review/SKILL.md` | Skeptical, evidence-based audit guidelines |
 | | `skills/session-summary/SKILL.md` | Session summary & anti-compaction skill |
-| **Commands** | `commands/agy.md` | `/agy <prompt>` |
-| | `commands/agy-plan.md` | `/agy-plan <task>` |
-| | `commands/agy-review.md` | `/agy-review [target]` |
-| | `commands/agy-audit.md` | `/agy-audit [target]` |
-| | `commands/agy-summary.md` | `/agy-summary [focus]` |
-| | `commands/agy-narrate.md` | `/agy-narrate [voice/lang]` |
-| | `commands/agy-narrate-voices.md` | `/agy-narrate-voices [lang]` |
-| | `commands/agy-research.md` | `/agy-research <topic>` |
-| | `commands/agy-usage.md` | `/agy-usage` |
+| **Commands** | `commands/run.md` | `/antigravity:run <prompt>` |
+| | `commands/plan.md` | `/antigravity:plan <task>` |
+| | `commands/review.md` | `/antigravity:review [target]` |
+| | `commands/audit.md` | `/antigravity:audit [target]` |
+| | `commands/summary.md` | `/antigravity:summary [focus]` |
+| | `commands/narrate.md` | `/antigravity:narrate [voice/lang]` |
+| | `commands/voices.md` | `/antigravity:voices [lang]` |
+| | `commands/research.md` | `/antigravity:research <topic>` |
+| | `commands/usage.md` | `/antigravity:usage` |
 | **Voice Chat** | `voice-chat/text_loop.py` / `voice_loop.py` | Real-Time Voice Mode companion scripts (console / real mic + VAD) |
 | **Distribution** | `.claude-plugin/marketplace.json` | Marketplace manifest - the recommended install channel |
 | | `scripts/stamp-release.mjs` | Pins the marketplace entry to the release tag's commit sha (`npm run release:stamp`) |

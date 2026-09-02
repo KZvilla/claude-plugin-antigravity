@@ -1,6 +1,6 @@
 ---
 name: session-summary
-description: Use this skill when the user wants to create a session summary, document what was done in a session, preserve context before compaction, generate a handoff document, or mentions "summarize session", "session summary", "what did we do", "document this session", or "save session notes".
+description: '[skill, loads itself] Background knowledge for session summaries; /antigravity:summary is the explicit trigger. Use this skill when the user wants to create a session summary, document what was done in a session, preserve context before compaction, generate a handoff document, or mentions "summarize session", "session summary", "what did we do", "document this session", or "save session notes".'
 metadata:
   version: 0.3.0
 ---
@@ -30,19 +30,19 @@ Claude Code's context window compaction is lossy — it discards details, interm
 
 ### Basic (summarize current session)
 ```
-/agy-summary
+/antigravity:summary
 ```
 
 ### With focus area
 ```
-/agy-summary decisions    → emphasizes architectural/design choices
-/agy-summary changes      → emphasizes files modified
-/agy-summary debugging    → emphasizes problems and resolutions
+/antigravity:summary decisions    → emphasizes architectural/design choices
+/antigravity:summary changes      → emphasizes files modified
+/antigravity:summary debugging    → emphasizes problems and resolutions
 ```
 
 ### Specific session by ID
 ```
-/agy-summary 057c77fc-17d4-4ada-86c4-b9f40f2f4d93
+/antigravity:summary 057c77fc-17d4-4ada-86c4-b9f40f2f4d93
 ```
 
 ### Programmatic via MCP tool
@@ -77,7 +77,7 @@ claude_version: "2.1.241"
 
 If you detect that the user's session has been long and productive (many tool calls, multiple files modified), consider suggesting:
 
-> "This has been a productive session. Want me to generate a summary before we wrap up? Run `/agy-summary` to save a structured record."
+> "This has been a productive session. Want me to generate a summary before we wrap up? Run `/antigravity:summary` to save a structured record."
 
 ## Size Handling
 

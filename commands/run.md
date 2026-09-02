@@ -1,5 +1,5 @@
 ---
-description: Run an autonomous subagent task in Google Antigravity CLI (agy)
+description: Delegate any task to Antigravity (agy) — it reads and writes files
 argument-hint: <task or prompt>
 ---
 

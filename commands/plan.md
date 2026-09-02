@@ -1,5 +1,5 @@
 ---
-description: Ask Antigravity to analyze the codebase and generate an architectural implementation plan
+description: Architectural implementation plan from Antigravity — read-only, changes nothing
 argument-hint: <feature or refactoring task>
 ---
 

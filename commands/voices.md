@@ -1,5 +1,5 @@
 ---
-description: List all installed Voicebox voice profiles and their role assignments (defaults and fallbacks)
+description: List the installed Voicebox voice profiles, languages, and role assignments
 argument-hint: ["all" | "es" | "en"]
 ---
 
@@ -15,4 +15,4 @@ Instructions:
    - If omitted or "all" -> pass `language: "all"`
 2. Call the `mcp__antigravity__agy_narrate_voices` tool.
 3. Present the returned markdown table and Voicebox service status to the user.
-4. Explain how to invoke any of the listed voices using `/agy-narrate <name>` or natural prompt.
+4. Explain how to invoke any of the listed voices using `/antigravity:narrate <name>` or natural prompt.
