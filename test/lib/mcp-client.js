@@ -3,6 +3,7 @@
  * No dependencies, matching the server itself.
  */
 const { spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
@@ -78,8 +79,30 @@ function startServer({ serverJs, cwd, captureFile } = {}) {
     }),
     listTools: () => request('tools/list', {}),
     callTool: (name, args) => request('tools/call', { name, arguments: args }),
-    stop: () => child.kill()
+    // Awaits the real exit. `child.kill()` only sends the signal, and on
+    // Windows the process keeps a handle on its cwd until it is actually gone
+    // — which is the fixture directory the caller is about to delete.
+    stop: () => new Promise(resolve => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve();
+      const done = () => resolve();
+      child.once('exit', done);
+      child.kill();
+      setTimeout(() => { child.removeListener('exit', done); resolve(); }, 2000).unref();
+    })
   };
 }
 
-module.exports = { startServer, REPO_ROOT };
+/**
+ * Deletes a fixture directory, tolerating Windows handle-release lag.
+ *
+ * Regression context: research.test.js failed roughly one run in three with
+ * `EBUSY: resource busy or locked, rmdir` — every assertion green, only the
+ * cleanup throwing, so the suite exited non-zero for no real reason. Awaiting
+ * the server's exit fixes the common case; the retries cover the rest, since
+ * the OS can hold a directory handle briefly after the process is gone.
+ */
+function removeFixture(dir) {
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+}
+
+module.exports = { startServer, removeFixture, REPO_ROOT };

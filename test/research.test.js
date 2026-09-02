@@ -9,7 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { startServer } = require('./lib/mcp-client');
+const { startServer, removeFixture } = require('./lib/mcp-client');
 const { check, group, report } = require('./lib/assert');
 
 function makeFixture(permissions) {
@@ -57,7 +57,7 @@ async function main() {
     check('prompt requests a Sources section', prompt.includes('## Sources'));
   });
 
-  server.stop();
+  await server.stop();
 
   // --- Denied network -----------------------------------------------------
   const deniedFixture = makeFixture({ allow: ['read'], deny: ['network'] });
@@ -68,7 +68,7 @@ async function main() {
   await denied.initialize();
   const res = await denied.callTool('agy_research', { topic: 'anything', cwd: deniedFixture });
   const deniedCalls = fs.readFileSync(deniedCapture, 'utf8').trim().split('\n').filter(Boolean);
-  denied.stop();
+  await denied.stop();
 
   const text = res.result.content[0].text;
 
@@ -92,15 +92,15 @@ async function main() {
     permissions: { allow: ['read', 'network'], deny: [] }
   });
   const overrideCalls = fs.readFileSync(overrideCapture, 'utf8').trim().split('\n').filter(Boolean);
-  override.stop();
+  await override.stop();
 
   await group('Per-call override can re-enable network', () => {
     check('not an error', !overridden.result.isError);
     check('agy was invoked', overrideCalls.length === 1);
   });
 
-  fs.rmSync(listFixture, { recursive: true, force: true });
-  fs.rmSync(deniedFixture, { recursive: true, force: true });
+  removeFixture(listFixture);
+  removeFixture(deniedFixture);
   return report();
 }
 

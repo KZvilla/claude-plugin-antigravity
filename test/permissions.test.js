@@ -17,7 +17,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { startServer } = require('./lib/mcp-client');
+const { startServer, removeFixture } = require('./lib/mcp-client');
 const { check, group, report } = require('./lib/assert');
 
 const RESTRICTIVE_POLICY = {
@@ -68,7 +68,7 @@ async function main() {
   // that moved the logic into shared helpers.
   await server.callTool('agy_run', { prompt: 'Do the thing', cwd: fixture });
 
-  server.stop();
+  await server.stop();
 
   const calls = fs.readFileSync(capture, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
   const names = [...READONLY_TOOLS.map(t => t[0]), 'agy_run'];
@@ -93,7 +93,7 @@ async function main() {
     });
   });
 
-  fs.rmSync(fixture, { recursive: true, force: true });
+  removeFixture(fixture);
   return report();
 }
 
