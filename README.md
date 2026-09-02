@@ -1,6 +1,6 @@
 # Antigravity Claude Code Plugin
 
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/github/package-json/v/KZvilla/claude-plugin-antigravity?color=blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-green)
 ![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
@@ -94,7 +94,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 
 | Requirement | Details |
 |-------------|---------|
-| **Node.js** | ≥ 18 (used to run the MCP server) |
+| **Node.js** | **≥ 20.12** for the Telegram bridge (it loads `.env` with `process.loadEnvFile`); ≥ 18 is enough if you only use the `agy_*` MCP tools |
 | **Antigravity CLI** | `agy` or `agy.exe` installed and on your `PATH` ([Install guide](https://antigravity.google/cli)) |
 | **Claude Code** | Active Claude Code terminal session |
 | **Google API Key** | Configured for Antigravity (`GEMINI_API_KEY` or `agy auth login`) |

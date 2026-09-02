@@ -1,8 +1,6 @@
 ---
 name: agy-cli
 description: '[skill, loads itself] Reference for working with the Antigravity CLI. Use this skill when delegating tasks to Google Antigravity CLI (agy), running Antigravity as an autonomous subagent, requesting architectural planning with Gemini reasoning, performing second-opinion code reviews, configuring ALLOW/DENY permissions, generating structured session summaries, delegating deep web research, or when the user mentions "ask agy", "run in agy", "delegate to agy", "antigravity plan", or "cross-check with agy".'
-metadata:
-  version: 0.3.0
 ---
 
 # Antigravity Subagent Skill

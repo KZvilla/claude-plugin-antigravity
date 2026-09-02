@@ -1,8 +1,6 @@
 ---
 name: session-summary
 description: '[skill, loads itself] Background knowledge for session summaries; /lagrange:summary is the explicit trigger. Use this skill when the user wants to create a session summary, document what was done in a session, preserve context before compaction, generate a handoff document, or mentions "summarize session", "session summary", "what did we do", "document this session", or "save session notes".'
-metadata:
-  version: 0.3.0
 ---
 
 # Session Summary Skill
