@@ -20,7 +20,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/KZvilla/claude-plugin-antigravity.git",
-        "sha": "b21e13070d18c093273e87a9c694f3649e2d20da"
+        "sha": "be21f1f25aadef79ddec9dd06729a4a265a78b53"
       },
       "description": "Delegate to Google Antigravity CLI (agy) as an autonomous subagent: planning, adversarial review, evidence-based audits, cited web research and session summaries. Optional voice narration (local Voicebox) and push notifications to your own Telegram bot, both inactive until you add credentials. Unofficial; not affiliated with Google.",
       "category": "development",
