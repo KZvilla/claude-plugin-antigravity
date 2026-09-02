@@ -755,7 +755,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for summarization (e.g. "gemini-3.1-pro" for very large sessions). Falls back to configured default.'
+          description: 'Model override for summarization. Leave unset and the tool picks: the configured default for logs up to 1MB, and "gemini-3.1-pro" above that, since flash loses the thread on very long transcripts. Setting this always wins, and the chosen model is reported in the output.'
         },
         effort: {
           type: 'string',
@@ -1910,6 +1910,48 @@ function validarModeloEsfuerzo(cliArgs) {
   return null;
 }
 
+// Por encima de este tamano de log, Flash deja de sostener la transcripcion
+// entera y empieza a rellenar huecos. Es el umbral que ya publicaban
+// commands/summary.md y el skill de resumenes.
+const RESUMEN_UMBRAL_PRO = 1024 * 1024;
+const MODELO_RESUMEN_LARGO = 'gemini-3.1-pro';
+
+function elegirModeloResumen(args, config, fileSize) {
+  // Peticion explicita: no se toca, ni el modelo ni el esfuerzo.
+  if (args.model) {
+    return {
+      model: args.model,
+      effort: args.effort || config.defaultEffort || 'high',
+      nota: null
+    };
+  }
+
+  const porDefecto = config.defaultModel;
+  if (fileSize <= RESUMEN_UMBRAL_PRO) {
+    return {
+      model: porDefecto,
+      effort: args.effort || config.defaultEffort || 'high',
+      nota: null
+    };
+  }
+
+  // La familia Pro solo existe en low y high (`agy models`), asi que un
+  // `medium` heredado de la configuracion haria fallar la llamada. Se sube a
+  // high y se dice: coercionar en silencio seria peor que el fallo.
+  const pedido = args.effort || config.defaultEffort || 'high';
+  const effort = pedido === 'medium' ? 'high' : pedido;
+
+  const mb = (fileSize / 1024 / 1024).toFixed(1);
+  let nota = `Log de ${mb} MB, por encima del umbral de 1 MB: se usa \`${MODELO_RESUMEN_LARGO}\``
+    + ` en vez de \`${porDefecto || 'el modelo por defecto de agy'}\`.`;
+  if (effort !== pedido) {
+    nota += ` El esfuerzo sube de \`${pedido}\` a \`high\`: la familia Pro no admite \`medium\`.`;
+  }
+  nota += ' Pasa `model` explicitamente para forzar otro.';
+
+  return { model: MODELO_RESUMEN_LARGO, effort, nota };
+}
+
 function executeAgy(args, options = {}) {
   const timeoutMinutes = options.timeoutMinutes || 15;
   const timeoutMs = (timeoutMinutes + 1) * 60 * 1000;
@@ -2970,8 +3012,17 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       const fullPrompt = `${summarySystemPrompt}\n\n---\n\n## Session Metadata\n- Project: ${processed.sessionMeta.cwd || cwd}\n- Branch: ${processed.sessionMeta.branch || 'unknown'}\n- Claude Version: ${processed.sessionMeta.version || 'unknown'}\n- Session Start: ${processed.sessionMeta.startTime || 'unknown'}\n- Session End: ${processed.sessionMeta.endTime || 'unknown'}\n- Total Turns: ${processed.totalTurns}\n- Log File Size: ${(fileSize / 1024).toFixed(1)}KB\n\n---\n\n## Session Transcript\n\n${processed.transcript}`;
 
       // 6. Delegate to agy for summarization
-      const effectiveEffort = args.effort || config.defaultEffort || 'high';
-      const effectiveModel = args.model || config.defaultModel;
+      //
+      // Eleccion automatica de modelo. Hasta 0.7.2 esto era
+      // `args.model || config.defaultModel`, sin mirar el tamano: una sesion de
+      // 8,3 MB se resumio con Flash y el resultado perdio el hilo -- invento un
+      // SHA de commit que no existe en el repositorio, presentado como dato.
+      // El umbral de 1 MB ya estaba documentado en el comando y en el skill;
+      // solo faltaba aplicarlo.
+      //
+      // Un `model` explicito siempre manda: esto solo decide cuando nadie eligio.
+      const { model: effectiveModel, effort: effectiveEffort, nota: notaModelo } =
+        elegirModeloResumen(args, config, fileSize);
       const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
@@ -3040,6 +3091,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       formatted += `- Focus: \`${focus}\`\n`;
       formatted += `- Saved to: \`${savedPath}\`\n`;
       if (effectiveModel) formatted += `- Model: \`${effectiveModel}\`\n`;
+      formatted += `- Effort: \`${effectiveEffort}\`\n`;
+      if (notaModelo) formatted += `- Model choice: ${notaModelo}\n`;
       formatted += `- Duration: ${duration ? `${duration.toFixed(1)}s` : 'unknown'}\n`;
       if (conversationId) {
         formatted += `- Conversation ID: \`${conversationId}\`\n`;

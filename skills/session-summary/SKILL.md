@@ -87,4 +87,11 @@ If you detect that the user's session has been long and productive (many tool ca
 | 100KB - 1MB | Filtered (noise removed, tool results condensed) |
 | > 1MB | Truncated: first 10 turns + most recent turns that fit in 500K chars |
 
-For very large sessions (>1MB), recommend `gemini-3.1-pro`, which reasons over long transcripts better than the flash default. Run `agy models` for the current list; Pro only accepts `low` and `high` effort.
+Above 1MB the tool switches to `gemini-3.1-pro` by itself, because flash loses the
+thread on transcripts that long — an 8.3MB session summarised with flash invented a
+commit SHA that did not exist in the repository, printed as fact. Passing `model`
+explicitly always overrides the choice, and the output says which model ran.
+
+Run `agy models` for the current list. Note that the Pro family only accepts `low`
+and `high` effort, so a `medium` inherited from config is raised to `high` (and the
+output says so) rather than failing inside agy.
