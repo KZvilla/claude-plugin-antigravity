@@ -50,7 +50,7 @@ Claude Code's context window compaction is lossy — it discards details, interm
 {
   "session_id": "057c77fc-17d4-4ada-86c4-b9f40f2f4d93",
   "focus": "decisions",
-  "model": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro",
   "output_path": "./docs/session-2026-08-28.md"
 }
 ```
@@ -87,4 +87,4 @@ If you detect that the user's session has been long and productive (many tool ca
 | 100KB - 1MB | Filtered (noise removed, tool results condensed) |
 | > 1MB | Truncated: first 10 turns + most recent turns that fit in 500K chars |
 
-For very large sessions (>5MB), recommend using `gemini-2.5-pro` which has a 2M token context window.
+For very large sessions (>1MB), recommend `gemini-3.1-pro`, which reasons over long transcripts better than the flash default. Run `agy models` for the current list; Pro only accepts `low` and `high` effort.

@@ -74,7 +74,7 @@ Produce a comprehensive implementation plan without making edits (guaranteed rea
 ```json
 {
   "task": "Migrate legacy button classes to Radix UI across src/components/finance.",
-  "model": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro",
   "effort": "high"
 }
 ```

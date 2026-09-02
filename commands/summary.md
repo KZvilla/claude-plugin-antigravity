@@ -17,4 +17,4 @@ Instructions:
 3. Present the generated summary, then report the run details the tool actually returns:
    the saved file path, turns processed, source log size, and focus. Report only what
    appears in the tool output — do not guess whether the transcript was truncated.
-4. If the session log is very large (>1MB), suggest using `model: "gemini-2.5-pro"` for better results.
+4. If the session log is very large (>1MB), suggest using `model: "gemini-3.1-pro"` for better results.

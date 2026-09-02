@@ -214,11 +214,11 @@ Denying `"network"` blocks web search and URL fetching, and makes `agy_research`
 
 Ask Claude naturally:
 
-> *"Claude, delegale esta tarea a agy usando el modelo `gemini-2.5-pro` y effort `high`"*
+> *"Claude, delegale esta tarea a agy usando el modelo `gemini-3.1-pro` y effort `high`"*
 
 | Parameter | Values |
 |-----------|--------|
-| `model` | `"gemini-3.7-flash"`, `"gemini-2.5-pro"` |
+| `model` | `"gemini-3.7-flash"`, `"gemini-3.1-pro"` |
 | `effort` | `"low"`, `"medium"`, `"high"` |
 
 ### 2. Persistent Defaults via Tool

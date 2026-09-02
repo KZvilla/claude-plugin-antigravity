@@ -275,7 +275,7 @@ function getModelSpecs(modelName) {
   const m = (modelName || '').toLowerCase();
   if (m.includes('pro')) {
     return {
-      name: modelName || 'gemini-2.5-pro',
+      name: modelName || 'gemini-3.1-pro',
       contextWindow: 2097152,
       maxOutput: 65536,
       description: 'Google Gemini Pro (Deep Reasoning & Multi-Turn Architecture)'
@@ -420,7 +420,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for Antigravity session (e.g. "gemini-3.7-flash", "gemini-2.5-pro"). Falls back to configured default.'
+          description: 'Model override for Antigravity session (e.g. "gemini-3.7-flash", "gemini-3.1-pro"). Falls back to configured default.'
         },
         effort: {
           type: 'string',
@@ -469,7 +469,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for planning session (e.g. "gemini-2.5-pro", "gemini-3.7-flash").'
+          description: 'Model override for planning session (e.g. "gemini-3.1-pro", "gemini-3.7-flash").'
         },
         effort: {
           type: 'string',
@@ -554,7 +554,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override (e.g. "gemini-2.5-pro" recommended for deep audits).'
+          description: 'Model override (e.g. "gemini-3.1-pro" recommended for deep audits).'
         },
         effort: {
           type: 'string',
@@ -656,7 +656,7 @@ const TOOLS = [
       properties: {
         model: {
           type: 'string',
-          description: 'Default model name (e.g. "gemini-3.7-flash", "gemini-2.5-pro").'
+          description: 'Default model name (e.g. "gemini-3.7-flash", "gemini-3.1-pro").'
         },
         effort: {
           type: 'string',
@@ -730,7 +730,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for summarization (e.g. "gemini-2.5-pro" for very large sessions). Falls back to configured default.'
+          description: 'Model override for summarization (e.g. "gemini-3.1-pro" for very large sessions). Falls back to configured default.'
         },
         effort: {
           type: 'string',
@@ -766,7 +766,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for "start" (e.g. "gemini-3.7-flash", "gemini-2.5-flash").'
+          description: 'Model override for "start" (e.g. "gemini-3.7-flash", "gemini-3.6-flash").'
         },
         effort: {
           type: 'string',
@@ -1851,10 +1851,49 @@ function offloadLargePrompt(args) {
   }
 }
 
+// Los modelos de agy no aceptan cualquier esfuerzo. `agy models` los lista con
+// el sufijo incorporado, y la familia Pro solo existe en low y high:
+//
+//   gemini-3.7-flash-high|medium|low     gemini-3.1-pro-high|low
+//
+// Pasar el nombre corto es valido -- agy lo resuelve con --effort -- pero
+// `--model gemini-3.1-pro --effort medium` es un error que solo aparece tras
+// arrancar el proceso, con un mensaje que llega envuelto en JSON. Hoy no se
+// dispara porque el esfuerzo por defecto es `high`; en cuanto alguien pide
+// medium con un modelo Pro, si.
+const ESFUERZOS_POR_FAMILIA = [
+  { patron: /pro/i, permitidos: ['low', 'high'] }
+];
+
+function validarModeloEsfuerzo(cliArgs) {
+  const i = cliArgs.indexOf('--model');
+  const j = cliArgs.indexOf('--effort');
+  if (i === -1 || j === -1) return null;
+  const modelo = cliArgs[i + 1];
+  const esfuerzo = cliArgs[j + 1];
+  if (typeof modelo !== 'string' || typeof esfuerzo !== 'string') return null;
+  // Un id ya sufijado lo valida agy; aqui solo interesa el nombre corto.
+  if (/-(low|medium|high)$/i.test(modelo)) return null;
+
+  for (const { patron, permitidos } of ESFUERZOS_POR_FAMILIA) {
+    if (patron.test(modelo) && !permitidos.includes(esfuerzo.toLowerCase())) {
+      return `El modelo "${modelo}" no admite effort "${esfuerzo}". `
+        + `Disponibles para esa familia: ${permitidos.join(', ')}. `
+        + `Ejecuta \`agy models\` para ver la lista completa.`;
+    }
+  }
+  return null;
+}
+
 function executeAgy(args, options = {}) {
   const timeoutMinutes = options.timeoutMinutes || 15;
   const timeoutMs = (timeoutMinutes + 1) * 60 * 1000;
   const cwd = options.cwd || process.cwd();
+
+  const problema = validarModeloEsfuerzo(args);
+  if (problema) {
+    return Promise.resolve({ success: false, error: problema, stdout: '', stderr: '' });
+  }
 
   const { args: descargados, cleanup: limpiarPrompt } = offloadLargePrompt(args);
 

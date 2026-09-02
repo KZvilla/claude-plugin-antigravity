@@ -62,7 +62,7 @@ Antigravity is powered by Google Gemini models (Gemini 2.5 / 3.7 Pro and Flash) 
 
 - `mcp__lagrange__agy_run`:
   - `prompt`: Specific instructions and context for Antigravity.
-  - `model`: Model override (e.g. `"gemini-3.7-flash"`, `"gemini-2.5-pro"`). Falls back to configured default.
+  - `model`: Model override (e.g. `"gemini-3.7-flash"`, `"gemini-3.1-pro"`). Falls back to configured default.
   - `effort`: `"low"`, `"medium"`, or `"high"` (defaults to configured default, usually `"high"`).
   - `mode`: `"accept-edits"` (can write files and run commands) or `"plan"` (read-only analysis).
   - `conversation_id`: Resume a previous session thread to maintain full context.
@@ -97,7 +97,7 @@ Antigravity is powered by Google Gemini models (Gemini 2.5 / 3.7 Pro and Flash) 
 ## 📋 Best Practices for Delegating
 
 1. **Configuring Model and Effort**:
-   - If the user specifies a model (e.g. "usa gemini-2.5-pro") or effort level (e.g. "con effort high"), always pass those arguments to `agy_run`, `agy_plan`, or `agy_review`.
+   - If the user specifies a model (e.g. "usa gemini-3.1-pro") or effort level (e.g. "con effort high"), always pass those arguments to `agy_run`, `agy_plan`, or `agy_review`.
    - If the user wants to change defaults permanently, use `agy_set_config`.
 2. **Be Specific with Context**:
    - When calling `agy_run`, include relevant file paths, error messages, and expected outcomes.
