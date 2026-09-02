@@ -9,6 +9,8 @@ SESSION-SUMMARY.md
 # docs/ es material de trabajo: propuestas, revisiones y notas de sesion.
 docs/*
 docs/
+bundles/*
+bundles/
 
 # Security & Secrets (Standard §11.1)
 .env
