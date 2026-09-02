@@ -226,6 +226,7 @@ export function runAgyTask(options = {}) {
 
     console.log(`[executor] Ejecutando: ${AGY_BIN} (modo: ${mode}, sandbox: ${useSandbox ? 'sí' : 'no'}, conv: ${conversationId || 'nueva'}, cwd: ${cwd})`);
 
+    const startedAt = Date.now();
     const child = spawn(AGY_BIN, cliArgs, {
       cwd,
       shell: false,
@@ -296,7 +297,11 @@ export function runAgyTask(options = {}) {
       } catch {}
 
       const activeConvId = (parsed && parsed.conversation_id) || conversationId || null;
-      const durationSeconds = (parsed && parsed.duration_seconds) || 0;
+      // Reloj de pared de ESTA tarea. `parsed.duration_seconds` es acumulado de
+      // toda la conversación, así que al reanudar una sesión vieja informaba
+      // horas para una respuesta de segundos.
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const sessionSeconds = (parsed && parsed.duration_seconds) || 0;
 
       if (code === 0 && (!parsed || parsed.status !== 'ERROR')) {
         const responseText = (parsed && parsed.response) || stdout || '(Sin respuesta generada)';
@@ -305,6 +310,7 @@ export function runAgyTask(options = {}) {
           data: parsed,
           conversationId: activeConvId,
           durationSeconds,
+          sessionSeconds,
           responseText,
           rawOutput: stdout
         });
@@ -323,6 +329,7 @@ export function runAgyTask(options = {}) {
           data: parsed,
           conversationId: activeConvId,
           durationSeconds,
+          sessionSeconds,
           error: errorMsg,
           stdout,
           stderr

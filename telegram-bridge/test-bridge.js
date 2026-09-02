@@ -258,7 +258,10 @@ console.log('✔ Test 14: markdownToTelegramHtml es determinista y escapa siempr
 assert.strictEqual(formatElapsed(0), '0s');
 assert.strictEqual(formatElapsed(45), '45s');
 assert.strictEqual(formatElapsed(65), '1m 05s');
-assert.strictEqual(formatElapsed(3600), '60m 00s');
+assert.strictEqual(formatElapsed(3599), '59m 59s');
+assert.strictEqual(formatElapsed(3600), '1h 00m');
+// El caso que disparó el arreglo: 18733.2s de sesión acumulada.
+assert.strictEqual(formatElapsed(18733.2), '5h 12m');
 console.log('✔ Test 15: formatElapsed');
 
 // Test 16: la cola guarda la MISMA referencia, no una copia. De eso depende que

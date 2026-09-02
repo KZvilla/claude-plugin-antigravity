@@ -272,7 +272,7 @@ async function processTaskQueue() {
         setConversationId(chatId, result.conversationId);
       }
 
-      const meta = formatExecutionMeta(result.data, result.durationSeconds, result.conversationId, mode);
+      const meta = formatExecutionMeta(result.data, result.durationSeconds, result.conversationId, mode, result.sessionSeconds);
       const fullResponse = result.responseText + meta;
 
       // Si fue un /plan, ofrecer botón interactivo para ejecutarlo

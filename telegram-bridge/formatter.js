@@ -234,11 +234,18 @@ export async function replyWithSmartChunks(ctx, fullText, extra = {}) {
 /**
  * Formatea un bloque con detalles de la ejecución de Antigravity
  */
-export function formatExecutionMeta(resData, durationSeconds, conversationId, mode) {
+export function formatExecutionMeta(resData, durationSeconds, conversationId, mode, sessionSeconds = 0) {
   let meta = `\n\n---\n⚡ *Antigravity CLI*\n`;
   if (conversationId) meta += `• Sesión: \`${conversationId}\`\n`;
   if (mode) meta += `• Modo: \`${mode}\`\n`;
-  if (durationSeconds) meta += `• Duración: \`${durationSeconds.toFixed(1)}s\`\n`;
+  if (durationSeconds) meta += `• Duración: \`${formatElapsed(durationSeconds)}\`\n`;
+  // `agy` reporta `duration_seconds` acumulado de toda la conversación, no de
+  // esta tarea: al reanudar una sesión de hace horas salían cifras como
+  // «18733.2s» para una respuesta de medio minuto. El reloj de pared del
+  // executor es el dato honesto; el acumulado solo se muestra si añade algo.
+  if (sessionSeconds && sessionSeconds - durationSeconds > 5) {
+    meta += `• Sesión acumulada: \`${formatElapsed(sessionSeconds)}\`\n`;
+  }
 
   if (resData && resData.usage) {
     const u = resData.usage;
@@ -252,11 +259,14 @@ export function formatExecutionMeta(resData, durationSeconds, conversationId, mo
 }
 
 /**
- * Formatea una duración en segundos como `2m 34s`, para el mensaje de progreso.
+ * Formatea una duración en segundos como `45s`, `2m 34s` o `5h 12m`. Sin el
+ * tramo de horas, una sesión larga se leía como `312m 13s`.
  */
 export function formatElapsed(seconds) {
   const total = Math.max(0, Math.round(seconds));
-  const m = Math.floor(total / 60);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
   return m === 0 ? `${s}s` : `${m}m ${String(s).padStart(2, '0')}s`;
 }

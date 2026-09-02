@@ -95,15 +95,20 @@ function mutateState(mutator) {
 // Lectura y escritura
 // ==============================================================================
 
-// Caché invalidada por mtime + tamaño. El bucle de espera de askTelegramQuestion
-// relee el estado una vez por segundo durante hasta 300 s; sin caché eso es un
-// parseo completo del fichero en cada vuelta.
+// Caché del *parseo*, no de la lectura. El bucle de espera de
+// askTelegramQuestion relee el estado una vez por segundo durante hasta 300 s;
+// sin caché eso es un JSON.parse completo en cada vuelta.
+//
+// La clave es el contenido crudo, no `mtime` + tamaño: Windows sella los
+// tiempos de escritura con una granularidad muy por encima del milisegundo, así
+// que dos escrituras seguidas del mismo tamaño (dos IDs de conversación de
+// igual longitud, por ejemplo) compartían mtime y la caché seguía sirviendo
+// estado obsoleto. Leer unos pocos KB es barato; parsearlos no tanto.
 let cache = null;
 
-function readStateFromDisk() {
-  if (!fs.existsSync(STATE_FILE)) return emptyState();
+function parseState(raw) {
   try {
-    const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    const parsed = JSON.parse(raw);
     // `queue` es un campo legado: la cola vive ahora en memoria (queue.js) y se
     // descarta al leer para no rehidratar Contexts muertos ni tokens antiguos.
     return {
@@ -117,23 +122,33 @@ function readStateFromDisk() {
 }
 
 /**
- * Carga el estado persistido desde state.json, con caché invalidada por mtime.
+ * Lectura sin caché, para el ciclo leer-modificar-escribir bajo lock: ahí
+ * servir un parseo anterior podría pisar lo que otro proceso acabe de escribir.
+ */
+function readStateFromDisk() {
+  try {
+    return parseState(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch {
+    return emptyState();
+  }
+}
+
+/**
+ * Carga el estado persistido desde state.json, cacheando el parseo.
  */
 export function loadState() {
-  let stat = null;
+  let raw = null;
   try {
-    stat = fs.statSync(STATE_FILE);
+    raw = fs.readFileSync(STATE_FILE, 'utf8');
   } catch {
     cache = null;
     return emptyState();
   }
 
-  if (cache && cache.mtimeMs === stat.mtimeMs && cache.size === stat.size) {
-    return cache.state;
-  }
+  if (cache && cache.raw === raw) return cache.state;
 
-  const state = readStateFromDisk();
-  cache = { mtimeMs: stat.mtimeMs, size: stat.size, state };
+  const state = parseState(raw);
+  cache = { raw, state };
   return state;
 }
 
@@ -145,7 +160,7 @@ function writeStateToDisk(state) {
   try {
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
     fs.renameSync(tmp, STATE_FILE);
-    cache = null; // el mtime cambió; que la próxima lectura lo recoja
+    cache = null; // el contenido cambió; que la próxima lectura lo recoja
   } catch (err) {
     console.error(`[state] Error guardando state.json: ${err.message}`);
     try { fs.unlinkSync(tmp); } catch {}
