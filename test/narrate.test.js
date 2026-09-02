@@ -13,6 +13,8 @@
  * vive el riesgo real — ese texto se sintetiza, se manda al chat de Telegram y
  * queda escrito en daemon.log.
  */
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { startServer, REPO_ROOT } = require('./lib/mcp-client');
 const { check, group, report } = require('./lib/assert');
@@ -142,6 +144,134 @@ async function main() {
 
     const persona = getPolishPrompt('x', 'es', { name: 'Emily', personality: 'calida' }, true);
     check('la persona no puede cambiar el mensaje', /never at the cost of changing what the message says/i.test(persona));
+  });
+
+
+  // --- extraccion del checkpoint -----------------------------------------
+  //
+  // Contexto: una narracion real afirmo "no automated tests have run" justo
+  // despues de 35 tests en verde. No fue una alucinacion — el modelo recibio
+  // overallTestStatus: NO_TESTS y lo dijo fielmente. El defecto estaba en el
+  // extractor, en dos sitios distintos.
+
+  const cp = require(path.join(REPO_ROOT, 'mcp-server', 'checkpoint.js'));
+
+  await group('isTestExecution distingue ejecutar de mencionar', () => {
+    // La version anterior era comando.includes('test'). Medido sobre 1141
+    // comandos de 13 sesiones reales marcaba 281, con un 68% de falsos
+    // positivos; el patron actual marca 102, todos ejecuciones de verdad.
+    const ejecutan = [
+      'npm test', 'npm test 2>&1', 'npm run bridge:test', 'npm run --silent test:mcp',
+      'cd "/x" && npm test', 'node test/run.js', 'node test-bridge.js',
+      'node test/daemon-platform.test.js 2>&1', 'pytest -q', 'npx vitest run',
+      'cargo test --all', 'go test ./...', 'ctest', 'CI=1 npm test', 'timeout 60 npm test',
+      'for i in 1 2 3; do r=$(npm test 2>&1); done'
+    ];
+    const noEjecutan = [
+      'ls test/',
+      'echo "npm test: $?"',
+      'grep -n "test" foo.js',
+      'sed -n "45,120p" test-bridge.js',
+      "cat > policy.js <<'EOF'\nun comentario que menciona test",
+      'node --check test-bridge.js',
+      'TELEGRAM_BOT_TOKEN=1234567890:AAFakeTokenForTestingOnly node bot.js',
+      'npm run validate',
+      'npm run bridge:daemon:check'
+    ];
+    const fallanPositivos = ejecutan.filter(c => !cp.isTestExecution(c));
+    const fallanNegativos = noEjecutan.filter(c => cp.isTestExecution(c));
+    check('detecta las ejecuciones reales', fallanPositivos.length === 0, fallanPositivos.join(' | '));
+    check('no confunde mencionar con ejecutar', fallanNegativos.length === 0, fallanNegativos.join(' | '));
+    // Los dos casos concretos que rompian: el heredoc y el fichero leido.
+    check('un heredoc con "test" dentro no es un test', !cp.isTestExecution("cat > x.js <<'EOF'\n// test\nEOF"));
+    check('node --check solo parsea, no ejecuta', !cp.isTestExecution('node --check test-bridge.js'));
+  });
+
+  await group('testFailed usa las dos senales, y no cuenta los ceros', () => {
+    // is_error no basta: canalizar la salida (| tail, | grep, > fichero)
+    // enmascara el codigo de salida. Medido sobre 91 ejecuciones reales, hubo 7
+    // fallos autenticos que is_error no vio y la salida si delataba.
+    check('is_error manda', cp.testFailed({ isError: true, content: 'lo que sea' }) === true);
+    check('detecta fallo con la salida canalizada', cp.testFailed({ isError: false, content: '1/5 suites FAILED' }) === true);
+    check('detecta "3 failing"', cp.testFailed({ isError: false, content: '3 failing' }) === true);
+    check('todo verde no es fallo', cp.testFailed({ isError: false, content: 'all 5 suites passed' }) === false);
+    // Y al reves: un recuento en cero no puede leerse como fallo.
+    check('"0 failed" no es fallo', cp.testFailed({ isError: false, content: 'Tests: 0 failed, 42 passed' }) === false);
+    check('"failures: 0" no es fallo', cp.testFailed({ isError: false, content: 'failures: 0' }) === false);
+    check('sin resultado devuelve null', cp.testFailed(null) === null);
+  });
+
+  await group('la ventana retrocede cuando la peticion no trae trabajo', () => {
+    // Reproduce el incidente: el usuario pide narrar en una frase normal, de
+    // modo que la heuristica anterior (texto < 50 caracteres y contiene
+    // "narra") no se disparaba y la ventana arrancaba en esa misma peticion,
+    // donde por definicion no hay trabajo todavia.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cp-'));
+    const log = path.join(dir, 's.jsonl');
+
+    const usuario = (t) => JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: t }] } });
+    const bash = (id, comando) => JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Bash', input: { command: comando } }] }
+    });
+    const resultado = (id, texto, esError) => JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: texto, is_error: Boolean(esError) }] }
+    });
+    const edicion = (f) => JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'e1', name: 'Edit', input: { file_path: f } }] }
+    });
+
+    // Turno 1: trabajo de verdad. Turno 2: la peticion de narrar, sin trabajo.
+    fs.writeFileSync(log, [
+      usuario('corrige la documentacion y procede la implementacion'),
+      edicion('/repo/telegram-bridge/policy.js'),
+      bash('t1', 'cd /repo && npm test 2>&1'),
+      resultado('t1', 'all 5 suites passed', false),
+      usuario('ya corri el npm run bridge:daemon:install, hacemos una prueba antes de pushear? Usa lagrange narrative usando Emily para narrar un resumen de lo implementado')
+    ].join('\n') + '\n');
+
+    const r = cp.extractLastCheckpoint(log);
+    check('retrocede un turno', r.turnsBack === 1, String(r.turnsBack));
+    check('encuentra el trabajo', r.commandsCount === 1, String(r.commandsCount));
+    check('encuentra los tests', r.testExecutions.length === 1, String(r.testExecutions.length));
+    check('el estado ya no es NO_TESTS', r.overallTestStatus === 'PASSED', r.overallTestStatus);
+    check('el objetivo es el turno con trabajo', /corrige la documentacion/.test(r.userGoal), r.userGoal);
+
+    // Si el ultimo turno SI trae trabajo, no se retrocede.
+    fs.appendFileSync(log, [
+      bash('t2', 'cd /repo && npm run bridge:test'),
+      resultado('t2', '36/36 ok', false)
+    ].join('\n') + '\n');
+    const r2 = cp.extractLastCheckpoint(log);
+    check('no retrocede si hay trabajo en el ultimo turno', r2.turnsBack === 0, String(r2.turnsBack));
+    check('y narra ese turno', /lagrange narrative/.test(r2.userGoal), r2.userGoal.slice(0, 60));
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await group('un fallo en la ventana no lo tapa un verde posterior', () => {
+    // Antes el estado global era el de la ULTIMA ejecucion detectada, asi que
+    // arreglar y reejecutar borraba el rastro del fallo — y, peor, un `sed`
+    // sobre un fichero de tests podia ser la "ultima ejecucion".
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cp2-'));
+    const log = path.join(dir, 's.jsonl');
+    const usuario = (t) => JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: t }] } });
+    const bash = (id, c) => JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Bash', input: { command: c } }] } });
+    const res = (id, t, e) => JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: t, is_error: Boolean(e) }] } });
+
+    fs.writeFileSync(log, [
+      usuario('arregla el bug'),
+      bash('a', 'npm test'), res('a', '1/5 suites FAILED', false),
+      bash('b', 'npm test'), res('b', 'all 5 suites passed', false)
+    ].join('\n') + '\n');
+
+    const r = cp.extractLastCheckpoint(log);
+    check('se detectan las dos ejecuciones', r.testExecutions.length === 2, String(r.testExecutions.length));
+    check('el checkpoint refleja el fallo', r.overallTestStatus === 'FAILED', r.overallTestStatus);
+
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   report();

@@ -17,6 +17,7 @@ const {
   normalizeSpokenText,
   getPolishPrompt
 } = require('./spoken-text.js');
+const { extractLastCheckpoint } = require('./checkpoint.js');
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
 
@@ -1873,157 +1874,22 @@ async function waitForGenerationFile(genDir, generationId, beforeFiles = [], tim
   return null;
 }
 
-function extractLastCheckpoint(filePath) {
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`Session log file not found: ${filePath}`);
-  }
-
-  const content = fs.readFileSync(filePath, 'utf8');
-  const lines = content.split('\n').filter(l => l.trim());
-
-  function isRealUserMessage(obj) {
-    if (obj.type !== 'user' || obj.isMeta) return false;
-    const c = obj.message?.content;
-    if (!c) return false;
-    if (Array.isArray(c)) {
-      if (c.some(item => item.type === 'tool_result')) return false;
-      return c.some(item => item.type === 'text' && item.text && item.text.trim());
-    }
-    return typeof c === 'string' && c.trim().length > 0;
-  }
-
-  function getUserText(obj) {
-    const c = obj.message?.content;
-    if (typeof c === 'string') return c.trim();
-    if (Array.isArray(c)) {
-      return c.filter(item => item.type === 'text').map(item => item.text || '').join(' ').trim();
-    }
-    return '';
-  }
-
-  const userMessages = [];
-  for (let i = 0; i < lines.length; i++) {
-    try {
-      const obj = JSON.parse(lines[i]);
-      if (isRealUserMessage(obj)) {
-        userMessages.push({ lineIndex: i, text: getUserText(obj), ts: obj.timestamp });
-      }
-    } catch {}
-  }
-
-  if (userMessages.length === 0) {
-    return {
-      userGoal: 'General development task',
-      filesModified: [],
-      commandsCount: 0,
-      testExecutions: [],
-      overallTestStatus: 'NO_TESTS',
-      assistantNotes: ''
-    };
-  }
-
-  let targetUserMsg = userMessages[userMessages.length - 1];
-  // Acepta el nombre nuevo y el viejo: los registros JSONL de sesiones
-  // anteriores a v0.5.0 llevan `/agy-narrate`, y se siguen leyendo. old-name-ok
-  const isOnlyNarrationCommand = /^\/(antigravity:narrate|agy-narrate)/.test(targetUserMsg.text) ||   // old-name-ok
-    (targetUserMsg.text.length < 50 && (targetUserMsg.text.toLowerCase().includes('narra') || targetUserMsg.text.toLowerCase().includes('narrat')));
-
-  if (isOnlyNarrationCommand && userMessages.length > 1) {
-    targetUserMsg = userMessages[userMessages.length - 2];
-  }
-
-  const startLineIndex = targetUserMsg.lineIndex;
-  const checkpointLines = lines.slice(startLineIndex);
-
-  const filesModified = new Set();
-  const commandsRun = [];
-  const toolResults = new Map();
-  let latestAssistantText = '';
-
-  for (const line of checkpointLines) {
-    let obj;
-    try { obj = JSON.parse(line); } catch { continue; }
-
-    if (obj.type === 'assistant' && obj.message?.content) {
-      for (const item of obj.message.content) {
-        if (item.type === 'tool_use') {
-          const name = item.name || '';
-          const inp = item.input || {};
-
-          if (['Edit', 'Write', 'NotebookEdit'].includes(name) && inp.file_path) {
-            filesModified.add(inp.file_path);
-          } else if (['write_to_file', 'replace_file_content'].includes(name) && inp.TargetFile) {
-            filesModified.add(inp.TargetFile);
-          }
-
-          if (name === 'Bash' || name === 'run_command') {
-            const cmd = inp.command || inp.CommandLine || '';
-            if (cmd) {
-              commandsRun.push({ id: item.id, command: cmd, ts: obj.timestamp });
-            }
-          }
-        } else if (item.type === 'text' && item.text && item.text.trim()) {
-          if (!item.text.includes('agy_narrate')) {
-            latestAssistantText = item.text.trim();
-          }
-        }
-      }
-    } else if (obj.type === 'user' && obj.message?.content) {
-      if (Array.isArray(obj.message.content)) {
-        for (const item of obj.message.content) {
-          if (item.type === 'tool_result' && item.tool_use_id) {
-            toolResults.set(item.tool_use_id, {
-              isError: Boolean(item.is_error),
-              content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
-            });
-          }
-        }
-      }
-    }
-  }
-
-  const testKeywords = ['test', 'pytest', 'jest', 'vitest', 'cargo test', 'go test', 'npm test', 'npx test', 'ctest'];
-  const testExecutions = [];
-  for (const cmd of commandsRun) {
-    const lower = cmd.command.toLowerCase();
-    const isTest = testKeywords.some(kw => lower.includes(kw));
-    if (isTest) {
-      const res = toolResults.get(cmd.id);
-      const isFailed = res ? (res.isError || res.content.toLowerCase().includes('failed') || res.content.toLowerCase().includes('failing')) : false;
-      testExecutions.push({
-        command: cmd.command.slice(0, 120),
-        passed: res ? !isFailed : null,
-        outputSnippet: res ? res.content.slice(0, 200) : ''
-      });
-    }
-  }
-
-  let overallTestStatus = 'NO_TESTS';
-  if (testExecutions.length > 0) {
-    const lastTest = testExecutions[testExecutions.length - 1];
-    overallTestStatus = lastTest.passed === true ? 'PASSED' : (lastTest.passed === false ? 'FAILED' : 'PENDING');
-  }
-
-  return {
-    userGoal: targetUserMsg.text,
-    filesModified: Array.from(filesModified),
-    commandsCount: commandsRun.length,
-    testExecutions,
-    overallTestStatus,
-    assistantNotes: latestAssistantText.slice(0, 500)
-  };
-}
 
 function getNarrationPrompt(checkpoint, targetLang, profile, enablePersonality = false) {
   const langName = targetLang === 'en' ? 'English' : 'Spanish';
   const langCode = targetLang === 'en' ? 'en' : 'es';
   const profileName = (profile && profile.name) || 'Voice Assistant';
 
+  // Se le da el RECUENTO, no solo el estado. Un "pasaron los tests" es cierto
+  // pero vago; "las cinco suites en verde" es lo que una persona diria.
+  const nTests = (checkpoint.testExecutions || []).length;
   let testSummary = 'No tests executed in this checkpoint.';
   if (checkpoint.overallTestStatus === 'PASSED') {
-    testSummary = 'Tests were executed and PASSED successfully.';
+    testSummary = `${nTests} test run(s) were executed and ALL PASSED.`;
   } else if (checkpoint.overallTestStatus === 'FAILED') {
-    testSummary = 'Tests were executed and FAILED.';
+    testSummary = `${nTests} test run(s) were executed and at least one FAILED.`;
+  } else if (checkpoint.overallTestStatus === 'PENDING') {
+    testSummary = `${nTests} test run(s) were started but their result is unknown.`;
   }
 
   const filesList = checkpoint.filesModified.length > 0
@@ -3403,7 +3269,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         commandsCount: 0,
         testExecutions: [],
         overallTestStatus: 'NO_TESTS',
-        assistantNotes: ''
+        assistantNotes: '',
+        turnsBack: 0
       };
 
       if (sessionFile) {
@@ -3502,7 +3369,17 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       });
       out += `\n**Contexto del Checkpoint detectado:**\n`;
       out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
-      out += `- **Estado de Tests**: \`${checkpoint.overallTestStatus}\`\n`;
+      // Se informa el retroceso: si la petición de narrar no contenía trabajo,
+      // la ventana se abrió en un turno anterior, y saber CUÁL se narró es la
+      // diferencia entre confiar en el resumen y tener que deducirlo.
+      if (checkpoint.turnsBack > 0) {
+        out += `- **Ventana**: ${checkpoint.turnsBack} turno(s) atrás (la petición de narrar no contenía trabajo)\n`;
+      }
+      out += `- **Estado de Tests**: \`${checkpoint.overallTestStatus}\``;
+      out += (checkpoint.testExecutions || []).length > 0
+        ? ` (${checkpoint.testExecutions.length} ejecución(es) detectada(s))\n`
+        : '\n';
+      out += `- **Comandos ejecutados**: ${checkpoint.commandsCount}\n`;
       if (checkpoint.filesModified.length > 0) {
         out += `- **Archivos identificados**: ${checkpoint.filesModified.map(f => `\`${path.basename(f)}\``).slice(0, 5).join(', ')}${checkpoint.filesModified.length > 5 ? ` (+${checkpoint.filesModified.length - 5} más)` : ''}\n`;
       }
