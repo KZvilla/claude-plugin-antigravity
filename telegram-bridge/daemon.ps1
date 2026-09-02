@@ -11,6 +11,8 @@
 #   .\daemon.ps1 status      Estado de la tarea, del proceso y del lockfile
 #   .\daemon.ps1 logs        Últimas líneas del log
 #
+#   .\daemon.ps1 install -Visible   Igual, pero dejando la consola a la vista
+#
 # Se ejecuta con el usuario actual y SOLO con la sesión iniciada: `agy` necesita
 # las credenciales del usuario y Voicebox vive en %APPDATA%. Ejecutarlo como
 # SYSTEM rompería ambas cosas, así que no se ofrece esa opción.
@@ -22,7 +24,11 @@ param(
     [ValidateSet('install', 'uninstall', 'start', 'stop', 'status', 'logs')]
     [string]$Command = 'status',
 
-    [int]$Lines = 40
+    [int]$Lines = 40,
+
+    # Registra la tarea con sesion interactiva, que muestra la ventana de
+    # consola del bot. Util para depurar el arranque; por defecto va oculta.
+    [switch]$Visible
 )
 
 $ErrorActionPreference = 'Stop'
@@ -111,6 +117,10 @@ function Invoke-Install {
 
     if (Get-BridgeTask) {
         Warn "La tarea '$TaskName' ya existe. Se vuelve a registrar con la configuración actual."
+        # Detener antes de borrar: si el bot sigue vivo, el nuevo arranque choca
+        # contra su propio bridge.lock y la tarea entra en bucle de reintentos.
+        try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch {}
+        Start-Sleep -Seconds 1
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
 
@@ -133,13 +143,45 @@ function Invoke-Install {
 
     # Sin -RunLevel Highest: el bridge no necesita privilegios elevados y
     # dárselos ampliaría el alcance de una cuenta de Telegram comprometida.
-    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
+    #
+    # LogonType: 'Interactive' hereda el escritorio del usuario, y eso deja una
+    # ventana de cmd.exe vacia y permanente en pantalla durante toda la vida del
+    # bot. 'S4U' corre igualmente como el usuario y con su perfil cargado
+    # (%APPDATA%, ~/.gemini), pero en una sesion sin escritorio: sin ventana.
+    # El disparador sigue siendo AtLogOn, asi que la semantica no cambia: el
+    # bridge solo arranca con la sesion iniciada.
+    $userId = "$env:USERDOMAIN\$env:USERNAME"
+    $logonType = if ($Visible) { 'Interactive' } else { 'S4U' }
 
-    Register-ScheduledTask -TaskName $TaskName `
-        -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
-        -Description 'Antigravity Telegram Bridge - long polling saliente, compatible con CGNAT.' | Out-Null
+    $registrar = {
+        param($tipo)
+        $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType $tipo
+        Register-ScheduledTask -TaskName $TaskName `
+            -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
+            -Description 'Antigravity Telegram Bridge - long polling saliente, compatible con CGNAT.' | Out-Null
+    }
 
-    Ok "Tarea '$TaskName' registrada (arranca al iniciar sesión)."
+    # S4U exige el permiso "Iniciar sesion como proceso por lotes". Suele estar
+    # concedido, pero si falta, registrar falla: mejor una ventana de mas que un
+    # daemon que no existe.
+    try {
+        & $registrar $logonType
+    } catch {
+        if ($logonType -eq 'S4U') {
+            Warn "No se pudo registrar en modo oculto (S4U): $($_.Exception.Message)"
+            Warn 'Se registra con sesion interactiva; veras una ventana de consola.'
+            $logonType = 'Interactive'
+            & $registrar $logonType
+        } else {
+            throw
+        }
+    }
+
+    if ($logonType -eq 'S4U') {
+        Ok "Tarea '$TaskName' registrada (arranca al iniciar sesión, sin ventana)."
+    } else {
+        Ok "Tarea '$TaskName' registrada (arranca al iniciar sesión, con ventana visible)."
+    }
     Info "Log: $LogFile"
 
     Start-ScheduledTask -TaskName $TaskName
