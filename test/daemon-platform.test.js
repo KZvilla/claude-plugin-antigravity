@@ -64,6 +64,79 @@ async function main() {
     check('avisa sobre linger', /enable-linger/.test(sh));
   });
 
+  await group('La unidad de systemd esta bien formada', () => {
+    // Se RENDERIZA la unidad de verdad, no se inspecciona el script: los dos
+    // fallos que esto atrapa -StartLimit en la seccion equivocada y una
+    // dependencia contra un target del gestor de sistema- no se ven leyendo el
+    // heredoc, y ninguna simulacion de plataforma los detecta.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-unit-'));
+    const render = path.join(dir, 'render.sh');
+    fs.writeFileSync(render, [
+      '#!/usr/bin/env bash',
+      'set -euo pipefail',
+      'BRIDGE_DIR="/home/u/repo/telegram-bridge"',
+      'BOT_SCRIPT="$BRIDGE_DIR/bot.js"',
+      `UNIT_DIR="${dir.replace(/\\/g, '/')}/unit"`,
+      'UNIT_FILE="$UNIT_DIR/lagrange-telegram-bridge.service"',
+      `eval "$(sed -n '/^write_unit()/,/^}/p' "${path.join(BRIDGE, 'daemon.sh').replace(/\\/g, '/')}")"`,
+      'write_unit "/usr/bin/node" "/home/u/.local/bin/agy"',
+      'cat "$UNIT_FILE"'
+    ].join('\n'));
+
+    let unidad = '';
+    try {
+      unidad = execFileSync('bash', [render], { encoding: 'utf8', timeout: 20000 });
+    } catch (err) {
+      unidad = '';
+      check('la unidad se puede renderizar', false, (err.stderr || err.message || '').toString().slice(0, 200));
+    }
+
+    if (unidad) {
+      // Se recorren las lineas en vez de usar un regex sobre todo el fichero.
+      // Con regex, un COMENTARIO que mencione "[Service]" -y la unidad tiene
+      // uno, explicando por que StartLimit* no va ahi- se toma por el comienzo
+      // de la seccion. Un parser de secciones de verdad reconoce la cabecera
+      // solo cuando ocupa la linea entera, igual que hace systemd.
+      const secciones = {};
+      let actual = null;
+      for (const linea of unidad.split(/\r?\n/)) {
+        const cabecera = linea.match(/^\[([A-Za-z]+)\]\s*$/);
+        if (cabecera) { actual = cabecera[1]; secciones[actual] = []; continue; }
+        if (actual) secciones[actual].push(linea);
+      }
+      const seccion = (nombre) => (secciones[nombre] || []).join('\n');
+      const unit = seccion('Unit');
+      const service = seccion('Service');
+
+      check('tiene las tres secciones', /\[Unit\]/.test(unidad) && /\[Service\]/.test(unidad) && /\[Install\]/.test(unidad));
+
+      // systemd movio StartLimit* a [Unit] en la v229. En [Service] se ignoran
+      // y systemd avisa de clave desconocida, asi que el limite de reinicios
+      // simplemente no existiria.
+      check('StartLimitBurst va en [Unit]', /StartLimitBurst=/.test(unit), unit.slice(0, 120));
+      check('StartLimitIntervalSec va en [Unit]', /StartLimitIntervalSec=/.test(unit));
+      check('StartLimit* NO esta en [Service]', !/StartLimit/.test(service));
+
+      // Un servicio de usuario no puede depender de un target del gestor de
+      // sistema; el Wants= solo genera ruido.
+      check('no depende de network-online.target', !/^\s*(Wants|After|Requires)=network/m.test(unidad), unidad.match(/^\s*(Wants|After|Requires)=.*/m)?.[0] || '');
+
+      // El fallo mas probable del primer arranque en Linux: sin PATH explicito,
+      // resolveAgyBin() no encuentra agy aunque funcione en la terminal.
+      check('fija un PATH explicito', /^Environment=PATH=/m.test(service), service.slice(0, 200));
+      check('el PATH incluye el directorio de node', /Environment=PATH=[^\n]*\/usr\/bin/.test(service));
+      check('el PATH incluye el directorio de agy detectado', /Environment=PATH=[^\n]*\/home\/u\/\.local\/bin/.test(service));
+
+      check('ExecStart usa rutas absolutas', /^ExecStart=\/usr\/bin\/node \/home\/u\/repo\/telegram-bridge\/bot\.js$/m.test(service));
+      check('WorkingDirectory apunta al bridge', /^WorkingDirectory=\/home\/u\/repo\/telegram-bridge$/m.test(service));
+      check('reinicia solo ante fallo', /^Restart=on-failure$/m.test(service));
+      check('la salida va al journal', /^StandardOutput=journal$/m.test(service));
+      check('se instala en default.target', /WantedBy=default\.target/.test(unidad));
+    }
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   await group('El guard de directorio estable existe en AMBAS plataformas', () => {
     const ps1 = fs.readFileSync(path.join(BRIDGE, 'daemon.ps1'), 'utf8');
     const sh = fs.readFileSync(path.join(BRIDGE, 'daemon.sh'), 'utf8');

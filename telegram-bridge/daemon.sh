@@ -137,7 +137,21 @@ test_prerequisites() {
     warn "Colocalo en $DATA_DIR/.env (sobrevive a claude plugin update)."
   fi
 
-  printf '%s' "$node_path"
+  # `agy` se busca aqui para poder meter SU directorio en el PATH de la unidad.
+  # Un servicio de usuario no hereda el PATH del shell, asi que un agy instalado
+  # en ~/.local/bin o similar seria invisible para el bot aunque funcione
+  # perfectamente en la terminal.
+  local agy_path
+  agy_path="$(command -v agy || true)"
+  if [ -n "$agy_path" ]; then
+    ok "agy en $agy_path"
+  else
+    warn "agy no esta en el PATH de este shell. El bot arrancara, pero las tareas fallaran."
+    warn "Instalalo desde https://antigravity.google/cli y vuelve a ejecutar install."
+  fi
+
+  # Dos lineas: node en la primera, agy en la segunda (vacia si no esta).
+  printf '%s\n%s' "$node_path" "$agy_path"
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -173,13 +187,29 @@ lock_started_at() {
 
 write_unit() {
   local node_path="$1"
+  local agy_path="${2:-}"
+  local node_dir
+  node_dir="$(dirname "$node_path")"
+  local agy_dir=''
+  [ -n "$agy_path" ] && agy_dir="$(dirname "$agy_path"):"
+
   mkdir -p "$UNIT_DIR"
   cat > "$UNIT_FILE" <<UNIT
 # Generado por daemon.sh - no editar a mano; install lo reescribe.
 [Unit]
 Description=Antigravity Telegram Bridge (long polling saliente, compatible con CGNAT)
-After=network-online.target
-Wants=network-online.target
+# StartLimit* va en [Unit], no en [Service]: sistemd los movio aqui en la v229
+# y en [Service] se ignoran con un aviso de clave desconocida.
+#
+# Tres reinicios por minuto y para. Sin tope, un fallo permanente -un token
+# invalido, por ejemplo- reintentaria en bucle para siempre.
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+# NO se ordena contra network-online.target: es un target del gestor de SISTEMA
+# y un servicio de usuario no puede depender de el de forma fiable (un Wants=
+# hacia una unidad que su gestor no conoce solo produce ruido). No hace falta:
+# el bot hace long polling con reintentos y grammY reconecta solo.
 
 [Service]
 Type=simple
@@ -187,10 +217,14 @@ WorkingDirectory=$BRIDGE_DIR
 ExecStart=$node_path $BOT_SCRIPT
 Restart=on-failure
 RestartSec=10
-# Tres reinicios por minuto y para. Sin tope, un fallo permanente -un token
-# invalido, por ejemplo- reintentaria en bucle para siempre.
-StartLimitBurst=3
-StartLimitIntervalSec=60
+
+# El entorno de un servicio de usuario es minimo: NO hereda el PATH del shell.
+# Sin esto, resolveAgyBin() hace 'which agy', no lo encuentra, y las tareas
+# fallan con "agy no esta en el PATH" aunque en la terminal funcione. Es el
+# fallo mas probable de este arranque, y el mas confuso.
+Environment=PATH=$node_dir:$agy_dir%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=%h
+
 # La salida va al journal: 'daemon.sh logs' la lee con journalctl. No se
 # redirige a un fichero a proposito; ver la cabecera de este script.
 StandardOutput=journal
@@ -206,15 +240,17 @@ invoke_install() {
   [ "$FORCE" -eq 1 ] || assert_directorio_estable
   require_systemd
 
-  local node_path
-  node_path="$(test_prerequisites)"
+  local prereq node_path agy_path
+  prereq="$(test_prerequisites)"
+  node_path="$(printf '%s' "$prereq" | sed -n '1p')"
+  agy_path="$(printf '%s' "$prereq" | sed -n '2p')"
 
   if systemctl --user list-unit-files "$UNIT_NAME" --no-legend 2>/dev/null | grep -q .; then
     warn "La unidad '$UNIT_NAME' ya existe. Se vuelve a escribir con la configuracion actual."
     systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
   fi
 
-  write_unit "$node_path"
+  write_unit "$node_path" "$agy_path"
   systemctl --user daemon-reload
   systemctl --user enable --now "$UNIT_NAME"
 
