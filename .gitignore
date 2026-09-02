@@ -6,10 +6,9 @@ __pycache__/
 Thumbs.db
 SESSION-SUMMARY.md
 *.local.md
+# docs/ es material de trabajo: propuestas, revisiones y notas de sesion.
 docs/*
 docs/
-test/*
-test/
 
 # Security & Secrets (Standard §11.1)
 .env
