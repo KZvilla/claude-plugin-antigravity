@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "kzvilla-antigravity",
+  "name": "kzvilla-lagrange",
   "description": "Marketplace de KZvilla: integración de Google Antigravity CLI (agy) con Claude Code",
   "owner": {
     "name": "KZvilla",
@@ -8,7 +8,7 @@
   },
   "metadata": {
     "description": "Delegación a Google Antigravity CLI (agy) desde Claude Code: subagentes autónomos, planificación, revisión adversarial, voz y puente de Telegram",
-    "version": "0.6.0"
+    "version": "0.7.0"
   },
   "renames": {
     "antigravity": "lagrange"
@@ -16,7 +16,7 @@
   "plugins": [
     {
       "name": "lagrange",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "source": {
         "source": "url",
         "url": "https://github.com/KZvilla/claude-plugin-antigravity.git",

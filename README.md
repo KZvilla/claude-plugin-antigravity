@@ -36,7 +36,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 
 ```text
 /plugin marketplace add KZvilla/claude-plugin-antigravity
-/plugin install lagrange@kzvilla-antigravity
+/plugin install lagrange@kzvilla-lagrange
 ```
 
 **2. Restart Claude Code.** `/reload-plugins` picks up commands, agents and
@@ -418,14 +418,14 @@ Inside a Claude Code session:
 
 ```text
 /plugin marketplace add KZvilla/claude-plugin-antigravity
-/plugin install lagrange@kzvilla-antigravity
+/plugin install lagrange@kzvilla-lagrange
 ```
 
 Or from a terminal:
 
 ```bash
 claude plugin marketplace add KZvilla/claude-plugin-antigravity
-claude plugin install lagrange@kzvilla-antigravity
+claude plugin install lagrange@kzvilla-lagrange
 ```
 
 This is the managed path: enable/disable, user vs. project scope, a visible
@@ -491,7 +491,7 @@ Restart Claude Code, then verify from a terminal:
 
 ```bash
 claude plugin list
-claude plugin details lagrange@kzvilla-antigravity
+claude plugin details lagrange@kzvilla-lagrange
 ```
 
 ### 🔐 Telegram Bridge Setup (Manual — Never Automated)
@@ -512,7 +512,7 @@ The Telegram tools (`telegram_notify`, `telegram_ask`, `telegram_send_voice`, an
 
 | Install channel | Put `.env` at | Survives an update? |
 |---|---|---|
-| Marketplace | `~/.claude/plugins/cache/kzvilla-antigravity/antigravity/<version>/.env` | **No** — the path is versioned, so a new version means a new empty directory |
+| Marketplace | `~/.claude/plugins/cache/kzvilla-lagrange/lagrange/<version>/.env` | **No** — the path is versioned, so a new version means a new empty directory |
 | Git clone (development) | `<clone>/.env` | Yes |
 
 A `.env` in a separate dev checkout does nothing for the installed plugin: outbound Telegram delivery will look unconfigured from the live plugin even though a manual test run elsewhere works fine.
