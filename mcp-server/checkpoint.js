@@ -31,8 +31,10 @@ const MAX_RETROCESO_TURNOS = 3;
 // comando que casa, bastaba que el ultimo fuese un `sed` para que el veredicto
 // saliera de ahi.
 
-// Ruido que puede preceder al ejecutor sin cambiar que lo sea.
-const PREFIJO_RUIDO = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+|sudo\s+|timeout\s+\d+\s+|time\s+|env\s+)+/;
+// Ruido que puede preceder al ejecutor sin cambiar que lo sea. Incluye
+// `bash -c`, cuyo payload SI es shell — al reves que el `-e` de node, que es
+// programa; ver SCRIPT_EN_LINEA.
+const PREFIJO_RUIDO = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+|sudo\s+|timeout\s+\d+\s+|time\s+|env\s+|(?:ba|z|k)?sh\s+-c\s+['"]?)+/;
 
 // Se separa por operadores de shell Y por `$(`, backtick y `do `, porque una
 // suite lanzada dentro de una sustitucion o de un bucle sigue siendo una suite.
@@ -53,16 +55,42 @@ const EJECUTOR_TESTS = new RegExp([
 ].join('|'), 'i');
 
 /**
- * ¿Este comando ejecuta una suite de tests?
+ * Recorta la parte EJECUTABLE de un comando, descartando el contenido de los
+ * heredocs.
  *
- * Mira solo la PRIMERA linea: un heredoc mete el contenido del fichero en las
- * siguientes, y ahi la palabra «test» aparece por casualidad.
+ * Un heredoc (`cat > x.js <<'EOF'`) mete el contenido de un fichero en las
+ * lineas siguientes, y ahi la palabra «test» aparece por casualidad — era una
+ * de las fuentes de falsos positivos.
+ *
+ * La primera version resolvia eso quedandose solo con la PRIMERA linea, y esa
+ * regla estaba mal: un bloque multilinea legitimo pone el `cd` en la primera y
+ * el ejecutor en la segunda, asi que `npm test` dejaba de detectarse. Se vio
+ * ejercitando el extractor sobre una sesion real, no en los tests.
+ *
+ * Se conserva la linea que ABRE el heredoc, porque el ejecutor puede estar
+ * antes del `<<` en esa misma linea.
+ */
+function parteEjecutable(command) {
+  const lineas = String(command || '').split('\n');
+  const corte = lineas.findIndex(l => /<<-?\s*['"]?[A-Za-z_]\w*['"]?\s*$/.test(l));
+  return (corte === -1 ? lineas : lineas.slice(0, corte + 1)).join('\n');
+}
+
+// Un interprete con script en linea: lo que sigue es PROGRAMA, no shell. Un
+// `node -e "...npm test..."` lleva ese texto como cadena literal, no lo
+// ejecuta. Se distingue por el interprete: en `bash -c "npm test"` el payload
+// si es shell y ahi los tests son reales.
+const SCRIPT_EN_LINEA = /^(?:node|python3?|deno)\b[^\n]*?(?:^|\s)(?:-e|--eval|-p|--print|-c)(?:\s|$|=)/;
+
+/**
+ * ¿Este comando ejecuta una suite de tests?
  */
 function isTestExecution(command) {
-  const primeraLinea = String(command || '').split('\n')[0];
-  for (const bruto of primeraLinea.split(SEPARADORES)) {
+  for (const bruto of parteEjecutable(command).split(/\n/).join(';').split(SEPARADORES)) {
     const seg = bruto.trim().replace(PREFIJO_RUIDO, '').trim();
     if (!seg) continue;
+    // A partir de un script en linea, el resto del comando es su contenido.
+    if (SCRIPT_EN_LINEA.test(seg)) break;
     // `node --check fichero.test.js` comprueba la sintaxis, no ejecuta nada.
     if (/^node\b/.test(seg) && /(?:^|\s)--check(?:\s|$)/.test(seg)) continue;
     if (EJECUTOR_TESTS.test(seg)) return true;

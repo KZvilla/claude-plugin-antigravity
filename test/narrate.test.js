@@ -185,6 +185,23 @@ async function main() {
     // Los dos casos concretos que rompian: el heredoc y el fichero leido.
     check('un heredoc con "test" dentro no es un test', !cp.isTestExecution("cat > x.js <<'EOF'\n// test\nEOF"));
     check('node --check solo parsea, no ejecuta', !cp.isTestExecution('node --check test-bridge.js'));
+
+    // El primer arreglo del heredoc fue "mirar solo la primera linea", y estaba
+    // mal: un bloque multilinea pone el `cd` arriba y el ejecutor abajo. Se vio
+    // ejercitando el extractor sobre una sesion real, no aqui — de ahi que estos
+    // tres casos existan.
+    check('multilinea: cd arriba, npm test abajo',
+      cp.isTestExecution('cd "C:/x"\nnpm test >/dev/null 2>&1; echo "npm test: $?"'));
+    check('varias lineas de comandos',
+      cp.isTestExecution('cd "/x"\nnpm run bridge:test >/dev/null 2>&1\nnpm run validate >/dev/null'));
+
+    // Y el heredoc no fue el unico contenedor de texto: el payload de `node -e`
+    // es PROGRAMA, no shell, asi que un "npm test" ahi dentro es una cadena.
+    check('node -e con "npm test" como literal no es un test',
+      !cp.isTestExecution('cd /x && node -e "const c=[[\'npm test\',true]]; console.log(c)"'));
+    check('python -c tampoco', !cp.isTestExecution('python3 -c "print(\'npm test\')"'));
+    // Pero `bash -c` SI es shell: el interprete decide, no la bandera.
+    check('bash -c si ejecuta shell', cp.isTestExecution('bash -c "npm test"'));
   });
 
   await group('testFailed usa las dos senales, y no cuenta los ceros', () => {
