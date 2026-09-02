@@ -385,9 +385,10 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
 • *Cola de tareas:* ${queueLen} pendientes (Procesando: ${isProcessingTask ? 'Sí' : 'No'})
 
 🔒 *Controles efectivos* (los impone el CLI)
-• *Sandbox de terminal:* ${status.enforcement.sandbox ? '`activo`' : '`inactivo` — actívalo con `AGY_SANDBOX=true`'}
 • *Aprobación de herramientas:* \`--dangerously-skip-permissions\` (auto-aprobada)
 • *Texto libre:* entra en modo \`plan\`; escribir requiere pulsar «Ejecutar cambios»
+• *Workspace:* fija el \`cwd\` de \`agy\`; *no* limita dónde puede escribir
+• *Sandbox de terminal:* ${status.enforcement.sandbox ? '`activo` — cada comando pide UAC' : '`inactivo`'} (restringe la terminal, no las rutas)
 
 ⚠️ *Guardrails solo sugeridos al modelo* (no exigibles: \`agy\` no expone flags de política por ruta o comando)
 • *Comandos desaconsejados:* \`${status.denyCommands.join(', ')}\`

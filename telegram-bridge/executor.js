@@ -99,12 +99,17 @@ export function loadPolicy(cwd = resolveWorkspace()) {
   const policy = {
     denyCommands: [...DEFAULT_DENY_COMMANDS],
     denyPaths: [...DEFAULT_DENY_PATHS],
-    // Activo por defecto. Verificado empíricamente: `--sandbox` bloquea las
-    // ESCRITURAS fuera del workspace y permite las de dentro. Sin él,
-    // `--dangerously-skip-permissions` deja a `agy` escribir en todo el disco y
-    // WORKSPACE_DIR es decorativo: fija el cwd, no un límite.
-    // No bloquea las LECTURAS fuera del workspace; eso no es exigible.
-    sandbox: true,
+    // Inactivo por defecto, y NO es un límite de rutas. `agy --help` lo describe
+    // como «terminal restrictions», y medido en Windows:
+    //   - la herramienta de escritura de archivos escribe fuera del workspace
+    //     igual con `--sandbox` que sin él;
+    //   - los comandos de terminal pasan por ShellExecute con elevación, o sea
+    //     un UAC por comando: si se cancela el comando falla, y si se acepta se
+    //     ejecuta como administrador.
+    // Activarlo por defecto sería peor que no hacerlo: no añade frontera y
+    // entrena al usuario a conceder admin a algo disparado desde Telegram.
+    // Se deja configurable, pero el límite real sigue siendo `--mode plan`.
+    sandbox: false,
     configFile: null
   };
 
@@ -175,8 +180,7 @@ export function runAgyTask(options = {}) {
     '--effort', effort
   ];
 
-  // Único control de permisos real que ofrece el CLI, además de `--mode plan`:
-  // acota las escrituras al workspace. Desactivable con AGY_SANDBOX=false.
+  // Restricciones de terminal, no de rutas: ver el comentario de loadPolicy().
   if (useSandbox) {
     cliArgs.push('--sandbox');
   }

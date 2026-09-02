@@ -162,14 +162,14 @@ assert.strictEqual(loadPolicy(policyDir).sandbox, false, 'AGY_SANDBOX debe ganar
 delete process.env.AGY_SANDBOX;
 fs.rmSync(policyDir, { recursive: true, force: true });
 
-// El sandbox va activo por defecto: es el único límite real de escritura que
-// tiene el bridge. Sin él, `--dangerously-skip-permissions` alcanza todo el
-// disco y WORKSPACE_DIR solo fija el cwd.
+// El sandbox va INACTIVO por defecto: medido, no limita rutas (la herramienta
+// de escritura sale del workspace igual) y convierte cada comando de terminal
+// en un UAC de elevación. Activarlo por defecto no añadiría frontera.
 const dirSinPolitica = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-bridge-nopol-'));
 assert.strictEqual(
   loadPolicy(dirSinPolitica).sandbox,
-  true,
-  'Sin fichero de pol\u00edtica ni AGY_SANDBOX, el sandbox debe estar activo'
+  false,
+  'Sin fichero de política ni AGY_SANDBOX, el sandbox va inactivo'
 );
 fs.rmSync(dirSinPolitica, { recursive: true, force: true });
 console.log('✔ Test 9: loadPolicy() respeta fichero y entorno');
