@@ -14,7 +14,11 @@
     {
       "name": "antigravity",
       "version": "0.4.0",
-      "source": "./",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/KZvilla/claude-plugin-antigravity.git",
+        "sha": "aecd21139d461e9b955451e5e375eb1749dfcbf2"
+      },
       "description": "Collaborate with Google Antigravity CLI (agy) as autonomous subagents and pair-programming partners: planning, adversarial review, audits, deep research, session summaries, voice narration and an outbound Telegram bridge.",
       "category": "development",
       "author": {

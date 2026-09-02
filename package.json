@@ -9,6 +9,8 @@
     "bridge:test": "npm --prefix telegram-bridge test",
     "test:mcp": "node -e \"const { spawn } = require('child_process'); const p = spawn('node', ['mcp-server/index.js']); p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'test',version:'1.0'}}})+'\\n'); p.stdout.once('data', d => { console.log('MCP OK:', JSON.parse(d.toString()).result.serverInfo.name); p.kill(); process.exit(0); });\"",
     "validate": "claude plugin validate .",
+    "release:stamp": "node scripts/stamp-release.mjs",
+    "release:check": "node scripts/stamp-release.mjs --check",
     "bridge:daemon": "npm --prefix telegram-bridge run daemon",
     "bridge:daemon:check": "npm --prefix telegram-bridge run daemon:check",
     "bridge:daemon:install": "npm --prefix telegram-bridge run daemon:install"

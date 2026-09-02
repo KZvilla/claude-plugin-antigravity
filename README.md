@@ -405,6 +405,7 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 | | `commands/agy-usage.md` | `/agy-usage` |
 | **Voice Chat** | `voice-chat/text_loop.py` / `voice_loop.py` | Real-Time Voice Mode companion scripts (console / real mic + VAD) |
 | **Distribution** | `.claude-plugin/marketplace.json` | Marketplace manifest - the recommended install channel |
+| | `scripts/stamp-release.mjs` | Pins the marketplace entry to the release tag's commit sha (`npm run release:stamp`) |
 | | `install.ps1` / `install.sh` | Script install, kept as a fallback |
 
 ---
