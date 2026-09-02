@@ -114,6 +114,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 | `/lagrange:voices [lang]` | List all installed Voicebox voice profiles, languages, roles, and service health |
 | `/lagrange:research <topic>` | Conduct deep web research with cited sources and structured insights |
 | `/lagrange:usage` | Display token telemetry, context saturation, and quota health |
+| `/lagrange:bridge` | Diagnose the Telegram bridge: daemon state, which copy of the code each half runs, credentials and shared state |
 
 > **Tip:** You can also ask Claude naturally — *"Delegale a agy que resuma esta sesión"*, *"¿Qué voces tengo disponibles?"* o *"Cuando termines, ejecuta la narración con Diego"* — and it will pick the right tool automatically.
 
@@ -121,7 +122,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 
 ## 🔧 MCP Tools Reference
 
-Fifteen tools exposed via the MCP server — twelve `agy_*` tools plus three `telegram_*` bridge tools:
+Seventeen tools exposed via the MCP server — thirteen `agy_*` tools plus four `telegram_*` bridge tools:
 
 | Tool | Mode | Default Timeout | Description |
 |------|------|-----------------|-------------|
@@ -141,6 +142,7 @@ Fifteen tools exposed via the MCP server — twelve `agy_*` tools plus three `te
 | `telegram_notify` | outbound | — | Push a notification (with optional file attachment) to your phone — see [Telegram Bridge Setup](#-telegram-bridge-setup-manual--never-automated) |
 | `telegram_ask` | Human-in-the-Loop | 5m | Ask a question with tappable choice buttons and block until you answer on your phone |
 | `telegram_send_voice` | outbound audio | — | Send an audio file (or the latest Voicebox generation) as a native voice note |
+| `telegram_bridge_status` | read-only | — | Diagnose the bridge: daemon state, which copy of the code each half runs, where credentials and shared state resolve — `/lagrange:bridge` |
 
 ### `agy_run` — Full Parameters
 
@@ -553,6 +555,14 @@ npm run bridge
 Note that the two copies share their **runtime state** regardless (`state.json` and `bridge.lock` live in the same durable directory), which is what lets an installed `telegram_ask` be answered by a daemon running from a clone.
 
 The bidirectional bot (`telegram-bridge/bot.js`, started with `npm run bridge` from the repo root) is only needed if you want to message the bot *from* your phone to kick off `agy` tasks or answer `telegram_ask` prompts — outbound notifications and voice notes work without it. To keep it running across logins, see `telegram-bridge/daemon.ps1` (`npm run bridge:daemon:install` on Windows).
+
+#### The daemon must be installed from a clone, not from the plugin copy
+
+`daemon.ps1 install` **refuses to run** from a managed plugin directory (`.claude/plugins/cache/…` or `…/marketplaces/…`), and the reason is worth stating because the failure it prevents is invisible.
+
+The scheduled task stores an **absolute path**. Each plugin version installs into its own directory, and updating does not delete the old ones — so a daemon registered from `…/lagrange/0.9.1/` stays pinned to 0.9.1 forever. After the next update, the bot runs the old code while the MCP tools run the new one, and *nothing fails*: no error, no warning, just two halves of the same bridge on different code. If old versions were deleted the daemon would crash at logon and you would know; that they survive is exactly what makes this silent.
+
+Run `/lagrange:bridge` at any time to see which copy each half is running, along with daemon state, the effective `.env`, and the shared state paths. (`-Force` bypasses the check if you have a case we did not anticipate.)
 
 ---
 

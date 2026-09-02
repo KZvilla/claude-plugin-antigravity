@@ -31,7 +31,14 @@ param(
 
     # Registra la tarea con sesion interactiva, que muestra la ventana de
     # consola del bot. Util para depurar el arranque; por defecto va oculta.
-    [switch]$Visible
+    [switch]$Visible,
+
+    # Salta la comprobacion de directorio estable de `install`. Ver
+    # Assert-DirectorioEstable: instalar el daemon desde una copia gestionada del
+    # plugin lo ancla a una version concreta y el desfase resultante no da la
+    # cara. Existe para no bloquear un caso legitimo que no hayamos previsto, no
+    # como atajo.
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -192,7 +199,57 @@ function Get-LockInfo {
     } catch { return $null }
 }
 
+<#
+    Un daemon NO puede registrarse desde el directorio de una version instalada
+    del plugin.
+
+    `claude plugin update` instala cada version en su propia carpeta
+    (`plugins/cache/<market>/<plugin>/<version>/`) y NO borra las anteriores. La
+    tarea programada guarda una ruta absoluta, asi que un daemon registrado ahi
+    queda anclado a esa version para siempre: tras actualizar, el bot sigue
+    ejecutando el codigo viejo mientras las herramientas MCP corren el nuevo.
+
+    Y como el directorio antiguo sigue existiendo, nada falla. No hay error, no
+    hay aviso: solo dos mitades del mismo puente ejecutando codigo distinto, que
+    es de las cosas mas caras de diagnosticar. Si las versiones se borrasen, el
+    daemon reventaria al arrancar y el usuario se enteraria; que sobrevivan es
+    justo lo que hace este fallo silencioso.
+
+    El bridge es un servicio de larga vida con credenciales y estado propios:
+    quiere un directorio estable que el usuario haya elegido, no uno que el
+    gestor de plugins reemplace cada release.
+#>
+function Assert-DirectorioEstable {
+    $ruta = $BridgeDir -replace '\\', '/'
+    if ($ruta -notmatch '(?i)/(\.claude|claude)/plugins/(cache|marketplaces)/') { return }
+
+    Write-Host ''
+    Warn 'Este daemon NO puede instalarse desde una copia gestionada del plugin.'
+    Write-Host ''
+    Write-Host "  Directorio actual: $BridgeDir" -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '  Cada version del plugin se instala en su propia carpeta y las antiguas'
+    Write-Host '  no se borran. La tarea programada guardaria una ruta anclada a ESTA'
+    Write-Host '  version: tras el proximo `claude plugin update`, el bot seguiria'
+    Write-Host '  ejecutando este codigo mientras las herramientas MCP corren el nuevo,'
+    Write-Host '  sin ningun error que lo delate.'
+    Write-Host ''
+    Write-Host '  Instalalo desde un clon del repositorio:' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '    git clone https://github.com/KZvilla/claude-plugin-antigravity.git'
+    Write-Host '    cd claude-plugin-antigravity'
+    Write-Host '    npm run bridge:daemon:install'
+    Write-Host ''
+    Write-Host '  Las credenciales y el estado ya son compartidos, asi que el clon usara'
+    Write-Host '  el mismo .env y el mismo state.json que el plugin instalado.'
+    Write-Host ''
+    Write-Host '  Si aun asi quieres continuar, vuelve a ejecutarlo con -Force.' -ForegroundColor DarkGray
+    Write-Host ''
+    exit 1
+}
+
 function Invoke-Install {
+    if (-not $Force) { Assert-DirectorioEstable }
     $nodePath = Test-Prerequisites
 
     if (Get-BridgeTask) {

@@ -960,6 +960,14 @@ const TOOLS = [
     }
   },
   {
+    name: 'telegram_bridge_status',
+    description: 'Diagnose the Telegram bridge: whether the daemon is running, WHICH COPY of the bridge code it runs, where its credentials and shared state resolve to, and whether any of that disagrees with the copy these MCP tools run from. Read-only. Use it when Telegram behaves inconsistently — a notification that reports success but never arrives, a telegram_ask that never unblocks, or behaviour that does not match a change that was just made.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
     name: 'agy_narrate_voices',
     description: 'List and inspect available voice profiles in local Voicebox with their language, voice type (cloned vs preset), personality status, and default/fallback role assignments in Antigravity.',
     inputSchema: {
@@ -3613,6 +3621,116 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       return {
         content: [{ type: 'text', text: out }]
       };
+    }
+
+    case 'telegram_bridge_status': {
+      const bridgeDir = path.join(__dirname, '..', 'telegram-bridge');
+
+      // Import dinamico de un modulo ESM desde este servidor CommonJS. Se
+      // prefiere a duplicar la resolucion de rutas: si las dos copias
+      // discreparan, esta herramienta mentiria precisamente sobre lo que existe
+      // para detectar discrepancias.
+      let rutas;
+      try {
+        const { pathToFileURL } = require('node:url');
+        rutas = await import(pathToFileURL(path.join(bridgeDir, 'paths.js')).href);
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `No se pudo cargar telegram-bridge/paths.js: ${err.message}` }]
+        };
+      }
+
+      const dataDir = rutas.bridgeDataDirPath();
+      const stateFile = path.join(dataDir, 'state.json');
+      const lockFile = path.join(dataDir, 'bridge.lock');
+
+      // De donde saldria el bot si lo arrancara la tarea programada. Es LA
+      // comparacion que importa: el daemon guarda una ruta absoluta y puede
+      // apuntar a una copia distinta de la que sirve estas herramientas.
+      let daemonDir = null;
+      let daemonTaskState = null;
+      if (process.platform === 'win32') {
+        try {
+          const ps = execFileSync('powershell', [
+            '-NoProfile', '-Command',
+            "$t = Get-ScheduledTask -TaskName 'AntigravityTelegramBridge' -ErrorAction SilentlyContinue; " +
+            "if ($t) { \"$($t.State)`n$($t.Actions.Arguments)\" }"
+          ], { encoding: 'utf8', timeout: 10000, stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+          if (ps) {
+            const [estado, args] = ps.split(/\r?\n/);
+            daemonTaskState = estado || null;
+            const m = (args || '').match(/"?([A-Za-z]:[\\/][^"]*?)[\\/]daemon-hidden\.vbs"?/i)
+              || (args || '').match(/"?([A-Za-z]:[\\/][^"]*?)[\\/]bot\.js"?/i);
+            if (m) daemonDir = m[1];
+          }
+        } catch {}
+      }
+
+      let lock = null;
+      try { lock = JSON.parse(fs.readFileSync(lockFile, 'utf8')); } catch {}
+      let botVivo = false;
+      if (lock && Number.isInteger(lock.pid)) {
+        try { process.kill(lock.pid, 0); botVivo = true; } catch {}
+      }
+
+      let stateInfo = null;
+      try {
+        const s = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        stateInfo = {
+          chats: Object.keys(s.chats || {}).length,
+          asksPendientes: Object.values(s.pendingAsks || {}).filter(a => a.status === 'pending').length
+        };
+      } catch {}
+
+      const envCandidatos = rutas.bridgeEnvCandidates(bridgeDir);
+      const envActivo = envCandidatos.find(f => fs.existsSync(f)) || null;
+      const envDuradero = path.join(dataDir, '.env');
+
+      const norm = (p) => p ? path.resolve(p).replace(/\\/g, '/').toLowerCase() : null;
+      const mismaCopia = daemonDir ? norm(daemonDir) === norm(bridgeDir) : null;
+      const enCopiaGestionada = /(\.claude|claude)\/plugins\/(cache|marketplaces)\//i.test(norm(bridgeDir) || '');
+
+      let out = '### 🌉 Estado del Telegram Bridge\n\n';
+
+      out += '**Daemon**\n';
+      if (daemonTaskState) {
+        out += `- Tarea programada: \`${daemonTaskState}\`\n`;
+        out += `- Bot en ejecución: ${botVivo ? `✅ PID ${lock.pid} (desde ${lock.startedAt || 'desconocido'})` : '❌ no hay proceso vivo'}\n`;
+      } else if (process.platform === 'win32') {
+        out += '- Tarea programada: _no registrada_ (`npm run bridge:daemon:install` desde un clon)\n';
+      } else {
+        out += '- Tarea programada: _solo se consulta en Windows_\n';
+      }
+
+      out += '\n**Qué código corre cada mitad**\n';
+      out += `- Herramientas MCP: \`${bridgeDir}\`${enCopiaGestionada ? ' _(copia gestionada del plugin)_' : ''}\n`;
+      out += `- Daemon del bot: ${daemonDir ? `\`${daemonDir}\`` : '_desconocido_'}\n`;
+      if (mismaCopia === true) {
+        out += '- ✅ Ambas mitades corren la misma copia.\n';
+      } else if (mismaCopia === false) {
+        out += '- ⚠️ **Corren copias distintas.** El estado y las credenciales se comparten, así que\n';
+        out += '  el human-in-the-loop funciona igual; pero un cambio de código solo lo verá la mitad\n';
+        out += '  que lo tenga. Si algo no se comporta como esperas tras editar o actualizar, es aquí.\n';
+      }
+
+      out += '\n**Credenciales (.env)**\n';
+      out += envActivo ? `- Se usaría: \`${envActivo}\`\n` : '- ⚠️ No se encontró ningún `.env`.\n';
+      if (envActivo && path.resolve(envActivo) !== path.resolve(envDuradero)) {
+        out += `- ℹ️ Ubicación duradera recomendada: \`${envDuradero}\`\n`;
+        out += '  (un `.env` dentro del directorio de una versión se pierde en el próximo `claude plugin update`)\n';
+      } else if (envActivo) {
+        out += '- ✅ En la ubicación duradera: sobrevive a `claude plugin update`.\n';
+      }
+
+      out += '\n**Estado compartido**\n';
+      out += `- Directorio de datos: \`${dataDir}\`\n`;
+      out += `- \`state.json\`: ${stateInfo ? `✅ ${stateInfo.chats} chat(s), ${stateInfo.asksPendientes} ask(s) pendiente(s)` : '_todavía no existe_'}\n`;
+      out += `- \`bridge.lock\`: ${lock ? `PID ${lock.pid}` : '_ninguno_'}\n`;
+      out += '- Ambas copias resuelven aquí, que es lo que permite responder desde el móvil\n';
+      out += '  un `telegram_ask` registrado por la otra.\n';
+
+      return { content: [{ type: 'text', text: out }] };
     }
 
     case 'agy_narrate_voices': {

@@ -45,6 +45,26 @@ async function main() {
     check('agy_say NO acepta `session_id`', say && !say.inputSchema.properties.session_id);
   });
 
+  await group('telegram_bridge_status diagnostica el desfase entre copias', async () => {
+    // Existe por una razon concreta: durante el desarrollo, el daemon y las
+    // herramientas MCP pueden salir de copias distintas del bridge. No es un
+    // fallo -el estado se comparte-, pero explica por que un cambio de codigo
+    // solo lo ve una mitad, y sin esta herramienta hay que deducirlo a mano.
+    const t = tools.find(x => x.name === 'telegram_bridge_status');
+    check('esta en tools/list', !!t);
+    check('no necesita argumentos', t && JSON.stringify(t.inputSchema.properties) === '{}');
+    check('se describe como read-only', !!(t && /read-only/i.test(t.description)));
+    check('nombra el sintoma que resuelve', !!(t && /telegram_ask/i.test(t.description)));
+
+    const res = await server.callTool('telegram_bridge_status', {});
+    const texto = res.result && res.result.content && res.result.content[0].text;
+    check('no es un error', !(res.result && res.result.isError), texto);
+    check('informa que codigo corre cada mitad', !!(texto && /Herramientas MCP/.test(texto)));
+    check('informa el .env efectivo', !!(texto && /Credenciales/.test(texto)));
+    check('informa el estado compartido', !!(texto && /Estado compartido/.test(texto)));
+    check('nombra el directorio de datos', !!(texto && /antigravity-telegram-bridge/.test(texto)));
+  });
+
   await group('agy_say rechaza una llamada sin texto util', async () => {
     const res = await server.callTool('agy_say', { text: '   ' });
     const texto = res.result && res.result.content && res.result.content[0].text;
