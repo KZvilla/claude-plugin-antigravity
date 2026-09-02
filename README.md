@@ -457,18 +457,54 @@ git clone https://github.com/KZvilla/claude-plugin-antigravity.git "$HOME/.claud
 
 </details>
 
-### Migrating from a script install
+### Uninstalling a script install
 
-The two channels install to different places, so keeping both means Claude Code
-loads the plugin **twice** - duplicate commands, duplicate MCP tools. Remove the
-old clone before installing from the marketplace:
+Also the migration step: the two channels install to different places, so
+keeping both means Claude Code loads the plugin **twice** - duplicate commands,
+duplicate MCP tools. Remove the old clone before installing from the
+marketplace.
 
+The scripts only ever clone into `~/.claude/skills/antigravity`; they write
+nothing to `settings.json` and register no MCP server, so removing that
+directory is the whole uninstall. Two things deserve care, and both snippets
+below handle them: the `.env` inside it is git-ignored and exists nowhere else,
+and on Windows the bridge daemon may be a scheduled task pointing into the
+directory you are about to delete.
+
+**Linux / macOS:**
 ```bash
-rm -rf "$HOME/.claude/skills/antigravity"      # PowerShell: Remove-Item -Recurse -Force "$env:USERPROFILE\.claude\skills\antigravity"
+dir="$HOME/.claude/skills/antigravity"
+if [ -d "$dir" ]; then
+  pkill -f "$dir/telegram-bridge/bot.js" 2>/dev/null
+  [ -f "$dir/.env" ] && cp "$dir/.env" "$HOME/antigravity.env.bak"
+  rm -rf "$dir"
+  echo "Uninstalled. Copy of .env kept at ~/antigravity.env.bak"
+else
+  echo "No script install found."
+fi
 ```
 
-If you set up the Telegram bridge, **copy your `.env` out first** - it is
-git-ignored, so it only exists in that directory.
+**Windows (PowerShell):**
+```powershell
+$dir = Join-Path $env:USERPROFILE '.claude\skills\antigravity'
+if (Test-Path $dir) {
+    # Only unregister the bridge daemon if it was installed FROM this copy.
+    $t = Get-ScheduledTask -TaskName AntigravityTelegramBridge -ErrorAction SilentlyContinue
+    if ($t -and $t.Actions[0].WorkingDirectory -like "$dir*") {
+        Stop-ScheduledTask $t.TaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask $t.TaskName -Confirm:$false
+    }
+    if (Test-Path "$dir\.env") { Copy-Item "$dir\.env" (Join-Path $env:USERPROFILE 'antigravity.env.bak') -Force }
+    Remove-Item -Recurse -Force $dir
+    Write-Host "Uninstalled. Copy of .env kept at $env:USERPROFILE\antigravity.env.bak"
+} else { Write-Host 'No script install found.' }
+```
+
+Then **restart Claude Code** - `/reload-plugins` drops commands, agents and
+skills, but MCP tool schemas registered at session start stay until a restart.
+
+A leftover `pluginUsage` entry in `~/.claude.json` is harmless telemetry; there
+is nothing else to clean up.
 
 ### Post-Install
 
