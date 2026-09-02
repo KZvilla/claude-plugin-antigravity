@@ -1,5 +1,5 @@
-# ──────────────────────────────────────────────────────────────────────
-# Antigravity Telegram Bridge — Daemon para Windows (Task Scheduler)
+﻿# ──────────────────────────────────────────────────────────────────────
+# Antigravity Telegram Bridge - Daemon para Windows (Task Scheduler)
 #
 # Registra el bridge como tarea programada que arranca al iniciar sesión y se
 # reinicia sola si el proceso muere. Fase 5 del plan de integración.
@@ -26,6 +26,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Este fichero se guarda en UTF-8 CON BOM y hay que mantenerlo asi: sin el,
+# powershell.exe (5.1) lo decodifica como ANSI, y una raya larga se convierte
+# en tres caracteres uno de los cuales el parser trata como comilla. El script
+# entero deja de parsear con errores que no apuntan a la linea culpable.
+# La consola necesita el mismo tratamiento para que los acentos no salgan rotos.
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
 $TaskName   = 'AntigravityTelegramBridge'
 $BridgeDir  = $PSScriptRoot
@@ -130,7 +137,7 @@ function Invoke-Install {
 
     Register-ScheduledTask -TaskName $TaskName `
         -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
-        -Description 'Antigravity Telegram Bridge — long polling saliente, compatible con CGNAT.' | Out-Null
+        -Description 'Antigravity Telegram Bridge - long polling saliente, compatible con CGNAT.' | Out-Null
 
     Ok "Tarea '$TaskName' registrada (arranca al iniciar sesión)."
     Info "Log: $LogFile"
@@ -182,7 +189,7 @@ function Invoke-Status {
     } else {
         $proc = Get-Process -Id $lock.pid -ErrorAction SilentlyContinue
         if ($proc) {
-            Ok "Bot vivo — PID $($lock.pid), desde $($lock.startedAt)"
+            Ok "Bot vivo - PID $($lock.pid), desde $($lock.startedAt)"
         } else {
             Warn "Lockfile huérfano del PID $($lock.pid): el proceso ya no existe."
         }

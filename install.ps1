@@ -1,5 +1,5 @@
-# ──────────────────────────────────────────────────────────────────────
-# Antigravity Claude Code Plugin — One-Command Installer (Windows)
+﻿# ──────────────────────────────────────────────────────────────────────
+# Antigravity Claude Code Plugin - One-Command Installer (Windows)
 # Usage:  irm https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.ps1 | iex
 # ──────────────────────────────────────────────────────────────────────
 $ErrorActionPreference = "Stop"
