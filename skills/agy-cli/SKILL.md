@@ -11,7 +11,7 @@ This skill teaches Claude Code how to collaborate with **Google Antigravity CLI 
 
 ## Overview
 
-Antigravity (`agy`) is Google's terminal-based AI development agent powered by Gemini models (Gemini 2.5 / 3.7 Pro and Flash) with extended reasoning capabilities. It has native terminal access, code editing capabilities, background task management, and workspace discovery.
+Antigravity (`agy`) is Google's terminal-based AI development agent powered by Gemini models (Gemini 3.8 / 3.7 Flash, 3.1 Pro) with extended reasoning capabilities. It has native terminal access, code editing capabilities, background task management, and workspace discovery.
 
 By pairing Claude Code and Antigravity:
 - **Claude Code** acts as the primary orchestrator, interactive driver, or pair programmer.
@@ -39,7 +39,7 @@ Run an autonomous Antigravity session.
 ```json
 {
   "prompt": "Implement the missing test cases in src/lib/__tests__/date-contract.test.ts. Run 'npm test' to verify and fix any failures.",
-  "model": "gemini-3.7-flash",
+  "model": "gemini-3.8-flash",
   "effort": "high",
   "permissions": {
     "allow": ["read", "edit", "commands"],
@@ -131,7 +131,7 @@ Persist defaults for model, effort, or ALLOW/DENY policies in `~/.claude/antigra
 
 ```json
 {
-  "model": "gemini-3.7-flash",
+  "model": "gemini-3.8-flash",
   "effort": "high",
   "permissions": {
     "deny_paths": [".env*", "**/*.key", "**/*.pem"],
@@ -147,7 +147,7 @@ Read Claude Code's session JSONL log, preprocess turns to filter noise, and gene
 ```json
 {
   "focus": "full",
-  "model": "gemini-3.7-flash",
+  "model": "gemini-3.8-flash",
   "effort": "high"
 }
 ```

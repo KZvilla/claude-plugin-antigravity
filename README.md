@@ -76,7 +76,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 | | Feature | Description |
 |---|---------|-------------|
 | 🤖 | **Autonomous Subagent** | Claude spins up Antigravity to execute complex tasks, multi-step refactors, and test suites |
-| 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (2.5 / 3.7 Pro & Flash) with configurable reasoning effort |
+| 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (3.8 / 3.7 Flash, 3.1 Pro) with configurable reasoning effort |
 | 🎙️ | **Voice Checkpoint Narration** | Zero-Claude-token spoken status updates via Voicebox TTS with automatic profile fallback |
 | 🗣️ | **Real-Time Voice Mode** | Full-duplex spoken conversation with barge-in, mic capture, and Silero VAD (`voice-chat/`) — zero-cloud audio via a local Voicebox TTS/STT engine |
 | 📋 | **Anti-Compaction Session Summary** | Analyzes raw JSONL session logs with Gemini (1M-2M context) to generate persistent, structured Markdown docs before context degrades |
@@ -146,7 +146,7 @@ Fifteen tools exposed via the MCP server — twelve `agy_*` tools plus three `te
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `prompt` | `string` | *required* | Task instructions for Antigravity |
-| `model` | `string` | `"gemini-3.7-flash"` | Gemini model to use |
+| `model` | `string` | `"gemini-3.8-flash"` | Gemini model to use |
 | `effort` | `string` | `"high"` | Reasoning effort: `"low"`, `"medium"`, `"high"` |
 | `mode` | `string` | `"accept-edits"` | `"accept-edits"` (read+write) or `"plan"` (read-only) |
 | `permissions` | `object` | — | Granular ALLOW/DENY policies (see below) |
@@ -191,7 +191,7 @@ Denying `"network"` blocks web search and URL fetching, and makes `agy_research`
 
 ```json
 {
-  "model": "gemini-3.7-flash",
+  "model": "gemini-3.8-flash",
   "effort": "high",
   "timeout_minutes": 15,
   "permissions": {
@@ -218,25 +218,25 @@ Ask Claude naturally:
 
 | Parameter | Values |
 |-----------|--------|
-| `model` | `"gemini-3.7-flash"`, `"gemini-3.1-pro"` |
+| `model` | `"gemini-3.8-flash"`, `"gemini-3.1-pro"` |
 | `effort` | `"low"`, `"medium"`, `"high"` |
 
 ### 2. Persistent Defaults via Tool
 
-> *"Configurá agy por defecto con modelo gemini-3.7-flash y effort high"*
+> *"Configurá agy por defecto con modelo gemini-3.8-flash y effort high"*
 
 ### 3. Environment Variables
 
 **Windows (PowerShell):**
 ```powershell
-$env:AGY_MODEL = "gemini-3.7-flash"
+$env:AGY_MODEL = "gemini-3.8-flash"
 $env:AGY_EFFORT = "high"
 $env:AGY_TIMEOUT_MINUTES = "20"
 ```
 
 **Linux / macOS (Bash / Zsh):**
 ```bash
-export AGY_MODEL="gemini-3.7-flash"
+export AGY_MODEL="gemini-3.8-flash"
 export AGY_EFFORT="high"
 export AGY_TIMEOUT_MINUTES="20"
 ```

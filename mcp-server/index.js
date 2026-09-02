@@ -307,7 +307,7 @@ function getModelSpecs(modelName) {
     };
   }
   return {
-    name: modelName || 'gemini-3.7-flash',
+    name: modelName || 'gemini-3.8-flash',
     contextWindow: 1048576,
     maxOutput: 65536,
     description: 'Google Gemini Flash (High-Speed Hybrid Thinking)'
@@ -445,7 +445,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for Antigravity session (e.g. "gemini-3.7-flash", "gemini-3.1-pro"). Falls back to configured default.'
+          description: 'Model override for Antigravity session (e.g. "gemini-3.8-flash", "gemini-3.1-pro"). Falls back to configured default.'
         },
         effort: {
           type: 'string',
@@ -494,7 +494,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for planning session (e.g. "gemini-3.1-pro", "gemini-3.7-flash").'
+          description: 'Model override for planning session (e.g. "gemini-3.1-pro", "gemini-3.8-flash").'
         },
         effort: {
           type: 'string',
@@ -681,7 +681,7 @@ const TOOLS = [
       properties: {
         model: {
           type: 'string',
-          description: 'Default model name (e.g. "gemini-3.7-flash", "gemini-3.1-pro").'
+          description: 'Default model name (e.g. "gemini-3.8-flash", "gemini-3.1-pro").'
         },
         effort: {
           type: 'string',
@@ -791,7 +791,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for "start" (e.g. "gemini-3.7-flash", "gemini-3.6-flash").'
+          description: 'Model override for "start" (e.g. "gemini-3.8-flash", "gemini-3.7-flash").'
         },
         effort: {
           type: 'string',
@@ -872,7 +872,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for Gemini narration generation (defaults to fast gemini-3.7-flash).'
+          description: 'Model override for Gemini narration generation (defaults to fast gemini-3.8-flash).'
         },
         effort: {
           type: 'string',
@@ -1879,7 +1879,7 @@ function offloadLargePrompt(args) {
 // Los modelos de agy no aceptan cualquier esfuerzo. `agy models` los lista con
 // el sufijo incorporado, y la familia Pro solo existe en low y high:
 //
-//   gemini-3.7-flash-high|medium|low     gemini-3.1-pro-high|low
+//   gemini-3.8-flash-high|medium|low     gemini-3.7-flash-high|medium|low     gemini-3.1-pro-high|low
 //
 // Pasar el nombre corto es valido -- agy lo resuelve con --effort -- pero
 // `--model gemini-3.1-pro --effort medium` es un error que solo aparece tras
@@ -2250,7 +2250,7 @@ async function handleToolCall(name, args) {
       }
 
       const usageData = loadUsage();
-      const activeModel = config.defaultModel || 'gemini-3.7-flash';
+      const activeModel = config.defaultModel || 'gemini-3.8-flash';
       const specs = getModelSpecs(activeModel);
       const s = usageData.session;
       const last = usageData.last_call;
@@ -2321,7 +2321,7 @@ async function handleToolCall(name, args) {
         content: [
           {
             type: 'text',
-            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default: gemini-3.7-flash)'}\n- Default Effort: ${config.defaultEffort || 'high'}\n- Default Timeout: ${config.defaultTimeoutMinutes}m\n- Permissions Policy:\n  * Allow: [${p.allow.join(', ')}]\n  * Deny: [${p.deny.join(', ') || 'none'}]\n  * Denied Paths: [${p.deny_paths.join(', ')}]\n  * Denied Commands: [${p.deny_commands.join(', ')}]\n  * Sandbox Mode: ${p.sandbox ? 'enabled' : 'disabled'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
+            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default: gemini-3.8-flash)'}\n- Default Effort: ${config.defaultEffort || 'high'}\n- Default Timeout: ${config.defaultTimeoutMinutes}m\n- Permissions Policy:\n  * Allow: [${p.allow.join(', ')}]\n  * Deny: [${p.deny.join(', ') || 'none'}]\n  * Denied Paths: [${p.deny_paths.join(', ')}]\n  * Denied Commands: [${p.deny_commands.join(', ')}]\n  * Sandbox Mode: ${p.sandbox ? 'enabled' : 'disabled'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
           }
         ]
       };

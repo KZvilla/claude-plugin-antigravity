@@ -145,7 +145,7 @@ export function loadPolicy(cwd = resolveWorkspace()) {
  * @param {Object} options
  * @param {string} options.prompt Tarea o instrucción a ejecutar
  * @param {'plan'|'accept-edits'} [options.mode='accept-edits'] Modo de ejecución
- * @param {string} [options.model] Modelo override (ej. gemini-3.7-flash)
+ * @param {string} [options.model] Modelo override (ej. gemini-3.8-flash)
  * @param {'low'|'medium'|'high'} [options.effort='high'] Esfuerzo de razonamiento
  * @param {number} [options.timeoutMinutes=15] Timeout en minutos
  * @param {string} [options.conversationId] ID para continuar conversación multiturno
