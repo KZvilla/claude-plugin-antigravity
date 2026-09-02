@@ -8,18 +8,18 @@
   },
   "metadata": {
     "description": "Delegación a Google Antigravity CLI (agy) desde Claude Code: subagentes autónomos, planificación, revisión adversarial, voz y puente de Telegram",
-    "version": "0.5.2"
+    "version": "0.5.3"
   },
   "plugins": [
     {
       "name": "antigravity",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "source": {
         "source": "url",
         "url": "https://github.com/KZvilla/claude-plugin-antigravity.git",
         "sha": "31df2b92408a9304101ec108853c9ad422ac0f8d"
       },
-      "description": "Collaborate with Google Antigravity CLI (agy) as autonomous subagents and pair-programming partners: planning, adversarial review, audits, deep research, session summaries, voice narration and an outbound Telegram bridge.",
+      "description": "Delegate to Google Antigravity CLI (agy) as an autonomous subagent: planning, adversarial review, evidence-based audits, cited web research and session summaries. Optional voice narration (local Voicebox) and push notifications to your own Telegram bot, both inactive until you add credentials. Unofficial; not affiliated with Google.",
       "category": "development",
       "author": {
         "name": "KZvilla"

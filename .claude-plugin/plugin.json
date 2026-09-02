@@ -1,13 +1,13 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "antigravity",
-  "version": "0.5.2",
-  "description": "Collaborate with Google Antigravity CLI (agy) as autonomous subagents and pair-programming partners",
+  "version": "0.5.3",
+  "description": "Delegate to Google Antigravity CLI (agy) as an autonomous subagent: planning, adversarial review, evidence-based audits, cited web research and session summaries. Optional voice narration (local Voicebox) and push notifications to your own Telegram bot, both inactive until you add credentials. Unofficial; not affiliated with Google.",
   "author": {
     "name": "KZvilla",
     "email": "krisvilla93@gmail.com"
   },
-  "homepage": "https://antigravity.google",
+  "homepage": "https://github.com/KZvilla/claude-plugin-antigravity",
   "keywords": [
     "antigravity",
     "agy",
