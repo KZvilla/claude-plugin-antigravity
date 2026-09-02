@@ -38,3 +38,7 @@ telegram-bridge/daemon-hidden.vbs
 telegram-bridge/daemon.log
 state.json
 *.lock
+
+# Agent rules & workspace customizations (excluded from repo)
+AGENTS.md
+.agents/
