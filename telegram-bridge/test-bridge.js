@@ -842,6 +842,83 @@ console.log('✔ Test 34 [BE-007]: TELEGRAM_BRIDGE_STATE_FILE tiene precedencia 
 }
 console.log('✔ Test 35 [BE-007]: importar bot.js no crea directorios ni migra ficheros');
 
+// Test 36 [BE-008]: el .env se busca tambien en una ubicacion que sobrevive a
+// `claude plugin update`.
+//
+// Contexto: cada version del plugin se instala en su PROPIO directorio
+// (`cache/<market>/<plugin>/<version>/`) y la actualizacion no arrastra los
+// ficheros que no estan en git. Un `.env` junto al codigo desaparece en cada
+// update, y el sintoma no es un fallo de arranque sino una herramienta que un
+// dia responde «No hay usuarios configurados»: credenciales duraderas dentro
+// de un directorio versionado, la misma clase de defecto que BE-007.
+{
+  const paths = await import('./paths.js');
+  const dataPrevio = process.env.TELEGRAM_BRIDGE_DATA_DIR;
+  const envPrevio = process.env.TELEGRAM_BRIDGE_ENV_FILE;
+
+  const raiz = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-env-'));
+  const datos = path.join(raiz, 'datos');
+  const plugin = path.join(raiz, 'cache', 'lagrange', '0.9.0');
+  const bridge = path.join(plugin, 'telegram-bridge');
+  fs.mkdirSync(bridge, { recursive: true });
+  fs.mkdirSync(datos, { recursive: true });
+  process.env.TELEGRAM_BRIDGE_DATA_DIR = datos;
+  delete process.env.TELEGRAM_BRIDGE_ENV_FILE;
+
+  const candidatos = paths.bridgeEnvCandidates(bridge);
+  assert.strictEqual(candidatos[0], path.join(bridge, '.env'), 'Primero el .env del bridge');
+  assert.strictEqual(candidatos[1], path.join(plugin, '.env'), 'Luego el de la raiz del plugin');
+  assert.strictEqual(candidatos[2], path.join(datos, '.env'), 'Y por ultimo el duradero');
+
+  // Sin ningun .env: el diagnostico debe decir donde se busco y cual es el
+  // duradero. Sin eso, el fallo no es accionable.
+  const diag = paths.describeEnvSearch(candidatos);
+  for (const c of candidatos) assert(diag.includes(c), `El diagnostico nombra ${c}`);
+  assert(/plugin update/i.test(diag), 'El diagnostico explica por que se pierde');
+  assert.strictEqual(paths.loadBridgeEnv(bridge).loaded, null, 'Sin ficheros no carga nada');
+
+  // Solo el duradero: es el escenario justo despues de un plugin update.
+  fs.writeFileSync(path.join(datos, '.env'), 'AGY_TEST_ENV_MARKER=duradero\n');
+  delete process.env.AGY_TEST_ENV_MARKER;
+  const soloDuradero = paths.loadBridgeEnv(bridge);
+  assert.strictEqual(soloDuradero.loaded, path.join(datos, '.env'), 'Cae al .env duradero');
+  assert.strictEqual(process.env.AGY_TEST_ENV_MARKER, 'duradero', 'Y carga sus variables');
+
+  // El .env local sigue teniendo precedencia: ninguna instalacion existente
+  // cambia de fichero por este arreglo.
+  fs.writeFileSync(path.join(bridge, '.env'), 'AGY_TEST_ENV_MARKER=local\n');
+  delete process.env.AGY_TEST_ENV_MARKER;
+  const conLocal = paths.loadBridgeEnv(bridge);
+  assert.strictEqual(conLocal.loaded, path.join(bridge, '.env'), 'El .env local gana');
+  assert.strictEqual(process.env.AGY_TEST_ENV_MARKER, 'local', 'Y son sus variables las que quedan');
+
+  // Override explicito por encima de todo.
+  const suelto = path.join(raiz, 'otro.env');
+  fs.writeFileSync(suelto, 'AGY_TEST_ENV_MARKER=explicito\n');
+  process.env.TELEGRAM_BRIDGE_ENV_FILE = suelto;
+  delete process.env.AGY_TEST_ENV_MARKER;
+  assert.strictEqual(paths.loadBridgeEnv(bridge).loaded, suelto, 'TELEGRAM_BRIDGE_ENV_FILE manda');
+  assert.strictEqual(process.env.AGY_TEST_ENV_MARKER, 'explicito', 'Y carga sus variables');
+
+  // Buscar el .env NO puede crear el directorio de datos: la busqueda ocurre en
+  // el cuerpo del modulo, y crear directorios ahi convierte un import en una
+  // escritura (la misma invariante que fija el Test 35).
+  const datosVirgen = path.join(raiz, 'sin-crear');
+  process.env.TELEGRAM_BRIDGE_DATA_DIR = datosVirgen;
+  delete process.env.TELEGRAM_BRIDGE_ENV_FILE;
+  paths.bridgeEnvCandidates(bridge);
+  paths.loadBridgeEnv(bridge);
+  assert(!fs.existsSync(datosVirgen), 'Buscar el .env no crea el directorio de datos');
+
+  delete process.env.AGY_TEST_ENV_MARKER;
+  if (dataPrevio === undefined) delete process.env.TELEGRAM_BRIDGE_DATA_DIR;
+  else process.env.TELEGRAM_BRIDGE_DATA_DIR = dataPrevio;
+  if (envPrevio === undefined) delete process.env.TELEGRAM_BRIDGE_ENV_FILE;
+  else process.env.TELEGRAM_BRIDGE_ENV_FILE = envPrevio;
+  fs.rmSync(raiz, { recursive: true, force: true });
+}
+console.log('✔ Test 36 [BE-008]: el .env sobrevive a un plugin update sin cambiar la precedencia');
+
 // Limpieza: solo el directorio temporal de test
 try {
   fs.rmSync(path.dirname(TEST_STATE_FILE), { recursive: true, force: true });

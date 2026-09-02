@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { registerPendingAsk, getPendingAsk, expirePendingAsk } from './state.js';
 import { splitMessage, markdownToTelegramHtml, escapeHtml } from './formatter.js';
 import { assertPathAllowed, PolicyViolationError, redactSecrets } from './policy.js';
+import { loadBridgeEnv, describeEnvSearch } from './paths.js';
 
 // Límite propio del caption de Telegram, muy por debajo de los 4096 del texto.
 const CAPTION_LIMIT = 1024;
@@ -19,15 +20,12 @@ const CAPTION_LIMIT = 1024;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// 1. Carga de Variables de Entorno
-const envLocal = path.join(__dirname, '.env');
-const envRoot = path.join(__dirname, '..', '.env');
-
-if (fs.existsSync(envLocal)) {
-  if (typeof process.loadEnvFile === 'function') process.loadEnvFile(envLocal);
-} else if (fs.existsSync(envRoot)) {
-  if (typeof process.loadEnvFile === 'function') process.loadEnvFile(envRoot);
-}
+// 1. Carga de Variables de Entorno.
+// Incluye una ubicación duradera fuera del directorio versionado del plugin:
+// `claude plugin update` instala cada versión en su propia carpeta y no
+// arrastra el .env, así que uno colocado junto al código se pierde en cada
+// actualización. Ver bridgeEnvCandidates() en paths.js.
+const envSearch = loadBridgeEnv(__dirname).searched;
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const rawAllowedIds = process.env.ALLOWED_USER_IDS || '';
@@ -53,7 +51,12 @@ export function getDefaultChatId(targetChatId = null) {
   }
   if (ALLOWED_USER_IDS.length > 0) return ALLOWED_USER_IDS[0];
 
-  throw new Error('No hay usuarios configurados en ALLOWED_USER_IDS ni se especificó un targetChatId.');
+  // Enumerar donde se busco el .env convierte este fallo -el sintoma tipico de
+  // un plugin recien actualizado- en algo que se puede arreglar sin adivinar.
+  throw new Error(
+    'No hay usuarios configurados en ALLOWED_USER_IDS ni se especificó un targetChatId.\n\n' +
+    describeEnvSearch(envSearch)
+  );
 }
 
 /**

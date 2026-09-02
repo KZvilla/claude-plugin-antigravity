@@ -8,7 +8,7 @@ import { runAgyTask, getAgyStatus, resolveWorkspace, resolveExtraDirs } from './
 import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk, formatElapsed, finalProgressLabel } from './formatter.js';
 import { redactSecrets } from './policy.js';
 import { startLogRotation } from './logrotate.js';
-import { resolveDataFile, legacyDataFile } from './paths.js';
+import { resolveDataFile, legacyDataFile, loadBridgeEnv, describeEnvSearch } from './paths.js';
 import {
   getConversationId,
   setConversationId,
@@ -34,16 +34,11 @@ const __dirname = path.dirname(__filename);
 // handler suyo podía probarse, y los criterios de verificación que hablan de
 // «simular un update» eran inaplicables.
 
-const envLocal = path.join(__dirname, '.env');
-const envRoot = path.join(__dirname, '..', '.env');
-
-if (typeof process.loadEnvFile === 'function') {
-  if (fs.existsSync(envLocal)) {
-    process.loadEnvFile(envLocal);
-  } else if (fs.existsSync(envRoot)) {
-    process.loadEnvFile(envRoot);
-  }
-}
+// Incluye una ubicación duradera fuera del directorio versionado del plugin:
+// `claude plugin update` instala cada versión en su propia carpeta y no
+// arrastra el .env, así que uno colocado junto al código se pierde en cada
+// actualización. Ver bridgeEnvCandidates() en paths.js.
+const envSearch = loadBridgeEnv(__dirname);
 
 /**
  * Whitelist de IDs autorizados. Se resuelve por llamada, no en el cuerpo del
@@ -719,8 +714,9 @@ function main() {
 
   const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   if (!TELEGRAM_BOT_TOKEN) {
-    console.error('[FATAL] Falta la variable TELEGRAM_BOT_TOKEN en el archivo .env.');
-    console.error('Por favor copia telegram-bridge/.env.example a telegram-bridge/.env y configura tu token.');
+    console.error('[FATAL] Falta la variable TELEGRAM_BOT_TOKEN.');
+    console.error(describeEnvSearch(envSearch.searched));
+    console.error('Parte de telegram-bridge/.env.example para crearlo.');
     process.exit(1);
   }
 
@@ -764,6 +760,7 @@ function main() {
   // no coinciden aquí, el human-in-the-loop no puede resolverse y el síntoma
   // —un ask que nunca se desbloquea— no apunta a su causa.
   console.log(`• Código: ${__dirname}`);
+  console.log(`• Credenciales: ${envSearch.loaded || 'ninguna (.env no encontrado)'}`);
   console.log(`• Estado compartido: ${getStateFilePath()}`);
   console.log(`• Workspace: ${resolveWorkspace()}${process.env.WORKSPACE_DIR ? '' : '  (sin WORKSPACE_DIR: es el cwd del proceso)'}`);
   const extraDirs = resolveExtraDirs();

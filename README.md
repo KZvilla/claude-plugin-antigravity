@@ -522,16 +522,26 @@ The Telegram tools (`telegram_notify`, `telegram_ask`, `telegram_send_voice`, an
 
 #### Where the `.env` has to live
 
-`.env` is git-ignored on purpose, so no install channel ever brings it along — only tracked files are fetched. It has to sit at the **plugin root of the copy that actually runs**, and where that is depends on how you installed:
+`.env` is git-ignored on purpose, so no install channel ever brings it along — only tracked files are fetched. It is searched for in this order, and the first one that exists wins:
 
-| Install channel | Put `.env` at | Survives an update? |
+| # | Location | Survives `claude plugin update`? |
 |---|---|---|
-| Marketplace | `~/.claude/plugins/cache/kzvilla-lagrange/lagrange/<version>/.env` | **No** — the path is versioned, so a new version means a new empty directory |
-| Git clone (development) | `<clone>/.env` | Yes |
+| 1 | `$TELEGRAM_BRIDGE_ENV_FILE` (an exact path, if you set it) | Yes |
+| 2 | `<plugin>/telegram-bridge/.env` | **No** — inside the versioned install directory |
+| 3 | `<plugin>/.env` | **No** — same reason |
+| 4 | `%LOCALAPPDATA%\antigravity-telegram-bridge\.env`<br>(`$XDG_STATE_HOME/antigravity-telegram-bridge/.env` elsewhere) | **Yes** |
 
-A `.env` in a separate dev checkout does nothing for the installed plugin: outbound Telegram delivery will look unconfigured from the live plugin even though a manual test run elsewhere works fine.
+**If you installed from the marketplace, use row 4.** Each version is installed into its own directory (`.../lagrange/<version>/`), and an update creates a new, empty one — a `.env` in rows 2 or 3 is left behind in the previous version. The failure is quiet: nothing breaks at startup, and the next Telegram tool call simply reports `No hay usuarios configurados`. That message now lists every path it searched, so you can see which one it expected.
 
-Because of the second row, **if you use the Telegram bridge, run it from a git clone**, not from the marketplace cache. The marketplace channel is the right one for the plugin itself (commands, agents, MCP tools); the bridge is a long-running daemon with its own credentials and state, and it wants a stable directory:
+Rows 2 and 3 stay first in the order so that existing installs and dev checkouts keep using exactly the file they already use.
+
+```bash
+# Marketplace install — durable location (Windows)
+mkdir -p "$LOCALAPPDATA/antigravity-telegram-bridge"
+cp telegram-bridge/.env.example "$LOCALAPPDATA/antigravity-telegram-bridge/.env"
+```
+
+A dev checkout keeps its own `.env` next to the code:
 
 ```bash
 git clone https://github.com/KZvilla/claude-plugin-antigravity.git
@@ -539,6 +549,8 @@ cd claude-plugin-antigravity
 cp telegram-bridge/.env.example .env    # then fill in the two values
 npm run bridge
 ```
+
+Note that the two copies share their **runtime state** regardless (`state.json` and `bridge.lock` live in the same durable directory), which is what lets an installed `telegram_ask` be answered by a daemon running from a clone.
 
 The bidirectional bot (`telegram-bridge/bot.js`, started with `npm run bridge` from the repo root) is only needed if you want to message the bot *from* your phone to kick off `agy` tasks or answer `telegram_ask` prompts — outbound notifications and voice notes work without it. To keep it running across logins, see `telegram-bridge/daemon.ps1` (`npm run bridge:daemon:install` on Windows).
 
