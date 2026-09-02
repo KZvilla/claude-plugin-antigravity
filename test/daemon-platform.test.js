@@ -70,6 +70,11 @@ async function main() {
     check('usa systemd --user, no una unidad de sistema', /systemctl --user/.test(sh));
     check('los logs van al journal', /journalctl --user/.test(sh));
     check('avisa sobre linger', /enable-linger/.test(sh));
+    // Se informa en un solo sitio: `install` termina llamando a `status`, asi
+    // que comprobarlo en ambos lo imprimia dos veces en cada instalacion.
+    check('el estado de linger se informa una sola vez',
+      (sh.match(/loginctl show-user/g) || []).length === 1,
+      `${(sh.match(/loginctl show-user/g) || []).length} comprobaciones`);
   });
 
   await group('La unidad de systemd esta bien formada', () => {

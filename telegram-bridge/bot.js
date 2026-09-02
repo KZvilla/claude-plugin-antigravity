@@ -763,6 +763,21 @@ function main() {
   console.log(`• Credenciales: ${envSearch.loaded || 'ninguna (.env no encontrado)'}`);
   console.log(`• Estado compartido: ${getStateFilePath()}`);
   console.log(`• Workspace: ${resolveWorkspace()}${process.env.WORKSPACE_DIR ? '' : '  (sin WORKSPACE_DIR: es el cwd del proceso)'}`);
+
+  // Sin WORKSPACE_DIR, el workspace es el cwd — y bajo un gestor de servicios
+  // ese cwd es la propia carpeta del bridge, porque tanto la unidad de systemd
+  // como la tarea programada la fijan como directorio de trabajo. El resultado
+  // es que un /run desde el movil opera sobre el codigo del propio puente.
+  //
+  // No se bloquea: puede ser deliberado, y negarse a arrancar por una
+  // configuracion por defecto seria peor. Pero se dice, porque el banner por si
+  // solo no delata que esa ruta es el codigo y no un proyecto.
+  const ws = resolveWorkspace();
+  if (path.resolve(ws) === path.resolve(__dirname) || path.resolve(ws) === path.resolve(__dirname, '..')) {
+    console.warn('  ⚠️  Ese workspace es el CODIGO DEL PROPIO BRIDGE.');
+    console.warn('      Una tarea lanzada desde Telegram editaria este plugin, no tu proyecto.');
+    console.warn('      Fija WORKSPACE_DIR en el .env a un directorio de trabajo acotado.');
+  }
   const extraDirs = resolveExtraDirs();
   if (extraDirs.length > 0) {
     console.log(`• Directorios extra: ${extraDirs.join(', ')}`);

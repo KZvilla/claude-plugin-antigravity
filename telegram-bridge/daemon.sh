@@ -312,23 +312,8 @@ invoke_install() {
   info "Unidad: $UNIT_FILE"
   info "Logs:   journalctl --user -u $UNIT_NAME -f"
 
-  # El equivalente de la semantica "al iniciar sesion" de Task Scheduler. Sin
-  # linger, el servicio muere al cerrar la ultima sesion del usuario y no
-  # arranca en el boot. Es la piedra con la que tropieza todo el mundo, asi que
-  # se comprueba en vez de asumirlo.
-  if command -v loginctl >/dev/null 2>&1; then
-    local linger
-    linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo 'no')"
-    if [ "$linger" != "yes" ]; then
-      echo
-      warn 'El servicio se detendra al cerrar sesion y no arrancara en el boot.'
-      printf '%s  Para que sobreviva:%s  sudo loginctl enable-linger %s\n' "$C_INFO" "$C_OFF" "$USER"
-      echo
-    else
-      ok "Linger activo: el servicio sobrevive al cierre de sesion."
-    fi
-  fi
-
+  # El estado de linger lo informa `invoke_status`, que se llama justo debajo.
+  # Comprobarlo tambien aqui lo imprimia dos veces en cada instalacion.
   sleep 2
   invoke_status
 }
@@ -389,12 +374,21 @@ invoke_status() {
 
   info "Datos: $DATA_DIR"
 
+  # El equivalente de la semantica "al iniciar sesion" de Task Scheduler. Sin
+  # linger, el servicio muere al cerrar la ultima sesion del usuario y no
+  # arranca en el boot: parece sano justo despues de instalarlo y desaparece
+  # tras el siguiente reinicio. Se comprueba en vez de asumirlo, y se informa
+  # en un solo sitio -aqui- porque `install` termina llamando a este mismo
+  # `status`.
   if command -v loginctl >/dev/null 2>&1; then
     local linger
     linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo 'no')"
-    [ "$linger" = "yes" ] \
-      && ok 'Linger activo: sobrevive al cierre de sesion.' \
-      || warn "Linger inactivo: se detiene al cerrar sesion (sudo loginctl enable-linger $USER)."
+    if [ "$linger" = "yes" ]; then
+      ok 'Linger activo: sobrevive al cierre de sesion.'
+    else
+      warn 'Linger INACTIVO: el servicio se detendra al cerrar sesion y no arrancara en el boot.'
+      printf '%s  Para que sobreviva:%s  sudo loginctl enable-linger %s\n' "$C_INFO" "$C_OFF" "$USER"
+    fi
   fi
 }
 
