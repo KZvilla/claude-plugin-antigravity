@@ -12,6 +12,11 @@ const readline = require('node:readline');
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
+const {
+  POLISH_SUGGESTED_OVER,
+  normalizeSpokenText,
+  getPolishPrompt
+} = require('./spoken-text.js');
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
 
@@ -144,7 +149,7 @@ function loadUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, research: 0, summary: 0, narrate: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, research: 0, summary: 0, narrate: 0, say: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -240,7 +245,7 @@ function resetUsage() {
     session_started_at: new Date().toISOString(),
     session: {
       total_calls: 0,
-      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, research: 0, summary: 0, narrate: 0 },
+      calls_by_tool: { run: 0, plan: 0, review: 0, audit: 0, research: 0, summary: 0, narrate: 0, say: 0 },
       input_tokens: 0,
       output_tokens: 0,
       thinking_tokens: 0,
@@ -841,7 +846,7 @@ const TOOLS = [
   },
   {
     name: 'agy_narrate',
-    description: 'Narrate a voice summary of the latest completed checkpoint or task via Voicebox Text-To-Speech. Zero-Claude-token architecture: extracts checkpoint details directly from Claude Code session logs, generates a concise 2-3 sentence conversational update using Gemini (agy), and plays audio locally on your speakers via Voicebox.',
+    description: 'Narrate a voice summary of the latest completed checkpoint or task via Voicebox Text-To-Speech. Zero-Claude-token architecture: it takes no text and writes the script itself, extracting checkpoint details directly from Claude Code session logs and condensing them into a 2-3 sentence spoken update via Gemini (agy). To speak a specific message you already have, use agy_say instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -892,6 +897,66 @@ const TOOLS = [
           description: 'When true, plays the audio aloud through your PC speakers (synthesized via POST /generate, then played with the native OS player — never Voicebox /speak, which double-plays). Defaults to false: silent generation, delivered to Telegram without scaring anyone. The /lagrange:narrate slash command sets this to true, since asking for narration out loud implies hearing it.'
         }
       }
+    }
+  },
+  {
+    name: 'agy_say',
+    description: 'Speak a specific text out loud via Voicebox Text-To-Speech, and optionally deliver it to Telegram as a voice note. Use this when YOU already have the exact message to say. To narrate a summary of what was just done in this session instead, use agy_narrate, which derives the script from the session log on its own and takes no text.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          description: 'The text to speak. Written for the ear, not the eye: keep it to a couple of sentences. Markdown, code blocks, URLs, file paths and emoji are stripped automatically (they are unlistenable), and anything that looks like a secret is redacted before it is spoken or sent. Text beyond ~1200 characters is truncated at a sentence boundary — pass polish:true instead to have it condensed.'
+        },
+        polish: {
+          type: 'boolean',
+          description: 'When true, agy (Gemini) rewrites the text into a short spoken-style update before synthesis. Costs an extra round-trip of a few seconds, so leave it off for text that is already short and conversational. Worth it for raw logs, long output, or notes that were written to be read rather than heard.'
+        },
+        voice: {
+          type: 'string',
+          description: 'Voice profile name or keyword (e.g. "Emily", "Diego Alvarez", "Isabel", "Aria", "Aiden"). Defaults to "Emily" for English and "Diego Alvarez" for Spanish.'
+        },
+        language: {
+          type: 'string',
+          enum: ['en', 'es'],
+          description: 'Spoken language ("es" or "en"). Automatically inferred from voice name if omitted.'
+        },
+        personality: {
+          type: 'boolean',
+          description: 'When true, adopts the persona configured on the Voicebox profile. Defaults to false (neutral professional tone).'
+        },
+        local_playback: {
+          type: 'boolean',
+          description: 'When true, plays the audio aloud through the PC speakers. Defaults to false: silent generation, delivered to Telegram without scaring anyone.'
+        },
+        send_telegram: {
+          type: 'boolean',
+          description: 'When true (default), delivers the synthesized speech as a native playable voice note to the mobile Telegram app.'
+        },
+        voicebox_url: {
+          type: 'string',
+          description: 'Custom Voicebox HTTP endpoint URL (defaults to configured URL or http://127.0.0.1:17493).'
+        },
+        voicebox_port: {
+          type: 'number',
+          description: 'Custom Voicebox port number if running on a non-default port.'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project working directory. Only used when polish is true.'
+        },
+        model: {
+          type: 'string',
+          description: 'Model override for the polish pass (defaults to the configured fast model). Ignored unless polish is true.'
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'Reasoning effort for the polish pass. Defaults to "low". Ignored unless polish is true.'
+        }
+      },
+      required: ['text']
     }
   },
   {
@@ -1471,6 +1536,178 @@ async function voiceboxModelsLoad(baseUrl, modelSize) {
   } catch (err) {
     return { ok: false, error: `Cannot reach Voicebox /models/load at ${baseUrl} (${err.message})` };
   }
+}
+
+// ==============================================================================
+// Narracion: tuberia de emision compartida por agy_narrate y agy_say
+// ==============================================================================
+
+/**
+ * Emite un texto ya saneado: Voicebox, reproduccion local opcional, entrega a
+ * Telegram y limpieza del .wav.
+ *
+ * Existe para que `agy_narrate` y `agy_say` compartan literalmente la misma
+ * tuberia. Son la misma emision con distinto origen del guion -una lo deriva
+ * del log de sesion, la otra lo recibe-, y mantener dos copias garantizaba que
+ * una arreglara un fallo que la otra conservase.
+ */
+async function emitNarration({
+  spokenText,
+  voiceboxUrl,
+  profile,
+  language,
+  personality = false,
+  localPlayback = false,
+  sendTelegram = true
+}) {
+  const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Roaming');
+  const genDir = path.join(appData, 'sh.voicebox.app', 'generations');
+  const beforeFiles = fs.existsSync(genDir) ? fs.readdirSync(genDir) : [];
+
+  let speakRes;
+  try {
+    speakRes = await sendVoiceboxGenerate(voiceboxUrl, spokenText, profile.id, language, { personality });
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+
+  let localPlayed = false;
+  let telegramDelivered = false;
+  let telegramError = null;
+  let generatedWavPath = null;
+
+  if (localPlayback) {
+    try {
+      generatedWavPath = await waitForGenerationFile(
+        genDir,
+        (speakRes && speakRes.id) ? speakRes.id : null,
+        beforeFiles,
+        90000
+      );
+      if (generatedWavPath) {
+        localPlayed = await playLocalAudio(generatedWavPath);
+      }
+    } catch (pErr) {
+      process.stderr.write(`[antigravity-mcp] Local playback error: ${pErr.message}\n`);
+    }
+  }
+
+  if (sendTelegram) {
+    const langLabel = language === 'es' ? 'Español' : 'Inglés';
+    try {
+      const tPayload = {
+        generationId: (speakRes && speakRes.id) ? speakRes.id : null,
+        beforeFiles,
+        waitForGeneration: !generatedWavPath,
+        timeoutSeconds: 95,
+        // El caption viaja al chat y a daemon.log. `spokenText` ya paso por
+        // redactSecrets en normalizeSpokenText, que es justo lo que hace seguro
+        // aceptar texto libre del llamante.
+        caption: `🎙️ "${spokenText}"\n(Voz: ${profile.name} • ${langLabel})`
+      };
+      if (generatedWavPath) {
+        tPayload.audioPath = generatedWavPath;
+      }
+      const tRes = await invokeTelegramBridge('--voice-json', tPayload);
+      if (tRes && tRes.ok) {
+        telegramDelivered = true;
+      } else {
+        telegramError = (tRes && tRes.error) ? tRes.error : 'Fallo desconocido enviando a Telegram.';
+      }
+    } catch (tErr) {
+      telegramError = tErr.message;
+    }
+    if (telegramError) {
+      process.stderr.write(`[antigravity-mcp] Telegram delivery failed: ${telegramError}\n`);
+    }
+  }
+
+  // Voicebox no borra sus generaciones: sin esto, generations/ crece sin limite.
+  if (generatedWavPath) {
+    try {
+      fs.unlinkSync(generatedWavPath);
+    } catch (delErr) {
+      process.stderr.write(`[antigravity-mcp] No se pudo borrar ${generatedWavPath}: ${delErr.message}\n`);
+    }
+  }
+
+  return { ok: true, speakRes, localPlayed, telegramDelivered, telegramError };
+}
+
+/**
+ * Bloque de salida comun a las dos herramientas de narracion.
+ */
+function formatNarrationOutput({ spokenText, profile, language, personality, localPlayback, emision, voiceboxUrl, voiceResolution }) {
+  const langLabel = language === 'es' ? 'Español' : 'Inglés';
+  const fallbackNotice = voiceResolution.isFallback
+    ? ` *(Fallback: ${voiceResolution.reason})*`
+    : ' *(Voz preferida)*';
+
+  let out = `**Texto narrado:**\n> "${spokenText}"\n\n`;
+  out += `**Detalles de la emisión:**\n`;
+  out += `- **Perfil de voz**: \`${profile.name}\` (${profile.voice_type || 'cloned'})${fallbackNotice}\n`;
+  out += `- **Idioma**: \`${langLabel} (${language})\`\n`;
+  out += `- **Modo de Personalidad**: ${personality ? `🎭 En personaje (\`${profile.personality || profile.description || 'expresivo'}\`)` : '👔 Neutral / Profesional'}\n`;
+  out += `- **Reproducción Local en PC**: ${localPlayback ? (emision.localPlayed ? '🔊 Reproducido limpiamente en altavoces (sin eco)' : '⚠️ Solicitado pero falló el reproductor local') : '🤫 Silencioso en PC'}\n`;
+  out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
+  if (emision.speakRes && emision.speakRes.id) {
+    out += `- **Voicebox Generation ID**: \`${emision.speakRes.id}\`\n`;
+  }
+  if (emision.telegramDelivered) {
+    out += `- **Telegram Móvil**: ✅ Nota de voz entregada a tu teléfono\n`;
+  } else if (emision.telegramError) {
+    out += `- **Telegram Móvil**: ⚠️ Falló el envío — ${emision.telegramError}\n`;
+  }
+  return out;
+}
+
+/**
+ * Resuelve Voicebox y el perfil de voz, o devuelve el error ya formateado para
+ * el cliente. Los dos primeros pasos son identicos en ambas herramientas.
+ */
+async function prepareNarrationTarget(args, config) {
+  const voiceboxUrl = resolveVoiceboxUrl(args, config);
+
+  const health = await checkVoiceboxHealth(voiceboxUrl);
+  if (!health.ok) {
+    return {
+      error: {
+        content: [{
+          type: 'text',
+          text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}\n\n*Asegúrate de iniciar la aplicación Voicebox en tu equipo (o especifica un puerto/URL personalizado si corre en otra dirección).*`
+        }]
+      }
+    };
+  }
+
+  let profiles = [];
+  try {
+    profiles = await getVoiceboxProfiles(voiceboxUrl);
+  } catch (err) {
+    return {
+      error: {
+        content: [{ type: 'text', text: `⚠️ Error al consultar los perfiles de voz de Voicebox: ${err.message}` }]
+      }
+    };
+  }
+
+  let voiceResolution;
+  try {
+    voiceResolution = resolveVoiceProfile(profiles, args.voice, args.language);
+  } catch (err) {
+    return {
+      error: {
+        content: [{ type: 'text', text: `⚠️ Error resolviendo el perfil de voz: ${err.message}` }]
+      }
+    };
+  }
+
+  return {
+    voiceboxUrl,
+    voiceResolution,
+    profile: voiceResolution.profile,
+    language: voiceResolution.language
+  };
 }
 
 function resolveVoiceProfile(profiles, requestedVoice, requestedLang) {
@@ -2301,7 +2538,7 @@ async function handleToolCall(name, args) {
       out += `- Quota / API Health: **${usageData.quota_status}**\n\n`;
 
       out += `**📈 Cumulative Session Usage:**\n`;
-      out += `- Total Delegated Calls: **${s.total_calls}** (run: ${s.calls_by_tool.run || 0}, plan: ${s.calls_by_tool.plan || 0}, review: ${s.calls_by_tool.review || 0}, audit: ${s.calls_by_tool.audit || 0}, research: ${s.calls_by_tool.research || 0}, summary: ${s.calls_by_tool.summary || 0}, narrate: ${s.calls_by_tool.narrate || 0})\n`;
+      out += `- Total Delegated Calls: **${s.total_calls}** (run: ${s.calls_by_tool.run || 0}, plan: ${s.calls_by_tool.plan || 0}, review: ${s.calls_by_tool.review || 0}, audit: ${s.calls_by_tool.audit || 0}, research: ${s.calls_by_tool.research || 0}, summary: ${s.calls_by_tool.summary || 0}, narrate: ${s.calls_by_tool.narrate || 0}, say: ${s.calls_by_tool.say || 0})\n`;
       out += `- Input Tokens: \`${formatTokens(s.input_tokens)}\`\n`;
       out += `- Output Tokens: \`${formatTokens(s.output_tokens)}\`\n`;
       out += `- Thinking / Reasoning Tokens: \`${formatTokens(s.thinking_tokens)}\`\n`;
@@ -3139,47 +3376,11 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
     case 'agy_narrate': {
       const cwd = args.cwd || process.cwd();
-      const voiceboxUrl = resolveVoiceboxUrl(args, config);
 
-      // 1. Verify Voicebox connectivity
-      const health = await checkVoiceboxHealth(voiceboxUrl);
-      if (!health.ok) {
-        return {
-          content: [{
-            type: 'text',
-            text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}\n\n*Asegúrate de iniciar la aplicación Voicebox en tu equipo (o especifica un puerto/URL personalizado si corre en otra dirección).*`
-          }]
-        };
-      }
-
-      // 2. Fetch available voice profiles
-      let profiles = [];
-      try {
-        profiles = await getVoiceboxProfiles(voiceboxUrl);
-      } catch (err) {
-        return {
-          content: [{
-            type: 'text',
-            text: `⚠️ Error al consultar los perfiles de voz de Voicebox: ${err.message}`
-          }]
-        };
-      }
-
-      // 3. Resolve profile & language (with Emily / Diego Alvarez defaults & fallbacks)
-      let voiceResolution;
-      try {
-        voiceResolution = resolveVoiceProfile(profiles, args.voice, args.language);
-      } catch (err) {
-        return {
-          content: [{
-            type: 'text',
-            text: `⚠️ Error resolviendo el perfil de voz: ${err.message}`
-          }]
-        };
-      }
-
-      const chosenProfile = voiceResolution.profile;
-      const targetLang = voiceResolution.language;
+      // 1-3. Voicebox, perfiles y resolucion de voz (comun con agy_say)
+      const destino = await prepareNarrationTarget(args, config);
+      if (destino.error) return destino.error;
+      const { voiceboxUrl, voiceResolution, profile: chosenProfile, language: targetLang } = destino;
 
       // 4. Locate session log & extract last checkpoint
       const logDir = getProjectLogDir(cwd);
@@ -3247,14 +3448,9 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         };
       }
 
-      // Clean spoken text: remove quotes, markdown, asterisks, brackets
-      let spokenText = (resData.response || agyRes.rawOutput || '').trim();
-      spokenText = spokenText
-        .replace(/^["'“”«»]+|["'“”«»]+$/g, '')
-        .replace(/[*#`_~]/g, '')
-        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-        .replace(/\n+/g, ' ')
-        .trim();
+      // El guion lo escribe un modelo con acceso al repo: pasa por el mismo
+      // saneado que el texto libre de agy_say, redaccion de secretos incluida.
+      let spokenText = normalizeSpokenText(resData.response || agyRes.rawOutput || '').text;
 
       if (!spokenText) {
         spokenText = targetLang === 'en'
@@ -3262,111 +3458,40 @@ Be thorough but concise. Prioritize primary sources and official documentation o
           : 'La última tarea se ha completado exitosamente.';
       }
 
-      // 5.9 Snapshot previo de archivos en generations/ para FIFO / detección exacta
-      const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Roaming');
-      const genDir = path.join(appData, 'sh.voicebox.app', 'generations');
-      const beforeFiles = fs.existsSync(genDir) ? fs.readdirSync(genDir) : [];
+      // Emision compartida con agy_say: Voicebox, altavoces, Telegram, limpieza.
+      const playLocally = Boolean(args.local_playback);
+      const emision = await emitNarration({
+        spokenText,
+        voiceboxUrl,
+        profile: chosenProfile,
+        language: targetLang,
+        personality: enablePersonality,
+        localPlayback: playLocally,
+        sendTelegram: args.send_telegram !== false
+      });
 
-      // 6. Send to Voicebox TTS: siempre usamos /generate para evitar el bug de doble reproducción de Voicebox
-      let speakRes;
-      try {
-        speakRes = await sendVoiceboxGenerate(voiceboxUrl, spokenText, chosenProfile.id, targetLang, {
-          personality: enablePersonality
-        });
-      } catch (err) {
+      if (!emision.ok) {
         return {
           content: [{
             type: 'text',
-            text: `⚠️ **Guión generado pero falló la generación en Voicebox:**\n\n"${spokenText}"\n\nError: ${err.message}`
+            text: `⚠️ **Guión generado pero falló la generación en Voicebox:**\n\n"${spokenText}"\n\nError: ${emision.error}`
           }]
         };
       }
 
-      const langLabel = targetLang === 'es' ? 'Español' : 'Inglés';
-      const playLocally = Boolean(args.local_playback);
-      let localPlayed = false;
-      let telegramDelivered = false;
-      let generatedWavPath = null;
-
-      // 6.1 Si se solicitó reproducción local, esperar a que el archivo termine y reproducirlo con el motor nativo de Windows (0 eco)
-      if (playLocally) {
-        try {
-          generatedWavPath = await waitForGenerationFile(
-            genDir,
-            (speakRes && speakRes.id) ? speakRes.id : null,
-            beforeFiles,
-            90000
-          );
-          if (generatedWavPath) {
-            localPlayed = await playLocalAudio(generatedWavPath);
-          }
-        } catch (pErr) {
-          process.stderr.write(`[antigravity-mcp] Local playback error: ${pErr.message}\n`);
-        }
-      }
-
-      // 6.2 Enviar nota de voz a Telegram si está configurado (por defecto activo)
-      let telegramError = null;
-      if (args.send_telegram !== false) {
-        try {
-          const tPayload = {
-            generationId: (speakRes && speakRes.id) ? speakRes.id : null,
-            beforeFiles,
-            waitForGeneration: !generatedWavPath,
-            timeoutSeconds: 95,
-            caption: `🎙️ "${spokenText}"\n(Voz: ${chosenProfile.name} • ${langLabel})`
-          };
-          if (generatedWavPath) {
-            tPayload.audioPath = generatedWavPath;
-          }
-          const tRes = await invokeTelegramBridge('--voice-json', tPayload);
-          if (tRes && tRes.ok) {
-            telegramDelivered = true;
-          } else {
-            telegramError = (tRes && tRes.error) ? tRes.error : 'Fallo desconocido enviando a Telegram.';
-          }
-        } catch (tErr) {
-          telegramError = tErr.message;
-        }
-        if (telegramError) {
-          process.stderr.write(`[antigravity-mcp] Telegram delivery failed: ${telegramError}\n`);
-        }
-      }
-
-      // 6.3 Limpieza: si reprodujimos localmente, el .wav quedó resuelto en
-      // generatedWavPath y ya cumplió su propósito (se reprodujo y, si correspondía,
-      // ya se lo pasamos a Telegram como audioPath). Voicebox no lo borra solo —
-      // sin esto, generations/ crece sin límite en cada narración.
-      if (generatedWavPath) {
-        try {
-          fs.unlinkSync(generatedWavPath);
-        } catch (delErr) {
-          process.stderr.write(`[antigravity-mcp] No se pudo borrar ${generatedWavPath}: ${delErr.message}\n`);
-        }
-      }
-
-      // 7. Format structured output for Claude
-      const fallbackNotice = voiceResolution.isFallback
-        ? ` *(Fallback: ${voiceResolution.reason})*`
-        : ' *(Voz preferida)*';
-
+      // 7. Salida estructurada. La cabecera comun la genera formatNarrationOutput;
+      // el contexto del checkpoint es lo unico propio de esta herramienta.
       let out = `### 🎙️ Narración de Voz Emitida (Voicebox)\n\n`;
-      out += `**Texto narrado:**\n`;
-      out += `> "${spokenText}"\n\n`;
-      out += `**Detalles de la emisión:**\n`;
-      out += `- **Perfil de voz**: \`${chosenProfile.name}\` (${chosenProfile.voice_type || 'cloned'})${fallbackNotice}\n`;
-      out += `- **Idioma**: \`${langLabel} (${targetLang})\`\n`;
-      out += `- **Modo de Personalidad**: ${enablePersonality ? `🎭 En personaje (\`${chosenProfile.personality || chosenProfile.description || 'expresivo'}\`)` : '👔 Neutral / Profesional'}\n`;
-      out += `- **Reproducción Local en PC**: ${playLocally ? (localPlayed ? '🔊 Reproducido limpiamente en altavoces (sin eco)' : '⚠️ Solicitado pero falló el reproductor local') : '🤫 Silencioso en PC'}\n`;
-      out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
-      if (speakRes && speakRes.id) {
-        out += `- **Voicebox Generation ID**: \`${speakRes.id}\`\n`;
-      }
-      if (telegramDelivered) {
-        out += `- **Telegram Móvil**: ✅ Nota de voz entregada a tu teléfono\n`;
-      } else if (telegramError) {
-        out += `- **Telegram Móvil**: ⚠️ Falló el envío — ${telegramError}\n`;
-      }
+      out += formatNarrationOutput({
+        spokenText,
+        profile: chosenProfile,
+        language: targetLang,
+        personality: enablePersonality,
+        localPlayback: playLocally,
+        emision,
+        voiceboxUrl,
+        voiceResolution
+      });
       out += `\n**Contexto del Checkpoint detectado:**\n`;
       out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
       out += `- **Estado de Tests**: \`${checkpoint.overallTestStatus}\`\n`;
@@ -3375,6 +3500,114 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       }
       if (duration) {
         out += `- **Tiempo de generación (Gemini)**: ${duration.toFixed(1)}s\n`;
+      }
+
+      return {
+        content: [{ type: 'text', text: out }]
+      };
+    }
+
+    case 'agy_say': {
+      const rawText = typeof args.text === 'string' ? args.text : '';
+      if (!rawText.trim()) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: 'agy_say requiere el parámetro `text` con el contenido a narrar.' }]
+        };
+      }
+
+      const destino = await prepareNarrationTarget(args, config);
+      if (destino.error) return destino.error;
+      const { voiceboxUrl, voiceResolution, profile: chosenProfile, language: targetLang } = destino;
+
+      const enablePersonality = Boolean(args.personality);
+      let polishDuration = 0;
+      let polishApplied = false;
+      let textoBase = rawText;
+
+      // El pulido es OPCIONAL y va antes del saneado. Es lo unico de esta
+      // herramienta que justifica una llamada a agy: reescribir en estilo
+      // hablado es tarea de lenguaje. Quitar markdown o redactar secretos no lo
+      // es, y mandarlos a un modelo solo anadiria latencia sin ganar nada —el
+      // llamante YA tiene el texto, que es la premisa de agy_say.
+      if (args.polish) {
+        const effectiveEffort = args.effort || 'low';
+        const effectiveModel = args.model || config.defaultModel;
+        const cliArgs = [
+          '--output-format', 'json',
+          '--dangerously-skip-permissions',
+          '--mode', 'plan',
+          '--effort', effectiveEffort
+        ];
+        if (effectiveModel) cliArgs.push('--model', effectiveModel);
+        cliArgs.push('-p', getPolishPrompt(rawText, targetLang, chosenProfile, enablePersonality));
+
+        const agyRes = await executeAgy(cliArgs, { cwd: args.cwd || process.cwd(), timeoutMinutes: 3 });
+        const resData = agyRes.data || {};
+        polishDuration = resData.duration_seconds || 0;
+
+        if (resData.usage) {
+          recordUsage('say', effectiveModel, effectiveEffort, resData.conversation_id || '', polishDuration, resData.usage, !agyRes.success, agyRes.error || '');
+        }
+
+        if (agyRes.success && (resData.response || agyRes.rawOutput)) {
+          textoBase = resData.response || agyRes.rawOutput;
+          polishApplied = true;
+        } else {
+          // Que falle el pulido no debe impedir hablar: se narra el original.
+          // Perder el mensaje por no poder embellecerlo seria el peor canje.
+          process.stderr.write(`[antigravity-mcp] Polish falló, se narra el texto original: ${agyRes.error || 'sin respuesta'}\n`);
+        }
+      }
+
+      const { text: spokenText, truncated, originalLength } = normalizeSpokenText(textoBase);
+
+      if (!spokenText) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: 'Tras sanear el texto no quedó nada que narrar. Probablemente era solo código, enlaces o emoji, que no se leen en voz alta.'
+          }]
+        };
+      }
+
+      const playLocally = Boolean(args.local_playback);
+      const emision = await emitNarration({
+        spokenText,
+        voiceboxUrl,
+        profile: chosenProfile,
+        language: targetLang,
+        personality: enablePersonality,
+        localPlayback: playLocally,
+        sendTelegram: args.send_telegram !== false
+      });
+
+      if (!emision.ok) {
+        return {
+          content: [{
+            type: 'text',
+            text: `⚠️ **Falló la generación en Voicebox:**\n\n"${spokenText}"\n\nError: ${emision.error}`
+          }]
+        };
+      }
+
+      let out = `### 🗣️ Texto Narrado (Voicebox)\n\n`;
+      out += formatNarrationOutput({
+        spokenText,
+        profile: chosenProfile,
+        language: targetLang,
+        personality: enablePersonality,
+        localPlayback: playLocally,
+        emision,
+        voiceboxUrl,
+        voiceResolution
+      });
+      out += `- **Origen del guión**: ${polishApplied ? `✨ Pulido por agy (${polishDuration.toFixed(1)}s)` : '📝 Texto del llamante, saneado localmente'}\n`;
+      if (truncated) {
+        out += `- **⚠️ Truncado**: el texto tenía ${originalLength} caracteres y se cortó en ${spokenText.length}. Usa \`polish: true\` para condensarlo en vez de recortarlo.\n`;
+      } else if (!polishApplied && originalLength > POLISH_SUGGESTED_OVER) {
+        out += `- **Sugerencia**: con ${originalLength} caracteres, \`polish: true\` daría una narración más escuchable.\n`;
       }
 
       return {

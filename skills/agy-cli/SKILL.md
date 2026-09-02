@@ -153,10 +153,20 @@ Read Claude Code's session JSONL log, preprocess turns to filter noise, and gene
 ```
 Available focuses: `"full"`, `"decisions"`, `"changes"`, `"debugging"`. Summaries are saved to `~/.claude/session-summaries/<date>-<session-id>.md`.
 
-### 10. `mcp__lagrange__agy_narrate` / `agy_narrate_voices`
-`agy_narrate` speaks a short status update out loud through local Voicebox TTS. It costs **zero Claude tokens**: the plugin reads the session log itself, has Gemini draft the spoken line, and sends it straight to Voicebox — Claude never writes the script. `agy_narrate_voices` lists the installed voice profiles, languages, and service health.
+### 10. `mcp__lagrange__agy_narrate` / `agy_say` / `agy_narrate_voices`
 
-Use when the user asks to *hear* an update, or names a voice ("narralo con Diego"). Pass `voice`/`language` when they specify one; `send_telegram` is on by default so the voice note also reaches their phone.
+Two speaking tools, and the difference is **who writes the words**:
+
+- **`agy_narrate` — you have nothing to say yet.** It takes no text. The plugin reads the session log itself, has Gemini draft a 2-3 sentence update, and sends it to Voicebox. Costs **zero Claude tokens**, because Claude never writes the script. This is the one for "narrate what just happened" / "cuéntame cómo fue".
+- **`agy_say` — you already have the exact message.** Pass it in `text`. Use it for anything you composed yourself: a heads-up, an answer, a warning, a line the user dictated.
+
+Picking the wrong one is the common failure: calling `agy_narrate` when the user asked you to say a *specific* sentence makes it ignore that sentence entirely and narrate the session instead.
+
+`agy_say` sanitizes locally and instantly — markdown, code blocks, file paths, URLs and emoji come out (they are unlistenable), and anything shaped like a secret is redacted before it is spoken or sent to Telegram. Add `polish: true` only when the text was written to be *read* rather than heard — a raw log, long output, dense notes. That costs an agy round-trip of a few seconds, so leave it off for a sentence you already phrased conversationally.
+
+`agy_narrate_voices` lists the installed voice profiles, languages, and service health.
+
+For both: pass `voice`/`language` when the user names one ("narralo con Diego"); `send_telegram` is on by default so the voice note also reaches their phone, and `local_playback` is off by default so nothing startles anyone.
 
 ### 11. `mcp__lagrange__agy_voice_stream`
 Backs the Real-Time Voice Mode ("Modo Charla") by keeping one long-lived streaming `agy` process alive across turns, instead of the blocking one-shot `agy_run` uses. Actions: `start`, `send`, `drain`, `status`, `stop`.

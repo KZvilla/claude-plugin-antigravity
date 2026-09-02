@@ -132,7 +132,8 @@ Fifteen tools exposed via the MCP server — twelve `agy_*` tools plus three `te
 | `agy_research` | read-only | 20m | Deep web research with cited sources — requires the `network` capability, errors out if denied |
 | `agy_session_summary` | read-only | 15m | Parse session JSONL and generate structured summary doc with Gemini |
 | `agy_voice_stream` | conversational | persistent (no fixed timeout) | Manage a long-lived, streaming `agy.exe` process for low-latency voice chat ("Modo Charla") — the backend behind `voice-chat/` |
-| `agy_narrate` | audio TTS | 3m | Spoken audio update of latest checkpoint via Voicebox (zero Claude tokens) |
+| `agy_narrate` | audio TTS | 3m | Spoken audio update of latest checkpoint via Voicebox (zero Claude tokens). Takes no text — it writes the script from the session log |
+| `agy_say` | audio TTS | — (3m with `polish`) | Speak a specific text you already have. Sanitized locally by default (markdown, paths, URLs, emoji stripped; secrets redacted); `polish: true` has Gemini condense it first |
 | `agy_narrate_voices` | read-only | — | List installed Voicebox voice profiles, languages, roles, and GPU health |
 | `agy_usage` | — | — | Session token telemetry, context window saturation, model limits, quota health |
 | `agy_status` | — | — | Binary path, CLI version, active model/effort defaults, permission policies |
@@ -299,6 +300,19 @@ Claude **does not** generate or summarize the text in its context window. Instea
 4. The plugin sends the text to Voicebox HTTP (`POST /generate`), which synthesizes a `.wav` silently, and then plays that file with the native OS audio player. (It deliberately avoids `POST /speak` — letting Voicebox do its own playback triggers a double-playback bug.)
 
 Running `/lagrange:narrate` plays the result on your speakers. When `agy_narrate` is called programmatically, local playback is off by default (`local_playback: false`) so background narration doesn't startle anyone — it still reaches your phone if the Telegram bridge is configured.
+
+### Speaking a specific text (`agy_say`)
+
+`agy_narrate` writes its own script and takes no text, which is exactly what you want for "tell me how it went" — and exactly what you don't want when the agent has a particular sentence to say. That is `agy_say`:
+
+```json
+{ "text": "El deploy termino, treinta y cinco pruebas en verde." }
+```
+
+It shares the whole emission pipeline with `agy_narrate` — same voice resolution, same Voicebox call, same local playback and Telegram delivery — and differs only in where the words come from. Two things are worth knowing:
+
+- **The text is sanitized locally, always.** Markdown, code blocks, file paths, URLs and emoji are stripped (none of them survive being read aloud), and anything shaped like a bot token is redacted *before* synthesis. That matters because the spoken text also becomes the Telegram caption and lands in `daemon.log`.
+- **`polish: true` is opt-in, not the default.** It has Gemini rewrite the text in spoken style, which is worth a few seconds for a raw log or long output, and wasted latency for a sentence you already phrased for the ear. The polish prompt is a *rewrite* instruction, not a summarize-from-facts one: it is explicitly forbidden from adding information the message didn't contain, so a narration can never invent a status that wasn't reported.
 
 ### Usage
 
