@@ -115,6 +115,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 | `/lagrange:research <topic>` | Conduct deep web research with cited sources and structured insights |
 | `/lagrange:usage` | Display token telemetry, context saturation, and quota health |
 | `/lagrange:bridge` | Diagnose the Telegram bridge: daemon state, which copy of the code each half runs, credentials and shared state |
+| `/lagrange:setup [track]` | Guided setup for the optional pieces — Voicebox, Telegram notifications, the bidirectional daemon (`voicebox`, `telegram`, `daemon`) |
 
 > **Tip:** You can also ask Claude naturally — *"Delegale a agy que resuma esta sesión"*, *"¿Qué voces tengo disponibles?"* o *"Cuando termines, ejecuta la narración con Diego"* — and it will pick the right tool automatically.
 
@@ -410,6 +411,7 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 | **Skills** | `skills/agy-cli/SKILL.md` | Context-aware delegation guidelines |
 | | `skills/adversarial-review/SKILL.md` | Skeptical, evidence-based audit guidelines |
 | | `skills/session-summary/SKILL.md` | Session summary & anti-compaction skill |
+| | `skills/setup/SKILL.md` | Guided setup for Voicebox, Telegram and the daemon — never handles secrets |
 | **Commands** | `commands/run.md` | `/lagrange:run <prompt>` |
 | | `commands/plan.md` | `/lagrange:plan <task>` |
 | | `commands/review.md` | `/lagrange:review [target]` |
@@ -513,6 +515,8 @@ claude plugin details lagrange@kzvilla-lagrange
 ### 🔐 Telegram Bridge Setup (Manual — Never Automated)
 
 The Telegram tools (`telegram_notify`, `telegram_ask`, `telegram_send_voice`, and `agy_narrate`'s `send_telegram` option) need your own bot token and chat ID in a `.env` file. **No install channel ever creates or copies them for you** — an installer that silently provisioned credentials would be a much worse security default than asking you to do it once, yourself.
+
+`/lagrange:setup telegram` walks you through the steps below and verifies the result by sending a test notification. It deliberately never asks for the token in the chat and never writes the file for you: anything typed into a Claude Code conversation is stored in the session JSONL, and `agy_session_summary` embeds that raw log into a prompt sent to Gemini — so a token pasted in chat can reach a third-party model through this plugin's own tooling. It tells you which file to create; you fill it in.
 
 1. Get a bot token from [@BotFather](https://t.me/BotFather) on Telegram.
 2. Get your numeric user ID from [@userinfobot](https://t.me/userinfobot).

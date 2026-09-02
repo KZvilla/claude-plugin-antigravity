@@ -104,8 +104,8 @@ function main() {
     // de `/` de todos los usuarios del plugin y compite por su atencion. Que
     // este numero falle al anadir uno obliga a justificar el alta en vez de
     // dejar que la superficie crezca sola.
-    check('ten commands present', commands.length === 10, `found ${commands.length}: ${commands.join(', ')}`);
-    check('three skills present', skills.length === 3, `found ${skills.length}: ${skills.join(', ')}`);
+    check('eleven commands present', commands.length === 11, `found ${commands.length}: ${commands.join(', ')}`);
+    check('four skills present', skills.length === 4, `found ${skills.length}: ${skills.join(', ')}`);
     check('no command carries the redundant agy- prefix',
       commands.every(c => !c.startsWith('agy-')), commands.filter(c => c.startsWith('agy-')).join(', '));
     check('no skill is named after the plugin',
