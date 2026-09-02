@@ -79,7 +79,9 @@ async function main() {
       `UNIT_DIR="${dir.replace(/\\/g, '/')}/unit"`,
       'UNIT_FILE="$UNIT_DIR/lagrange-telegram-bridge.service"',
       `eval "$(sed -n '/^write_unit()/,/^}/p' "${path.join(BRIDGE, 'daemon.sh').replace(/\\/g, '/')}")"`,
-      'write_unit "/usr/bin/node" "/home/u/.local/bin/agy"',
+      // La segunda ruta es la del BINARIO, no el comando renombrado en v0.5.0.
+      // El guardia de nombres no puede distinguirlos, de ahi la marca.
+      'write_unit "/usr/bin/node" "/home/u/.local/bin/agy"', // old-name-ok
       'cat "$UNIT_FILE"'
     ].join('\n'));
 
