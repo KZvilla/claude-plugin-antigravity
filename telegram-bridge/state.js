@@ -4,53 +4,223 @@ import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const STATE_FILE = path.join(__dirname, 'state.json');
+// Sobreescribible para que los tests no operen sobre el estado real del usuario.
+const STATE_FILE = process.env.TELEGRAM_BRIDGE_STATE_FILE
+  ? path.resolve(process.env.TELEGRAM_BRIDGE_STATE_FILE)
+  : path.join(__dirname, 'state.json');
 
-const DEFAULT_STATE = {
-  chats: {},
-  queue: [],
-  pendingAsks: {}
-};
+const LOCK_FILE = `${STATE_FILE}.lock`;
+
+// Un lock abandonado (proceso muerto a mitad de escritura) se considera obsoleto
+// pasado este tiempo. Una escritura de estado tarda milisegundos.
+const LOCK_STALE_MS = 5000;
+// Cuánto se espera por el lock antes de escribir igualmente. Bloquear al bot es
+// peor que una carrera improbable sobre un fichero de pocos kilobytes.
+const LOCK_WAIT_MS = 2000;
+// Los asks resueltos o expirados se purgan pasado este tiempo.
+const ASK_RETENTION_HOURS = 24;
+
+function emptyState() {
+  return { chats: {}, pendingAsks: {} };
+}
+
+// ==============================================================================
+// Exclusión mutua entre procesos
+// ==============================================================================
+//
+// `bot.js` y `notify.js` son procesos distintos (el servidor MCP lanza notify.js
+// por spawn) y ambos hacen ciclo completo leer-modificar-escribir sobre el mismo
+// fichero. Sin exclusión, un registerPendingAsk puede pisar un setConversationId
+// concurrente. Todo el ciclo va dentro del lock, no solo la escritura.
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireStateLock() {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+
+  for (;;) {
+    try {
+      return fs.openSync(LOCK_FILE, 'wx');
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        console.error(`[state] No se pudo tomar el lock: ${err.message}. Se escribe sin exclusión.`);
+        return null;
+      }
+      try {
+        if (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(LOCK_FILE);
+          continue;
+        }
+      } catch {
+        continue; // el lock desapareció entre el stat y ahora: reintentar
+      }
+      if (Date.now() >= deadline) {
+        console.error('[state] Lock ocupado más de lo razonable. Se escribe sin exclusión.');
+        return null;
+      }
+      sleepSync(20);
+    }
+  }
+}
+
+function releaseStateLock(fd) {
+  if (fd === null) return;
+  try { fs.closeSync(fd); } catch {}
+  try { fs.unlinkSync(LOCK_FILE); } catch {}
+}
 
 /**
- * Carga el estado persistido desde state.json
+ * Ejecuta un ciclo leer-modificar-escribir completo bajo lock.
+ * `mutator` recibe el estado fresco de disco; lo que devuelva se propaga al
+ * llamante. Si devuelve `false`, no se escribe nada.
  */
-export function loadState() {
-  if (!fs.existsSync(STATE_FILE)) {
-    return { ...DEFAULT_STATE, chats: {}, queue: [], pendingAsks: {} };
-  }
+function mutateState(mutator) {
+  const fd = acquireStateLock();
   try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    const state = readStateFromDisk();
+    purgeStaleAsks(state);
+    const result = mutator(state);
+    if (result !== false) {
+      writeStateToDisk(state);
+    }
+    return result;
+  } finally {
+    releaseStateLock(fd);
+  }
+}
+
+// ==============================================================================
+// Lectura y escritura
+// ==============================================================================
+
+// Caché del *parseo*, no de la lectura. El bucle de espera de
+// askTelegramQuestion relee el estado una vez por segundo durante hasta 300 s;
+// sin caché eso es un JSON.parse completo en cada vuelta.
+//
+// La clave es el contenido crudo, no `mtime` + tamaño: Windows sella los
+// tiempos de escritura con una granularidad muy por encima del milisegundo, así
+// que dos escrituras seguidas del mismo tamaño (dos IDs de conversación de
+// igual longitud, por ejemplo) compartían mtime y la caché seguía sirviendo
+// estado obsoleto. Leer unos pocos KB es barato; parsearlos no tanto.
+let cache = null;
+
+function parseState(raw) {
+  try {
     const parsed = JSON.parse(raw);
+    // `queue` es un campo legado: la cola vive ahora en memoria (queue.js) y se
+    // descarta al leer para no rehidratar Contexts muertos ni tokens antiguos.
     return {
       chats: parsed.chats || {},
-      queue: Array.isArray(parsed.queue) ? parsed.queue : [],
       pendingAsks: parsed.pendingAsks || {}
     };
   } catch (err) {
     console.error(`[state] Error leyendo state.json: ${err.message}. Reinicializando.`);
-    return { ...DEFAULT_STATE, chats: {}, queue: [], pendingAsks: {} };
+    return emptyState();
   }
 }
 
 /**
- * Guarda el estado en state.json de forma segura
+ * Lectura sin caché, para el ciclo leer-modificar-escribir bajo lock: ahí
+ * servir un parseo anterior podría pisar lo que otro proceso acabe de escribir.
  */
-export function saveState(state) {
+function readStateFromDisk() {
   try {
-    const data = JSON.stringify(state, null, 2);
-    fs.writeFileSync(STATE_FILE, data, 'utf8');
-  } catch (err) {
-    console.error(`[state] Error guardando state.json: ${err.message}`);
+    return parseState(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch {
+    return emptyState();
   }
 }
+
+/**
+ * Carga el estado persistido desde state.json, cacheando el parseo.
+ */
+export function loadState() {
+  let raw = null;
+  try {
+    raw = fs.readFileSync(STATE_FILE, 'utf8');
+  } catch {
+    cache = null;
+    return emptyState();
+  }
+
+  if (cache && cache.raw === raw) return cache.state;
+
+  const state = parseState(raw);
+  cache = { raw, state };
+  return state;
+}
+
+function writeStateToDisk(state) {
+  // Escritura atómica: un corte a mitad de un writeFileSync directo deja JSON
+  // truncado, y loadState lo reinicializaría a {} perdiendo en silencio todos
+  // los conversation_id y asks pendientes. El rename sí es atómico.
+  const tmp = `${STATE_FILE}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+    fs.renameSync(tmp, STATE_FILE);
+    cache = null; // el contenido cambió; que la próxima lectura lo recoja
+  } catch (err) {
+    console.error(`[state] Error guardando state.json: ${err.message}`);
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+/**
+ * Guarda el estado en state.json de forma atómica.
+ */
+export function saveState(state) {
+  const fd = acquireStateLock();
+  try {
+    writeStateToDisk(state);
+  } finally {
+    releaseStateLock(fd);
+  }
+}
+
+// ==============================================================================
+// Recolección de asks
+// ==============================================================================
+
+/**
+ * Elimina los asks resueltos o expirados con más de `retentionHours`.
+ * Los `pending` no se tocan: pueden tener un notify.js esperándolos.
+ * @returns {number} entradas eliminadas
+ */
+function purgeStaleAsks(state, retentionHours = ASK_RETENTION_HOURS) {
+  const cutoff = Date.now() - retentionHours * 3600 * 1000;
+  let removed = 0;
+
+  for (const [askId, ask] of Object.entries(state.pendingAsks || {})) {
+    if (ask.status === 'pending') continue;
+    const closedAt = Date.parse(ask.answeredAt || ask.expiredAt || ask.createdAt || '');
+    if (Number.isNaN(closedAt) || closedAt < cutoff) {
+      delete state.pendingAsks[askId];
+      removed++;
+    }
+  }
+
+  return removed;
+}
+
+/**
+ * Fuerza una purga inmediata de asks cerrados. Expuesta para los tests y para
+ * un futuro comando de mantenimiento.
+ */
+export function purgeAsks(retentionHours = ASK_RETENTION_HOURS) {
+  return mutateState((state) => purgeStaleAsks(state, retentionHours));
+}
+
+// ==============================================================================
+// Conversaciones por chat
+// ==============================================================================
 
 /**
  * Obtiene el último conversation_id asociado a un chat
  */
 export function getConversationId(chatId) {
-  const state = loadState();
-  const chat = state.chats[String(chatId)];
+  const chat = loadState().chats[String(chatId)];
   return chat ? chat.lastConversationId || null : null;
 }
 
@@ -58,103 +228,86 @@ export function getConversationId(chatId) {
  * Actualiza el conversation_id de un chat
  */
 export function setConversationId(chatId, conversationId, meta = {}) {
-  const state = loadState();
-  const idStr = String(chatId);
-  state.chats[idStr] = {
-    ...(state.chats[idStr] || {}),
-    lastConversationId: conversationId,
-    updatedAt: new Date().toISOString(),
-    ...meta
-  };
-  saveState(state);
+  mutateState((state) => {
+    const idStr = String(chatId);
+    state.chats[idStr] = {
+      ...(state.chats[idStr] || {}),
+      lastConversationId: conversationId,
+      updatedAt: new Date().toISOString(),
+      ...meta
+    };
+  });
 }
 
 /**
  * Limpia el conversation_id de un chat para iniciar sesión nueva
  */
 export function clearConversationId(chatId) {
-  const state = loadState();
-  const idStr = String(chatId);
-  if (state.chats[idStr]) {
+  mutateState((state) => {
+    const idStr = String(chatId);
+    if (!state.chats[idStr]) return false;
     delete state.chats[idStr].lastConversationId;
     state.chats[idStr].updatedAt = new Date().toISOString();
-    saveState(state);
-  }
-}
-
-/**
- * Agrega una tarea a la cola
- */
-export function enqueueTask(task) {
-  const state = loadState();
-  state.queue.push({
-    ...task,
-    enqueuedAt: new Date().toISOString()
   });
-  saveState(state);
-  return state.queue.length;
 }
 
-/**
- * Extrae la siguiente tarea de la cola
- */
-export function dequeueTask() {
-  const state = loadState();
-  if (state.queue.length === 0) return null;
-  const task = state.queue.shift();
-  saveState(state);
-  return task;
-}
-
-/**
- * Retorna la longitud actual de la cola
- */
-export function getQueueLength() {
-  const state = loadState();
-  return state.queue.length;
-}
+// ==============================================================================
+// Human-in-the-loop
+// ==============================================================================
 
 /**
  * Registra una pregunta pendiente de aprobación (Human-in-the-loop)
  */
 export function registerPendingAsk(askId, { question, options, chatId, messageId }) {
-  const state = loadState();
-  state.pendingAsks = state.pendingAsks || {};
-  state.pendingAsks[askId] = {
-    askId,
-    question,
-    options,
-    chatId,
-    messageId,
-    createdAt: new Date().toISOString(),
-    status: 'pending', // 'pending' | 'answered' | 'expired'
-    answer: null,
-    answeredBy: null,
-    answeredAt: null
-  };
-  saveState(state);
+  mutateState((state) => {
+    state.pendingAsks[askId] = {
+      askId,
+      question,
+      options,
+      chatId,
+      messageId,
+      createdAt: new Date().toISOString(),
+      status: 'pending', // 'pending' | 'answered' | 'expired'
+      answer: null,
+      answeredBy: null,
+      answeredAt: null
+    };
+  });
 }
 
 /**
  * Resuelve una pregunta pendiente cuando el usuario pulsa un botón en Telegram
  */
 export function resolvePendingAsk(askId, answer, answeredBy = null) {
-  const state = loadState();
-  if (state.pendingAsks && state.pendingAsks[askId]) {
-    state.pendingAsks[askId].status = 'answered';
-    state.pendingAsks[askId].answer = answer;
-    state.pendingAsks[askId].answeredBy = answeredBy;
-    state.pendingAsks[askId].answeredAt = new Date().toISOString();
-    saveState(state);
-    return state.pendingAsks[askId];
-  }
-  return null;
+  return mutateState((state) => {
+    const ask = state.pendingAsks[askId];
+    if (!ask) return false;
+    ask.status = 'answered';
+    ask.answer = answer;
+    ask.answeredBy = answeredBy;
+    ask.answeredAt = new Date().toISOString();
+    return ask;
+  }) || null;
+}
+
+/**
+ * Marca una pregunta como expirada al agotarse su plazo de espera.
+ * Sin esto los asks caducados quedan como `pending` para siempre y nunca se
+ * recolectan.
+ */
+export function expirePendingAsk(askId) {
+  return mutateState((state) => {
+    const ask = state.pendingAsks[askId];
+    if (!ask || ask.status !== 'pending') return false;
+    ask.status = 'expired';
+    ask.expiredAt = new Date().toISOString();
+    return ask;
+  }) || null;
 }
 
 /**
  * Obtiene el estado actual de una pregunta pendiente
  */
 export function getPendingAsk(askId) {
-  const state = loadState();
-  return (state.pendingAsks && state.pendingAsks[askId]) || null;
+  return loadState().pendingAsks[askId] || null;
 }

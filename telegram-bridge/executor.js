@@ -1,6 +1,7 @@
 import { spawn, execFileSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 
 /**
  * Resuelve la ruta del binario agy.exe de Antigravity
@@ -37,9 +38,106 @@ export function resolveAgyBin() {
 
 const AGY_BIN = resolveAgyBin();
 
-// Políticas de seguridad por defecto (heredadas del estándar del servidor MCP)
+// ==============================================================================
+// Política de permisos
+// ==============================================================================
+//
+// IMPORTANTE — qué se aplica de verdad y qué no:
+//
+//   `agy --help` (v1.1.22) NO expone ningún flag de política por ruta ni por
+//   comando. Los únicos controles reales del CLI son `--sandbox` (restricciones
+//   de terminal) y `--mode plan` (sesión de solo lectura). `deny_paths` y
+//   `deny_commands` se inyectan como texto delante del prompt: son una
+//   instrucción al modelo, no un control que el sistema pueda hacer cumplir.
+//
+// Se conservan porque reducen el riesgo en la práctica y porque mantienen la
+// paridad con el servidor MCP, pero `getAgyStatus()` los marca como
+// «sugeridos» para que `/status` no prometa una protección que no existe.
+
 const DEFAULT_DENY_COMMANDS = ['git push*', 'git reset --hard*', 'npm publish*', 'rm -rf /*'];
 const DEFAULT_DENY_PATHS = ['.env*', '**/*.key', '**/*.pem'];
+
+// Margen entre SIGTERM y SIGKILL al abortar una tarea.
+const SIGKILL_GRACE_MS = 5000;
+// Tope para consultar la versión del binario sin congelar el event loop.
+const AGY_VERSION_TIMEOUT_MS = 5000;
+
+/**
+ * Directorio de trabajo de las tareas. Fuente única de verdad: `bot.js` lo usa
+ * para el banner y el executor para lanzar `agy`, que antes discrepaban — el
+ * banner resolvía la raíz del repo y el executor usaba `process.cwd()`, que con
+ * `npm --prefix telegram-bridge start` es la carpeta del bridge.
+ */
+export function resolveWorkspace() {
+  return path.resolve(process.env.WORKSPACE_DIR || process.cwd());
+}
+
+/**
+ * Directorios extra que `agy` puede leer y escribir, de `AGY_ADD_DIRS`.
+ * Permite acotar `WORKSPACE_DIR` a un sandbox y abrir un repo concreto solo
+ * cuando hace falta, en lugar de ampliar el workspace entero.
+ */
+export function resolveExtraDirs() {
+  return (process.env.AGY_ADD_DIRS || '')
+    .split(',')
+    .map((d) => d.trim())
+    .filter(Boolean)
+    .map((d) => path.resolve(d));
+}
+
+function parseBool(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(String(value).trim());
+}
+
+/**
+ * Carga la política efectiva con la misma precedencia que el servidor MCP:
+ * defaults < ~/.claude/antigravity.json < <cwd>/.claude/antigravity.json < entorno.
+ * Así el bridge y el MCP no divergen cuando el usuario ajusta su política.
+ */
+export function loadPolicy(cwd = resolveWorkspace()) {
+  const policy = {
+    denyCommands: [...DEFAULT_DENY_COMMANDS],
+    denyPaths: [...DEFAULT_DENY_PATHS],
+    // Inactivo por defecto, y NO es un límite de rutas. `agy --help` lo describe
+    // como «terminal restrictions», y medido en Windows:
+    //   - la herramienta de escritura de archivos escribe fuera del workspace
+    //     igual con `--sandbox` que sin él;
+    //   - los comandos de terminal pasan por ShellExecute con elevación, o sea
+    //     un UAC por comando: si se cancela el comando falla, y si se acepta se
+    //     ejecuta como administrador.
+    // Activarlo por defecto sería peor que no hacerlo: no añade frontera y
+    // entrena al usuario a conceder admin a algo disparado desde Telegram.
+    // Se deja configurable, pero el límite real sigue siendo `--mode plan`.
+    sandbox: false,
+    configFile: null
+  };
+
+  const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  const candidates = [
+    homeDir ? path.join(homeDir, '.claude', 'antigravity.json') : null,
+    path.join(cwd, '.claude', 'antigravity.json')
+  ].filter(Boolean);
+
+  for (const file of candidates) {
+    if (!fs.existsSync(file)) continue;
+    try {
+      const perms = JSON.parse(fs.readFileSync(file, 'utf8')).permissions;
+      if (!perms) continue;
+      if (Array.isArray(perms.deny_commands)) policy.denyCommands = perms.deny_commands;
+      if (Array.isArray(perms.deny_paths)) policy.denyPaths = perms.deny_paths;
+      if (perms.sandbox !== undefined) policy.sandbox = Boolean(perms.sandbox);
+      policy.configFile = file;
+    } catch (err) {
+      console.error(`[executor] No se pudo leer ${file}: ${err.message}. Se ignora.`);
+    }
+  }
+
+  // El entorno gana: permite endurecer el bridge sin tocar la política del MCP.
+  policy.sandbox = parseBool(process.env.AGY_SANDBOX, policy.sandbox);
+
+  return policy;
+}
 
 /**
  * Ejecuta una tarea en Antigravity CLI de forma segura y estructurada
@@ -52,6 +150,9 @@ const DEFAULT_DENY_PATHS = ['.env*', '**/*.key', '**/*.pem'];
  * @param {number} [options.timeoutMinutes=15] Timeout en minutos
  * @param {string} [options.conversationId] ID para continuar conversación multiturno
  * @param {string} [options.cwd] Directorio de trabajo
+ * @param {boolean} [options.sandbox] Fuerza (o desactiva) `--sandbox` para esta tarea
+ * @param {(cancel: () => boolean) => void} [options.onSpawn] Recibe una función para
+ *        abortar esta tarea. Permite implementar /cancel sin exponer el ChildProcess.
  */
 export function runAgyTask(options = {}) {
   const {
@@ -61,9 +162,13 @@ export function runAgyTask(options = {}) {
     effort = process.env.AGY_EFFORT || 'high',
     timeoutMinutes = parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     conversationId = null,
-    cwd = process.env.WORKSPACE_DIR || process.cwd()
+    cwd = resolveWorkspace(),
+    sandbox = undefined,
+    onSpawn = null
   } = options;
 
+  const policy = loadPolicy(cwd);
+  const useSandbox = sandbox === undefined ? policy.sandbox : Boolean(sandbox);
   const timeoutMs = (timeoutMinutes + 1) * 60 * 1000;
 
   // Construcción de argumentos CLI
@@ -74,6 +179,18 @@ export function runAgyTask(options = {}) {
     '--mode', mode,
     '--effort', effort
   ];
+
+  // Restricciones de terminal, no de rutas: ver el comentario de loadPolicy().
+  if (useSandbox) {
+    cliArgs.push('--sandbox');
+  }
+
+  // Workspace explícito: sin esto `agy` depende del directorio desde el que se
+  // lanzó el proceso, y el usuario no tiene forma de saber cuál es.
+  cliArgs.push('--add-dir', cwd);
+  for (const dir of resolveExtraDirs()) {
+    if (dir !== cwd) cliArgs.push('--add-dir', dir);
+  }
 
   if (model) {
     cliArgs.push('--model', model);
@@ -98,10 +215,28 @@ export function runAgyTask(options = {}) {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
-    let killed = false;
+    let settled = false;
+    let killTimer = null;
 
-    console.log(`[executor] Ejecutando: ${AGY_BIN} (modo: ${mode}, conv: ${conversationId || 'nueva'}, cwd: ${cwd})`);
+    /**
+     * SIGTERM y, si el hijo lo ignora, SIGKILL. Antes solo se enviaba SIGTERM y
+     * se resolvía la promesa de inmediato, dejando posiblemente un agy.exe
+     * huérfano consumiendo cuota y CPU.
+     */
+    const terminate = (child) => {
+      try { child.kill('SIGTERM'); } catch {}
+      killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          console.warn('[executor] El proceso ignoró SIGTERM. Enviando SIGKILL.');
+          try { child.kill('SIGKILL'); } catch {}
+        }
+      }, SIGKILL_GRACE_MS);
+      killTimer.unref?.();
+    };
 
+    console.log(`[executor] Ejecutando: ${AGY_BIN} (modo: ${mode}, sandbox: ${useSandbox ? 'sí' : 'no'}, conv: ${conversationId || 'nueva'}, cwd: ${cwd})`);
+
+    const startedAt = Date.now();
     const child = spawn(AGY_BIN, cliArgs, {
       cwd,
       shell: false,
@@ -109,8 +244,9 @@ export function runAgyTask(options = {}) {
     });
 
     const timer = setTimeout(() => {
-      killed = true;
-      try { child.kill('SIGTERM'); } catch {}
+      if (settled) return;
+      settled = true;
+      terminate(child);
       resolve({
         success: false,
         error: `La tarea en Antigravity superó el tiempo límite de ${timeoutMinutes} minutos.`,
@@ -119,6 +255,24 @@ export function runAgyTask(options = {}) {
         stderr
       });
     }, timeoutMs);
+
+    if (typeof onSpawn === 'function') {
+      onSpawn(() => {
+        if (settled) return false;
+        settled = true;
+        clearTimeout(timer);
+        terminate(child);
+        resolve({
+          success: false,
+          cancelled: true,
+          error: 'Tarea cancelada por el usuario.',
+          conversationId,
+          stdout,
+          stderr
+        });
+        return true;
+      });
+    }
 
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString('utf8');
@@ -130,6 +284,8 @@ export function runAgyTask(options = {}) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      if (settled) return;
+      settled = true;
       resolve({
         success: false,
         error: `Error al iniciar ${AGY_BIN}: ${err.message}`,
@@ -141,7 +297,9 @@ export function runAgyTask(options = {}) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (killed) return;
+      if (killTimer) clearTimeout(killTimer);
+      if (settled) return;
+      settled = true;
 
       let parsed = null;
       try {
@@ -149,7 +307,11 @@ export function runAgyTask(options = {}) {
       } catch {}
 
       const activeConvId = (parsed && parsed.conversation_id) || conversationId || null;
-      const durationSeconds = (parsed && parsed.duration_seconds) || 0;
+      // Reloj de pared de ESTA tarea. `parsed.duration_seconds` es acumulado de
+      // toda la conversación, así que al reanudar una sesión vieja informaba
+      // horas para una respuesta de segundos.
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const sessionSeconds = (parsed && parsed.duration_seconds) || 0;
 
       if (code === 0 && (!parsed || parsed.status !== 'ERROR')) {
         const responseText = (parsed && parsed.response) || stdout || '(Sin respuesta generada)';
@@ -158,6 +320,7 @@ export function runAgyTask(options = {}) {
           data: parsed,
           conversationId: activeConvId,
           durationSeconds,
+          sessionSeconds,
           responseText,
           rawOutput: stdout
         });
@@ -176,6 +339,7 @@ export function runAgyTask(options = {}) {
           data: parsed,
           conversationId: activeConvId,
           durationSeconds,
+          sessionSeconds,
           error: errorMsg,
           stdout,
           stderr
@@ -185,24 +349,56 @@ export function runAgyTask(options = {}) {
   });
 }
 
+// La versión no cambia entre mensajes, y `execFileSync` sin timeout congela el
+// event loop: si el binario tarda o se cuelga, el bot deja de responder al long
+// polling. Se cachea y se acota el tiempo.
+let versionCache = null;
+
+function getAgyVersion() {
+  if (versionCache !== null) return versionCache;
+
+  const opts = { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: AGY_VERSION_TIMEOUT_MS };
+  let version = 'Desconocida';
+  try {
+    version = execFileSync(AGY_BIN, ['--version'], opts).trim();
+  } catch {
+    try {
+      version = execFileSync(AGY_BIN, ['help'], opts).split(/\r?\n/)[0].trim();
+    } catch {
+      // No se cachea el fallo: puede ser transitorio (binario actualizándose).
+      return 'Desconocida (no se pudo consultar el binario)';
+    }
+  }
+
+  versionCache = version;
+  return version;
+}
+
 /**
  * Consulta la versión e información del ejecutable de Antigravity
  */
-export function getAgyStatus(cwd = process.env.WORKSPACE_DIR || process.cwd()) {
-  let version = 'Desconocida';
-  try {
-    version = execFileSync(AGY_BIN, ['--version'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-  } catch {
-    try {
-      version = execFileSync(AGY_BIN, ['help'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).split('\n')[0].trim();
-    } catch {}
-  }
+export function getAgyStatus(cwd = resolveWorkspace()) {
+  const version = getAgyVersion();
+
+  const policy = loadPolicy(cwd);
 
   return {
     binPath: AGY_BIN,
     version,
     workspaceDir: cwd,
-    denyCommands: DEFAULT_DENY_COMMANDS,
-    denyPaths: DEFAULT_DENY_PATHS
+    extraDirs: resolveExtraDirs(),
+    denyCommands: policy.denyCommands,
+    denyPaths: policy.denyPaths,
+    configFile: policy.configFile,
+    // Cómo se aplica cada control. `/status` lo usa para no presentar una
+    // sugerencia al modelo como si fuese una política del sistema.
+    enforcement: {
+      // Reales: los impone el CLI.
+      sandbox: policy.sandbox,
+      skipPermissions: true,
+      // Solo sugeridos: viajan en el prompt, nada impide desobedecerlos.
+      denyCommands: 'prompt',
+      denyPaths: 'prompt'
+    }
   };
 }

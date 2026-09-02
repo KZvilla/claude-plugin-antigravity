@@ -1,0 +1,42 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "kzvilla-antigravity",
+  "description": "Marketplace de KZvilla: integración de Google Antigravity CLI (agy) con Claude Code",
+  "owner": {
+    "name": "KZvilla",
+    "email": "krisvilla93@gmail.com"
+  },
+  "metadata": {
+    "description": "Delegación a Google Antigravity CLI (agy) desde Claude Code: subagentes autónomos, planificación, revisión adversarial, voz y puente de Telegram",
+    "version": "0.4.0"
+  },
+  "plugins": [
+    {
+      "name": "antigravity",
+      "version": "0.4.0",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/KZvilla/claude-plugin-antigravity.git",
+        "sha": "aecd21139d461e9b955451e5e375eb1749dfcbf2"
+      },
+      "description": "Collaborate with Google Antigravity CLI (agy) as autonomous subagents and pair-programming partners: planning, adversarial review, audits, deep research, session summaries, voice narration and an outbound Telegram bridge.",
+      "category": "development",
+      "author": {
+        "name": "KZvilla"
+      },
+      "homepage": "https://github.com/KZvilla/claude-plugin-antigravity",
+      "tags": [
+        "antigravity",
+        "agy",
+        "subagent",
+        "gemini",
+        "pair-programming",
+        "code-review",
+        "planning",
+        "research",
+        "voice",
+        "telegram"
+      ]
+    }
+  ]
+}
