@@ -8,6 +8,6 @@ Retrieve and display the model usage metrics and quota status for Google Antigra
 $ARGUMENTS
 
 Instructions:
-1. If the arguments contain "reset", invoke `mcp__antigravity__agy_usage` with `reset: true`.
-2. Otherwise, invoke `mcp__antigravity__agy_usage` with default arguments.
+1. If the arguments contain "reset", invoke `mcp__lagrange__agy_usage` with `reset: true`.
+2. Otherwise, invoke `mcp__lagrange__agy_usage` with default arguments.
 3. Present the active model, context window capacity, session token consumption (input, output, thinking, cache read), and last task details cleanly formatted.

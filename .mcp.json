@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "antigravity": {
+    "lagrange": {
       "command": "node",
       "args": [
         "${CLAUDE_PLUGIN_ROOT}/mcp-server/index.js"

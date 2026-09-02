@@ -20,6 +20,6 @@ Instructions:
    argument. Without it the audit has nothing to check the code against and will have to infer
    the requirements, which it reports as a review limitation. If the user did not supply a plan,
    look for one (linked ticket, RFC, commit message, PR description) before falling back.
-3. Use the `mcp__antigravity__agy_audit` tool with `effort: "high"`.
+3. Use the `mcp__lagrange__agy_audit` tool with `effort: "high"`.
 4. Present the full structured audit report: Verdict, Findings (BLOCKER/MAJOR/MINOR/NOTE), Coverage Table, Validation, and Over-engineering sections.
 5. Highlight the verdict prominently at the top.

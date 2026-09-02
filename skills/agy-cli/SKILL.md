@@ -26,14 +26,14 @@ Delegate tasks to Antigravity when:
 4. **Rigorous Audit with a Blocking Verdict**: When a plain review is not strict enough — verifying an implementation against the plan it was supposed to follow, or a proposed plan against the real codebase (`agy_audit`).
 5. **Second Opinion on Tricky Bugs**: When troubleshooting a puzzling bug or flaky test, delegate an investigation to Antigravity with a fresh perspective.
 6. **Session Documentation & Anti-Compaction**: When the conversation gets long or at the end of a session, generate a structured markdown summary (`agy_session_summary`).
-7. **Deep Web Research**: When comprehensive live information with cited sources is required (`agy_research`, or `/antigravity:research`).
+7. **Deep Web Research**: When comprehensive live information with cited sources is required (`agy_research`, or `/lagrange:research`).
 8. **Spoken Status Updates**: When the user wants to *hear* what happened instead of reading it, or asks which voices are installed (`agy_narrate`, `agy_narrate_voices`).
 9. **Real-Time Voice Conversation**: Backing a live spoken session ("Modo Charla") with a persistent, streaming `agy` process (`agy_voice_stream`). Normally driven by the `voice-chat/` scripts, not called by hand.
 10. **Mobile Notifications & Approvals**: Pushing a notification, asking a blocking question, or sending a voice note to the user's phone (`telegram_notify`, `telegram_ask`, `telegram_send_voice`).
 
 ## Tool Reference
 
-### 1. `mcp__antigravity__agy_run`
+### 1. `mcp__lagrange__agy_run`
 Run an autonomous Antigravity session.
 
 ```json
@@ -68,7 +68,7 @@ Run an autonomous Antigravity session.
 }
 ```
 
-### 2. `mcp__antigravity__agy_plan`
+### 2. `mcp__lagrange__agy_plan`
 Produce a comprehensive implementation plan without making edits (guaranteed read-only).
 
 ```json
@@ -81,7 +81,7 @@ Produce a comprehensive implementation plan without making edits (guaranteed rea
 
 Pass `conversation_id` to refine an existing plan without leaving read-only mode. To *execute* the plan instead, hand the same ID to `agy_run`.
 
-### 3. `mcp__antigravity__agy_review`
+### 3. `mcp__lagrange__agy_review`
 Perform a thorough code review of recent changes (guaranteed read-only).
 
 ```json
@@ -91,7 +91,7 @@ Perform a thorough code review of recent changes (guaranteed read-only).
 }
 ```
 
-### 4. `mcp__antigravity__agy_audit`
+### 4. `mcp__lagrange__agy_audit`
 Run a skeptical, evidence-based audit. Much heavier than `agy_review`: it returns a BLOCKER / MAJOR / MINOR / NOTE finding rubric and a deterministic FAIL / PASS WITH RESERVATIONS / PASS verdict. Read-only, 25-minute default timeout.
 
 ```json
@@ -107,7 +107,7 @@ Two modes:
 - `"implementation"` (default) — does the code satisfy the `plan` it was supposed to follow, no more and no less?
 - `"plan"` — does the proposed plan in `target` fit the flows, data model, and conventions that already exist in the repo? Includes an explicit over-engineering check.
 
-### 5. `mcp__antigravity__agy_research`
+### 5. `mcp__lagrange__agy_research`
 Deep web research using Gemini's native search tools. Returns a structured report: Summary, Key Findings, Sources (with URLs), and Relevance to Current Project. Read-only, 20-minute default timeout.
 
 ```json
@@ -120,13 +120,13 @@ Deep web research using Gemini's native search tools. Returns a structured repor
 
 Requires the `network` capability. If `network` is denied — or simply missing from `allow` — the tool returns an error instead of a report. Relay that error to the user; do not re-run the question through `agy_run`, and do not answer it from memory. A research report is only worth anything if its citations were actually fetched.
 
-### 6. `mcp__antigravity__agy_usage`
+### 6. `mcp__lagrange__agy_usage`
 Display session token telemetry (input, output, thinking, cache read), context window saturation, active model limits, and quota status. Pass `reset: true` to clear session counters.
 
-### 7. `mcp__antigravity__agy_status`
+### 7. `mcp__lagrange__agy_status`
 Check CLI path, version, active model/effort defaults, and active ALLOW/DENY permission policies.
 
-### 8. `mcp__antigravity__agy_set_config`
+### 8. `mcp__lagrange__agy_set_config`
 Persist defaults for model, effort, or ALLOW/DENY policies in `~/.claude/antigravity.json` or `.claude/antigravity.json`.
 
 ```json
@@ -141,7 +141,7 @@ Persist defaults for model, effort, or ALLOW/DENY policies in `~/.claude/antigra
 }
 ```
 
-### 9. `mcp__antigravity__agy_session_summary`
+### 9. `mcp__lagrange__agy_session_summary`
 Read Claude Code's session JSONL log, preprocess turns to filter noise, and generate a structured markdown summary using Gemini. Solves context compaction degradation.
 
 ```json
@@ -153,12 +153,12 @@ Read Claude Code's session JSONL log, preprocess turns to filter noise, and gene
 ```
 Available focuses: `"full"`, `"decisions"`, `"changes"`, `"debugging"`. Summaries are saved to `~/.claude/session-summaries/<date>-<session-id>.md`.
 
-### 10. `mcp__antigravity__agy_narrate` / `agy_narrate_voices`
+### 10. `mcp__lagrange__agy_narrate` / `agy_narrate_voices`
 `agy_narrate` speaks a short status update out loud through local Voicebox TTS. It costs **zero Claude tokens**: the plugin reads the session log itself, has Gemini draft the spoken line, and sends it straight to Voicebox — Claude never writes the script. `agy_narrate_voices` lists the installed voice profiles, languages, and service health.
 
 Use when the user asks to *hear* an update, or names a voice ("narralo con Diego"). Pass `voice`/`language` when they specify one; `send_telegram` is on by default so the voice note also reaches their phone.
 
-### 11. `mcp__antigravity__agy_voice_stream`
+### 11. `mcp__lagrange__agy_voice_stream`
 Backs the Real-Time Voice Mode ("Modo Charla") by keeping one long-lived streaming `agy` process alive across turns, instead of the blocking one-shot `agy_run` uses. Actions: `start`, `send`, `drain`, `status`, `stop`.
 
 This is normally driven by the `voice-chat/` scripts (`text_loop.py`, `voice_loop.py`), which poll `drain` in a loop and pipe sentences to TTS. Do not call it by hand during a normal Claude Code session unless the user explicitly asks to drive a voice session manually — and if you start one, always `stop` it, since the `agy` process outlives the tool call.

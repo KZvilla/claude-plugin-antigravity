@@ -13,7 +13,7 @@ Instructions:
    - If it looks like a UUID → pass it as `session_id`
    - If it's "decisions", "changes", or "debugging" → pass it as `focus`
    - If empty or "current" → use defaults (most recent session, full focus)
-2. Use the `mcp__antigravity__agy_session_summary` tool with `effort: "high"`.
+2. Use the `mcp__lagrange__agy_session_summary` tool with `effort: "high"`.
 3. Present the generated summary, then report the run details the tool actually returns:
    the saved file path, turns processed, source log size, and focus. Report only what
    appears in the tool output — do not guess whether the transcript was truncated.

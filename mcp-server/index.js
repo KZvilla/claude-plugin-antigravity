@@ -864,7 +864,7 @@ const TOOLS = [
         },
         local_playback: {
           type: 'boolean',
-          description: 'When true, plays the audio aloud through your PC speakers (synthesized via POST /generate, then played with the native OS player — never Voicebox /speak, which double-plays). Defaults to false: silent generation, delivered to Telegram without scaring anyone. The /antigravity:narrate slash command sets this to true, since asking for narration out loud implies hearing it.'
+          description: 'When true, plays the audio aloud through your PC speakers (synthesized via POST /generate, then played with the native OS player — never Voicebox /speak, which double-plays). Defaults to false: silent generation, delivered to Telegram without scaring anyone. The /lagrange:narrate slash command sets this to true, since asking for narration out loud implies hearing it.'
         }
       }
     }
@@ -2183,7 +2183,7 @@ async function handleToolCall(name, args) {
         out += `*No subagent invocations recorded in this session yet.*\n`;
       }
 
-      out += `\n*Tip: Run \`/antigravity:usage reset\` or pass \`reset: true\` to clear session counters.*`;
+      out += `\n*Tip: Run \`/lagrange:usage reset\` or pass \`reset: true\` to clear session counters.*`;
 
       return {
         content: [
@@ -3293,7 +3293,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       }
 
       out += `\n> **Cómo usar una voz específica:**\n`;
-      out += `> - Comando: \`/antigravity:narrate <nombre>\` (ej: \`/antigravity:narrate aria\` o \`/antigravity:narrate "Mi voz"\`)\n`;
+      out += `> - Comando: \`/lagrange:narrate <nombre>\` (ej: \`/lagrange:narrate aria\` o \`/lagrange:narrate "Mi voz"\`)\n`;
       out += `> - Con Claude: *"Narra el último checkpoint con [nombre de voz]"*\n`;
 
       return {

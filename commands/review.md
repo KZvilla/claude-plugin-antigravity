@@ -10,5 +10,5 @@ $ARGUMENTS
 
 Instructions:
 1. Run `git status` or check current diff if needed to gather context.
-2. Use the `mcp__antigravity__agy_review` tool with `effort: "high"`.
+2. Use the `mcp__lagrange__agy_review` tool with `effort: "high"`.
 3. Present the review findings categorized by severity: Critical, Warnings, Suggestions.

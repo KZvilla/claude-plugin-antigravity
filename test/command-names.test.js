@@ -2,7 +2,8 @@
  * Slash-command names must stay consistent across the whole plugin.
  *
  * Regression context: v0.5.0 renamed the nine commands (`/agy-plan` ->
- * `/antigravity:plan`, and so on) and the `antigravity` skill to `agy-cli`.
+ * `/antigravity:plan`, and so on) and the `antigravity` skill to `agy-cli`;
+ * v0.6.0 then renamed the plugin itself, so the prefix is now `/lagrange:`. old-name-ok
  * A first sweep only covered commands/, skills/ and agents/, which left four
  * stale references in mcp-server/index.js. Three were cosmetic. The fourth was
  * not:
@@ -15,7 +16,7 @@
  * because an unrelated command printed a stale tip in its own output.
  *
  * So this suite checks both directions: no source file may reference a command
- * name that no longer exists, and every `/antigravity:x` mentioned anywhere
+ * name that no longer exists, and every `/lagrange:x` mentioned anywhere
  * must resolve to a real command or skill.
  */
 const fs = require('fs');
@@ -91,9 +92,9 @@ function main() {
         stale.push(`${rel}:${i + 1}  ${m[0]}`);
       }
 
-      // New shape: every /antigravity:x must exist.
-      for (const m of line.matchAll(/\/antigravity:([a-z][a-z-]*)/g)) {
-        if (!all.has(m[1])) dangling.push(`${rel}:${i + 1}  /antigravity:${m[1]}`);
+      // New shape: every /lagrange:x must exist.
+      for (const m of line.matchAll(/\/lagrange:([a-z][a-z-]*)/g)) {
+        if (!all.has(m[1])) dangling.push(`${rel}:${i + 1}  /lagrange:${m[1]}`);
       }
     });
   }
@@ -104,11 +105,11 @@ function main() {
     check('no command carries the redundant agy- prefix',
       commands.every(c => !c.startsWith('agy-')), commands.filter(c => c.startsWith('agy-')).join(', '));
     check('no skill is named after the plugin',
-      !skills.includes('antigravity'), '/antigravity:antigravity is unreachable noise');
+      !skills.includes('lagrange'), '/lagrange:lagrange would be unreachable noise');
 
     check('no stale pre-0.5.0 command references', stale.length === 0,
       stale.slice(0, 8).join(' | '));
-    check('every /antigravity:x resolves to a real command or skill', dangling.length === 0,
+    check('every /lagrange:x resolves to a real command or skill', dangling.length === 0,
       dangling.slice(0, 8).join(' | '));
 
     // Each command must carry frontmatter the slash menu can show.

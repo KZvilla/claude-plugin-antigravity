@@ -8,7 +8,7 @@ Delegate web research to Google Antigravity CLI (`agy`):
 $ARGUMENTS
 
 Instructions:
-1. Use the `mcp__antigravity__agy_research` tool with:
+1. Use the `mcp__lagrange__agy_research` tool with:
    - `topic`: the user's research question, verbatim
    - `effort: "high"`
    - `project_context`: a one-line note on how the topic relates to the current repo, if it plausibly does — omit it otherwise rather than inventing a connection

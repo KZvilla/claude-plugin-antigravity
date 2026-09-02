@@ -31,7 +31,7 @@ not an injected object.
 |------|--------|
 | `permissions.test.js` | The ALLOW/DENY policy reaches `agy_plan`, `agy_review`, `agy_audit` and `agy_run` — guardrail prompt, `deny_paths`, `deny_commands`, network, `--sandbox`, `--mode plan` |
 | `research.test.js` | `agy_research` exists as a tool, runs read-only when network is allowed, and returns an error (without launching agy) when it is denied |
-| `command-names.test.js` | Slash-command names stay consistent repo-wide: nothing references a pre-0.5.0 name, every `/antigravity:<name>` resolves to a real command or skill, and each command carries a description |
+| `command-names.test.js` | Slash-command names stay consistent repo-wide: nothing references a pre-0.5.0 name, every `/lagrange:<name>` resolves to a real command or skill, and each command carries a description |
 
 ## Confirming a test is load-bearing
 
@@ -55,7 +55,7 @@ At `3932d6f`, `permissions.test.js` fails 7 of 8 checks for each read-only tool
   copy pinned to a released `sha`, not this working directory. Editing files here
   changes nothing about the running plugin until a release is cut and installed.
   Anything involving the plugin's real tool namespace
-  (`mcp__plugin_antigravity_antigravity__*`) or the subagent's tool allowlist has
+  (`mcp__plugin_lagrange_lagrange__*`) or the subagent's tool allowlist has
   to be verified there, in a live session.
 - **Whether Claude Code loads what we wrote.** `command-names.test.js` reads the
   files on disk; it cannot tell you the slash menu renders them. v0.5.0 shipped a

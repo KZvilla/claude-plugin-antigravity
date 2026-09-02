@@ -13,6 +13,6 @@ Instructions:
    - If argument is "es" or "spanish" -> pass `language: "es"`
    - If argument is "en" or "english" -> pass `language: "en"`
    - If omitted or "all" -> pass `language: "all"`
-2. Call the `mcp__antigravity__agy_narrate_voices` tool.
+2. Call the `mcp__lagrange__agy_narrate_voices` tool.
 3. Present the returned markdown table and Voicebox service status to the user.
-4. Explain how to invoke any of the listed voices using `/antigravity:narrate <name>` or natural prompt.
+4. Explain how to invoke any of the listed voices using `/lagrange:narrate <name>` or natural prompt.

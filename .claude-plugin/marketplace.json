@@ -8,12 +8,15 @@
   },
   "metadata": {
     "description": "Delegación a Google Antigravity CLI (agy) desde Claude Code: subagentes autónomos, planificación, revisión adversarial, voz y puente de Telegram",
-    "version": "0.5.3"
+    "version": "0.6.0"
+  },
+  "renames": {
+    "antigravity": "lagrange"
   },
   "plugins": [
     {
-      "name": "antigravity",
-      "version": "0.5.3",
+      "name": "lagrange",
+      "version": "0.6.0",
       "source": {
         "source": "url",
         "url": "https://github.com/KZvilla/claude-plugin-antigravity.git",

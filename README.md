@@ -20,12 +20,12 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Installation](#-installation--setup)
 - [Slash Commands](#-slash-commands)
 - [MCP Tools Reference](#-mcp-tools-reference)
-- [Voice Checkpoint Narration](#-voice-checkpoint-narration-antigravitynarrate)
+- [Voice Checkpoint Narration](#-voice-checkpoint-narration-lagrangenarrate)
 - [Real-Time Voice Mode (`voice-chat/`)](#-real-time-voice-mode-voice-chat)
-- [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-antigravitysummary)
+- [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-lagrangesummary)
 - [Permissions (ALLOW / DENY)](#-granular-permissions-system-allow--deny)
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
-- [Telemetry (`/antigravity:usage`)](#-telemetry--usage-tracking-antigravityusage)
+- [Telemetry (`/lagrange:usage`)](#-telemetry--usage-tracking-lagrangeusage)
 - [Components](#-components)
 
 ---
@@ -36,7 +36,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 
 ```text
 /plugin marketplace add KZvilla/claude-plugin-antigravity
-/plugin install antigravity@kzvilla-antigravity
+/plugin install lagrange@kzvilla-antigravity
 ```
 
 **2. Restart Claude Code.** `/reload-plugins` picks up commands, agents and
@@ -46,27 +46,27 @@ at startup - a restart is what makes `agy_run` and friends appear.
 **3. Try it:**
 
 ```text
-/antigravity:run Analiza este proyecto y describí la arquitectura
+/lagrange:run Analiza este proyecto y describí la arquitectura
 ```
 
 ```text
-/antigravity:review
+/lagrange:review
 ```
 
 ```text
-/antigravity:summary
+/lagrange:summary
 ```
 
 ```text
-/antigravity:narrate
+/lagrange:narrate
 ```
 
 ```text
-/antigravity:research "Latest patterns for Claude Code plugins in 2026"
+/lagrange:research "Latest patterns for Claude Code plugins in 2026"
 ```
 
 ```text
-/antigravity:usage
+/lagrange:usage
 ```
 
 ---
@@ -105,15 +105,15 @@ at startup - a restart is what makes `agy_run` and friends appear.
 
 | Command | Description |
 |---------|-------------|
-| `/antigravity:run <prompt>` | Delegate any task to Antigravity (read + write) |
-| `/antigravity:plan <task>` | Generate an architectural plan (read-only, no file changes) |
-| `/antigravity:review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
-| `/antigravity:audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
-| `/antigravity:summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
-| `/antigravity:narrate [voice/lang]` | Narrate spoken voice summary of the latest task/checkpoint via Voicebox TTS (`emily`, `diego`, `es`, `en`) |
-| `/antigravity:voices [lang]` | List all installed Voicebox voice profiles, languages, roles, and service health |
-| `/antigravity:research <topic>` | Conduct deep web research with cited sources and structured insights |
-| `/antigravity:usage` | Display token telemetry, context saturation, and quota health |
+| `/lagrange:run <prompt>` | Delegate any task to Antigravity (read + write) |
+| `/lagrange:plan <task>` | Generate an architectural plan (read-only, no file changes) |
+| `/lagrange:review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
+| `/lagrange:audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
+| `/lagrange:summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
+| `/lagrange:narrate [voice/lang]` | Narrate spoken voice summary of the latest task/checkpoint via Voicebox TTS (`emily`, `diego`, `es`, `en`) |
+| `/lagrange:voices [lang]` | List all installed Voicebox voice profiles, languages, roles, and service health |
+| `/lagrange:research <topic>` | Conduct deep web research with cited sources and structured insights |
+| `/lagrange:usage` | Display token telemetry, context saturation, and quota health |
 
 > **Tip:** You can also ask Claude naturally — *"Delegale a agy que resuma esta sesión"*, *"¿Qué voces tengo disponibles?"* o *"Cuando termines, ejecuta la narración con Diego"* — and it will pick the right tool automatically.
 
@@ -243,18 +243,18 @@ export AGY_TIMEOUT_MINUTES="20"
 
 ---
 
-## 📊 Telemetry & Usage Tracking (`/antigravity:usage`)
+## 📊 Telemetry & Usage Tracking (`/lagrange:usage`)
 
 Antigravity automatically tracks token consumption, context caching efficiency, and context window saturation across all subagent calls.
 
 ```text
-/antigravity:usage
+/lagrange:usage
 ```
 
 To reset session counters:
 
 ```text
-/antigravity:usage reset
+/lagrange:usage reset
 ```
 
 ### Metrics Reported
@@ -268,50 +268,50 @@ To reset session counters:
 
 ---
 
-## 📋 Session Summary & Anti-Compaction (`/antigravity:summary`)
+## 📋 Session Summary & Anti-Compaction (`/lagrange:summary`)
 
 Claude Code's automatic context compaction can be lossy — intermediate decisions, edge cases, and reasoning get dropped as sessions grow. 
 
 Antigravity solves this by reading the raw session JSONL log from `~/.claude/projects/`, pre-processing and stripping noise in Node.js, and feeding the structured transcript to **Gemini's 1M-2M token context window** to generate a persistent Markdown summary with YAML frontmatter.
 
 ```text
-/antigravity:summary
+/lagrange:summary
 ```
 
 You can also target specific areas:
-- `/antigravity:summary decisions` — focus on architectural rationale and choices
-- `/antigravity:summary changes` — focus on modified files and code diffs
-- `/antigravity:summary debugging` — focus on errors, root causes, and fixes
+- `/lagrange:summary decisions` — focus on architectural rationale and choices
+- `/lagrange:summary changes` — focus on modified files and code diffs
+- `/lagrange:summary debugging` — focus on errors, root causes, and fixes
 
 Summaries are automatically saved to `~/.claude/session-summaries/<YYYY-MM-DD>-<session-id>.md`.
 
 ---
 
-## 🎙️ Voice Checkpoint Narration (`/antigravity:narrate`)
+## 🎙️ Voice Checkpoint Narration (`/lagrange:narrate`)
 
 Narrate a spoken audio status update upon completing a task or checkpoint via **Voicebox Text-To-Speech (TTS)**.
 
 ### Zero-Claude-Token Architecture
 Claude **does not** generate or summarize the text in its context window. Instead:
-1. Claude simply invokes `/antigravity:narrate` (or the `agy_narrate` tool).
+1. Claude simply invokes `/lagrange:narrate` (or the `agy_narrate` tool).
 2. The plugin locates Claude Code's session log (`.jsonl`), extracts the latest task checkpoint (user goal, modified files, and final test execution status).
 3. The plugin invokes Gemini CLI (`agy`) with `--effort low` to draft a concise 2-3 sentence conversational spoken script in ~1-2 seconds (using Gemini quota, **0 Claude tokens**).
 4. The plugin sends the text to Voicebox HTTP (`POST /generate`), which synthesizes a `.wav` silently, and then plays that file with the native OS audio player. (It deliberately avoids `POST /speak` — letting Voicebox do its own playback triggers a double-playback bug.)
 
-Running `/antigravity:narrate` plays the result on your speakers. When `agy_narrate` is called programmatically, local playback is off by default (`local_playback: false`) so background narration doesn't startle anyone — it still reaches your phone if the Telegram bridge is configured.
+Running `/lagrange:narrate` plays the result on your speakers. When `agy_narrate` is called programmatically, local playback is off by default (`local_playback: false`) so background narration doesn't startle anyone — it still reaches your phone if the Telegram bridge is configured.
 
 ### Usage
 
 ```text
-/antigravity:narrate
+/lagrange:narrate
 ```
 
 With specific voice or language preference:
 ```text
-/antigravity:narrate emily       # English narration with Emily voice
-/antigravity:narrate diego       # Spanish narration with Diego Alvarez voice
-/antigravity:narrate en          # English narration (defaults to Emily)
-/antigravity:narrate es          # Spanish narration (defaults to Diego Alvarez)
+/lagrange:narrate emily       # English narration with Emily voice
+/lagrange:narrate diego       # Spanish narration with Diego Alvarez voice
+/lagrange:narrate en          # English narration (defaults to Emily)
+/lagrange:narrate es          # Spanish narration (defaults to Diego Alvarez)
 ```
 
 Or ask Claude conversationally:
@@ -337,7 +337,7 @@ La naturalidad y el estilo de la narración en personaje se adaptan automáticam
 - **`description`**: Describe la identidad, acento o tono (ej: *"Comediante uruguayo de internet con voz rasposa"* o *"Locutor profesional español"*).
 - **`personality`**: Define modismos, actitud y muletillas (ej: *"Humor bizarro e irreverente, usa modismos como '¡Sapeee!', 'más bien loquita', festejando con euforia si los tests pasaron"*).
 
-Gemini (`agy`) lee estos campos dinámicamente en tiempo real desde la API de Voicebox. Al activar el modo personaje (con `/antigravity:narrate <voz> personality` o pidiéndoselo a Claude), el guión adoptará ese personaje manteniendo siempre la veracidad técnica sobre los archivos y tests del proyecto.
+Gemini (`agy`) lee estos campos dinámicamente en tiempo real desde la API de Voicebox. Al activar el modo personaje (con `/lagrange:narrate <voz> personality` o pidiéndoselo a Claude), el guión adoptará ese personaje manteniendo siempre la veracidad técnica sobre los archivos y tests del proyecto.
 
 ---
 
@@ -362,12 +362,12 @@ Run either script with `--help` for the full flag list (TTS engine/model overrid
 
 ---
 
-## 🌐 Deep Web Research (`/antigravity:research`)
+## 🌐 Deep Web Research (`/lagrange:research`)
 
 Delegate deep web research and live doc searches directly to Antigravity, which leverages Gemini's native search tools and Vertex AI:
 
 ```text
-/antigravity:research "Best practices for Claude Code hooks and lifecycle events 2026"
+/lagrange:research "Best practices for Claude Code hooks and lifecycle events 2026"
 ```
 
 Returns a structured report with an Executive Summary, Key Findings, Cited Source URLs, and direct relevance to your current project.
@@ -394,20 +394,19 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 | **Skills** | `skills/agy-cli/SKILL.md` | Context-aware delegation guidelines |
 | | `skills/adversarial-review/SKILL.md` | Skeptical, evidence-based audit guidelines |
 | | `skills/session-summary/SKILL.md` | Session summary & anti-compaction skill |
-| **Commands** | `commands/run.md` | `/antigravity:run <prompt>` |
-| | `commands/plan.md` | `/antigravity:plan <task>` |
-| | `commands/review.md` | `/antigravity:review [target]` |
-| | `commands/audit.md` | `/antigravity:audit [target]` |
-| | `commands/summary.md` | `/antigravity:summary [focus]` |
-| | `commands/narrate.md` | `/antigravity:narrate [voice/lang]` |
-| | `commands/voices.md` | `/antigravity:voices [lang]` |
-| | `commands/research.md` | `/antigravity:research <topic>` |
-| | `commands/usage.md` | `/antigravity:usage` |
+| **Commands** | `commands/run.md` | `/lagrange:run <prompt>` |
+| | `commands/plan.md` | `/lagrange:plan <task>` |
+| | `commands/review.md` | `/lagrange:review [target]` |
+| | `commands/audit.md` | `/lagrange:audit [target]` |
+| | `commands/summary.md` | `/lagrange:summary [focus]` |
+| | `commands/narrate.md` | `/lagrange:narrate [voice/lang]` |
+| | `commands/voices.md` | `/lagrange:voices [lang]` |
+| | `commands/research.md` | `/lagrange:research <topic>` |
+| | `commands/usage.md` | `/lagrange:usage` |
 | **Tests** | `test/` | Dependency-free suites that drive the MCP server over real stdio with `agy` stubbed — `npm test` |
 | **Voice Chat** | `voice-chat/text_loop.py` / `voice_loop.py` | Real-Time Voice Mode companion scripts (console / real mic + VAD) |
 | **Distribution** | `.claude-plugin/marketplace.json` | Marketplace manifest - the recommended install channel |
 | | `scripts/stamp-release.mjs` | Pins the marketplace entry to the release tag's commit sha (`npm run release:stamp`) |
-| | `install.ps1` / `install.sh` | Script install, kept as a fallback |
 
 ---
 
@@ -419,54 +418,33 @@ Inside a Claude Code session:
 
 ```text
 /plugin marketplace add KZvilla/claude-plugin-antigravity
-/plugin install antigravity@kzvilla-antigravity
+/plugin install lagrange@kzvilla-antigravity
 ```
 
 Or from a terminal:
 
 ```bash
 claude plugin marketplace add KZvilla/claude-plugin-antigravity
-claude plugin install antigravity@kzvilla-antigravity
+claude plugin install lagrange@kzvilla-antigravity
 ```
 
 This is the managed path: enable/disable, user vs. project scope, a visible
 version, and updates through `claude plugin marketplace update` instead of a
 `git reset --hard` over your working copy.
 
-### Scripts (fallback)
+### Migrating from a script install
 
-Kept for environments where the marketplace is not an option. They clone into
-`~/.claude/skills/antigravity` and **overwrite local changes** on update.
+`install.ps1` and `install.sh` were removed in 0.6.0. They cloned into
+`~/.claude/skills/antigravity` and updated with `git reset --hard`, which
+overwrote local changes and gave no version to point at. The marketplace does
+the same job with a pinned `sha`, real versions and a managed lifecycle.
 
-<details>
-<summary>Show the script install</summary>
+If you installed with them, remove the old clone: the two channels install to
+different places, so keeping both means Claude Code loads the plugin **twice**
+- duplicate commands, duplicate MCP tools.
 
-**Windows (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.ps1 | iex
-```
-
-**Linux / macOS (Bash):**
-```bash
-curl -fsSL https://raw.githubusercontent.com/KZvilla/claude-plugin-antigravity/main/install.sh | bash
-```
-
-**Manual clone:**
-```bash
-git clone https://github.com/KZvilla/claude-plugin-antigravity.git "$HOME/.claude/skills/antigravity"
-```
-
-</details>
-
-### Uninstalling a script install
-
-Also the migration step: the two channels install to different places, so
-keeping both means Claude Code loads the plugin **twice** - duplicate commands,
-duplicate MCP tools. Remove the old clone before installing from the
-marketplace.
-
-The scripts only ever clone into `~/.claude/skills/antigravity`; they write
-nothing to `settings.json` and register no MCP server, so removing that
+The scripts only ever cloned into `~/.claude/skills/antigravity`; they wrote
+nothing to `settings.json` and registered no MCP server, so removing that
 directory is the whole uninstall. Two things deserve care, and both snippets
 below handle them: the `.env` inside it is git-ignored and exists nowhere else,
 and on Windows the bridge daemon may be a scheduled task pointing into the
@@ -513,12 +491,12 @@ Restart Claude Code, then verify from a terminal:
 
 ```bash
 claude plugin list
-claude plugin details antigravity@kzvilla-antigravity    # or antigravity@skills-dir for a script install
+claude plugin details lagrange@kzvilla-antigravity
 ```
 
 ### 🔐 Telegram Bridge Setup (Manual — Never Automated)
 
-The Telegram tools (`telegram_notify`, `telegram_ask`, `telegram_send_voice`, and `agy_narrate`'s `send_telegram` option) need your own bot token and chat ID in a `.env` file. **This is intentionally not part of `install.ps1`/`install.sh`** — an installer that silently created or copied credentials for you would be a much worse security default than asking you to do it once, yourself.
+The Telegram tools (`telegram_notify`, `telegram_ask`, `telegram_send_voice`, and `agy_narrate`'s `send_telegram` option) need your own bot token and chat ID in a `.env` file. **No install channel ever creates or copies them for you** — an installer that silently provisioned credentials would be a much worse security default than asking you to do it once, yourself.
 
 1. Get a bot token from [@BotFather](https://t.me/BotFather) on Telegram.
 2. Get your numeric user ID from [@userinfobot](https://t.me/userinfobot).
@@ -534,7 +512,6 @@ The Telegram tools (`telegram_notify`, `telegram_ask`, `telegram_send_voice`, an
 
 | Install channel | Put `.env` at | Survives an update? |
 |---|---|---|
-| Script (`install.ps1` / `install.sh`) | `~/.claude/skills/antigravity/.env` | Yes — the clone is stable, and `.env` is ignored by the `git reset --hard` |
 | Marketplace | `~/.claude/plugins/cache/kzvilla-antigravity/antigravity/<version>/.env` | **No** — the path is versioned, so a new version means a new empty directory |
 | Git clone (development) | `<clone>/.env` | Yes |
 

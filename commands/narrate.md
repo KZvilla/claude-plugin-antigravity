@@ -18,9 +18,9 @@ Instructions:
    - Persona / Personality mode:
      * If user explicitly asks for personality (mentions "personality", "personaje", "con estilo", "humor") -> pass `personality: true`
      * Otherwise -> default to `personality: false` (clean professional tone).
-2. Call the `mcp__antigravity__agy_narrate` tool with `local_playback: true`.
+2. Call the `mcp__lagrange__agy_narrate` tool with `local_playback: true`.
    The tool's own default is `false` (silent generation for background/agentic use), but someone
-   typing `/antigravity:narrate` is asking to *hear* it, so this command always plays it aloud.
+   typing `/lagrange:narrate` is asking to *hear* it, so this command always plays it aloud.
    Pass `local_playback: false` only if the user explicitly asks to keep the PC silent
    (e.g. "mandámelo solo al teléfono", "sin sonido acá").
 3. The plugin will automatically:

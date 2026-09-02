@@ -1,33 +1,33 @@
 ---
-name: Antigravity
+name: agy
 description: Delegate complex execution, deep reasoning, architectural planning, adversarial code review, session documentation, or web research to Google Antigravity CLI (agy). Use this subagent for pair programming, TDD implementation, second opinions, session summaries, and multi-turn collaboration.
 tools:
   # When this plugin is installed, Claude Code namespaces its MCP server as
   # plugin_<plugin>_<server>, so the real tool names are
-  # mcp__plugin_antigravity_antigravity__*. The bare mcp__antigravity__* names
+  # mcp__plugin_lagrange_lagrange__*. The bare mcp__lagrange__* names
   # apply when the server is registered directly (e.g. a local .mcp.json during
   # development). Both prefixes are listed so the allowlist matches either
   # registration; names that don't resolve are ignored.
-  - mcp__plugin_antigravity_antigravity__agy_run
-  - mcp__plugin_antigravity_antigravity__agy_voice_stream
-  - mcp__plugin_antigravity_antigravity__agy_plan
-  - mcp__plugin_antigravity_antigravity__agy_review
-  - mcp__plugin_antigravity_antigravity__agy_audit
-  - mcp__plugin_antigravity_antigravity__agy_research
-  - mcp__plugin_antigravity_antigravity__agy_usage
-  - mcp__plugin_antigravity_antigravity__agy_status
-  - mcp__plugin_antigravity_antigravity__agy_set_config
-  - mcp__plugin_antigravity_antigravity__agy_session_summary
-  - mcp__antigravity__agy_run
-  - mcp__antigravity__agy_voice_stream
-  - mcp__antigravity__agy_plan
-  - mcp__antigravity__agy_review
-  - mcp__antigravity__agy_audit
-  - mcp__antigravity__agy_research
-  - mcp__antigravity__agy_usage
-  - mcp__antigravity__agy_status
-  - mcp__antigravity__agy_set_config
-  - mcp__antigravity__agy_session_summary
+  - mcp__plugin_lagrange_lagrange__agy_run
+  - mcp__plugin_lagrange_lagrange__agy_voice_stream
+  - mcp__plugin_lagrange_lagrange__agy_plan
+  - mcp__plugin_lagrange_lagrange__agy_review
+  - mcp__plugin_lagrange_lagrange__agy_audit
+  - mcp__plugin_lagrange_lagrange__agy_research
+  - mcp__plugin_lagrange_lagrange__agy_usage
+  - mcp__plugin_lagrange_lagrange__agy_status
+  - mcp__plugin_lagrange_lagrange__agy_set_config
+  - mcp__plugin_lagrange_lagrange__agy_session_summary
+  - mcp__lagrange__agy_run
+  - mcp__lagrange__agy_voice_stream
+  - mcp__lagrange__agy_plan
+  - mcp__lagrange__agy_review
+  - mcp__lagrange__agy_audit
+  - mcp__lagrange__agy_research
+  - mcp__lagrange__agy_usage
+  - mcp__lagrange__agy_status
+  - mcp__lagrange__agy_set_config
+  - mcp__lagrange__agy_session_summary
   - Read
   - Grep
   - Glob
@@ -58,9 +58,9 @@ Antigravity is powered by Google Gemini models (Gemini 2.5 / 3.7 Pro and Flash) 
 
 ## 🛠️ Available MCP Tools
 
-> Tool names below are written with the short `mcp__antigravity__` prefix. When the plugin is installed, the same tools appear as `mcp__plugin_antigravity_antigravity__<name>` — use whichever prefix is actually present in your tool list.
+> Tool names below are written with the short `mcp__lagrange__` prefix. When the plugin is installed, the same tools appear as `mcp__plugin_lagrange_lagrange__<name>` — use whichever prefix is actually present in your tool list.
 
-- `mcp__antigravity__agy_run`:
+- `mcp__lagrange__agy_run`:
   - `prompt`: Specific instructions and context for Antigravity.
   - `model`: Model override (e.g. `"gemini-3.7-flash"`, `"gemini-2.5-pro"`). Falls back to configured default.
   - `effort`: `"low"`, `"medium"`, or `"high"` (defaults to configured default, usually `"high"`).
@@ -69,29 +69,29 @@ Antigravity is powered by Google Gemini models (Gemini 2.5 / 3.7 Pro and Flash) 
   - `continue_session`: Set `true` to continue the most recent session (`-c`).
   - `dangerously_skip_permissions`: Defaults to `true` for headless execution.
   - `cwd`: Target directory.
-- `mcp__antigravity__agy_plan`:
+- `mcp__lagrange__agy_plan`:
   - `task`: Task description.
   - `model`: Model override.
   - `effort`: `"low"`, `"medium"`, or `"high"`.
   - `conversation_id`: Resume a planning thread to refine a plan without leaving read-only mode.
-- `mcp__antigravity__agy_review`:
+- `mcp__lagrange__agy_review`:
   - `review_target`: What to review (e.g. `"git diff"`, `"src/components/foo.tsx"`).
   - `model`: Model override.
   - `effort`: `"low"`, `"medium"`, or `"high"`.
   - `guidelines`: Architecture/lint/business rules to enforce.
-- `mcp__antigravity__agy_audit`: heavyweight, evidence-based audit — stricter than `agy_review`, returns a BLOCKER/MAJOR/MINOR/NOTE rubric and a FAIL / PASS WITH RESERVATIONS / PASS verdict.
+- `mcp__lagrange__agy_audit`: heavyweight, evidence-based audit — stricter than `agy_review`, returns a BLOCKER/MAJOR/MINOR/NOTE rubric and a FAIL / PASS WITH RESERVATIONS / PASS verdict.
   - `target`: What to audit (git diff, file paths, branch, PR description, or a plan/RFC to check against the codebase).
   - `audit_mode`: `"implementation"` (default — verify code against a plan) or `"plan"` (verify a proposed plan against the real project).
   - `plan`: The plan/spec/acceptance criteria to audit against. Used by `"implementation"` mode.
   - `conversation_id`: Resume an audit thread.
-- `mcp__antigravity__agy_research`: deep web research with cited sources. Read-only, and requires the `network` capability — if it is denied the tool errors out instead of answering from memory, and you must relay that rather than falling back to `agy_run`.
+- `mcp__lagrange__agy_research`: deep web research with cited sources. Read-only, and requires the `network` capability — if it is denied the tool errors out instead of answering from memory, and you must relay that rather than falling back to `agy_run`.
   - `topic`: The research question.
   - `project_context`: How the topic relates to the current repo (omit if it doesn't).
   - `recency`: Source recency constraint for time-sensitive topics (e.g. `"past 6 months"`).
   - `conversation_id`: Resume a research thread for follow-ups without re-running the search.
-- `mcp__antigravity__agy_status`:
+- `mcp__lagrange__agy_status`:
   - Checks agy CLI installation, path, active default model, and default effort.
-- `mcp__antigravity__agy_set_config`:
+- `mcp__lagrange__agy_set_config`:
   - Persist default `model` or `effort` globally (`~/.claude/antigravity.json`) or per project (`./.claude/antigravity.json`).
 
 ## 📋 Best Practices for Delegating

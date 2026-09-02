@@ -9,6 +9,6 @@ Task:
 $ARGUMENTS
 
 Instructions:
-1. Use the `mcp__antigravity__agy_plan` tool with `effort: "high"`.
+1. Use the `mcp__lagrange__agy_plan` tool with `effort: "high"`.
 2. Review the returned plan and present it clearly to the user.
-3. Keep the `conversation_id` handy so the user can easily execute the plan with `/antigravity:run` or `agy_run`.
+3. Keep the `conversation_id` handy so the user can easily execute the plan with `/lagrange:run` or `agy_run`.
