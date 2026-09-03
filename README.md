@@ -286,8 +286,38 @@ You can also target specific areas:
 - `/lagrange:summary decisions` — focus on architectural rationale and choices
 - `/lagrange:summary changes` — focus on modified files and code diffs
 - `/lagrange:summary debugging` — focus on errors, root causes, and fixes
+- `/lagrange:summary handoff` — **context transfer for a fresh session**, not documentation: it prioritizes findings that exist only in the conversation over anything recoverable from `git log`, and ends in a copy-paste prompt. Use it before compacting.
 
 Summaries are automatically saved to `~/.claude/session-summaries/<YYYY-MM-DD>-<session-id>.md`.
+
+### Declare what must survive
+
+The `agy_session_summary` tool takes `key_points`: short sentences the agent running
+the session knows matter and that a reader of the log cannot recover — method rules
+and invariants learned the hard way, findings whose evidence is scattered, approaches
+already tried and discarded.
+
+Each one is injected as mandatory *and verified mechanically* in the result. It exists
+because that class of content was lost in **6 of 6** runs, across two models, at ~100k
+input tokens — not a context-length problem, just content nothing marked as important.
+
+### Every summary is checked against the repository
+
+A mechanical verification runs on every call and **cannot hallucinate**, because it
+compares the document against facts extracted from the log and against git: commit
+SHAs cited, the version the session actually ended at, file coverage, and the declared
+`key_points`. Its findings come back with the summary.
+
+`strict: true` turns a blocking finding into a failed call and adds a second
+adversarial pass. That pass is **advisory and never blocks** — measured, it rejected a
+correct document for "inventing" terms that appeared dozens of times in the transcript
+it had been given.
+
+### Hearing it
+
+`narrate: true` speaks a short digest through Voicebox. The digest is written in the
+same call that produces the document, by something that just read the whole session —
+narrating the finished document instead reaches only its first few percent.
 
 ---
 
@@ -424,7 +454,7 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 | | `commands/voices.md` | `/lagrange:voices [lang]` |
 | | `commands/research.md` | `/lagrange:research <topic>` |
 | | `commands/usage.md` | `/lagrange:usage` |
-| **Tests** | `test/` | Dependency-free suites that drive the MCP server over real stdio with `agy` stubbed — `npm test` |
+| **Tests** | `test/` | Dependency-free suites that drive the MCP server over real stdio with `agy` stubbed — `npm test`, or `npm run gates` for every gate at once |
 | **Voice Chat** | `voice-chat/text_loop.py` / `voice_loop.py` | Real-Time Voice Mode companion scripts (console / real mic + VAD) |
 | **Distribution** | `.claude-plugin/marketplace.json` | Marketplace manifest - the recommended install channel |
 | | `scripts/stamp-release.mjs` | Pins the marketplace entry to the release tag's commit sha (`npm run release:stamp`) |

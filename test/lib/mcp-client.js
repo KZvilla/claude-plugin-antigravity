@@ -60,13 +60,21 @@ function startServer({ serverJs, cwd, captureFile } = {}) {
   });
 
   let nextId = 1;
-  const request = (method, params) => new Promise((resolve, reject) => {
+
+  // 20 s alcanzan para las herramientas que responden solas (tools/list, un
+  // rechazo por validacion). Las que delegan en agy tardan minutos, asi que el
+  // plazo es un parametro: con el fijo, el arnes no podia ejercitar ningun
+  // camino que llamara al modelo -- entre ellos el handler de
+  // agy_session_summary, que quedaba cubierto solo por sus modulos sueltos.
+  const TIMEOUT_POR_DEFECTO = 20000;
+
+  const request = (method, params, timeoutMs = TIMEOUT_POR_DEFECTO) => new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, resolve);
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     setTimeout(() => {
-      if (pending.delete(id)) reject(new Error(`timeout waiting for ${method}`));
-    }, 20000);
+      if (pending.delete(id)) reject(new Error(`timeout waiting for ${method} after ${timeoutMs}ms`));
+    }, timeoutMs);
   });
 
   return {
@@ -78,7 +86,7 @@ function startServer({ serverJs, cwd, captureFile } = {}) {
       clientInfo: { name: 'antigravity-tests', version: '1.0' }
     }),
     listTools: () => request('tools/list', {}),
-    callTool: (name, args) => request('tools/call', { name, arguments: args }),
+    callTool: (name, args, timeoutMs) => request('tools/call', { name, arguments: args }, timeoutMs),
     // Awaits the real exit. `child.kill()` only sends the signal, and on
     // Windows the process keeps a handle on its cwd until it is actually gone
     // — which is the fixture directory the caller is about to delete.

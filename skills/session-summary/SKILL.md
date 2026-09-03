@@ -36,7 +36,66 @@ Claude Code's context window compaction is lossy — it discards details, interm
 /lagrange:summary decisions    → emphasizes architectural/design choices
 /lagrange:summary changes      → emphasizes files modified
 /lagrange:summary debugging    → emphasizes problems and resolutions
+/lagrange:summary handoff      → context transfer for a fresh session
 ```
+
+`handoff` is not an emphasis, it is a different document: written for an agent
+starting cold, it prioritizes findings that exist only in the conversation over
+anything recoverable from `git log`, and ends in a copy-paste prompt. Use it
+before compacting or when the session is about to end.
+
+### Declaring what must survive (`key_points`)
+
+The single most valuable parameter, and the one most often skipped. Pass short
+sentences that YOU know matter and that a reader of the log cannot recover:
+
+```json
+{
+  "focus": "handoff",
+  "key_points": [
+    "Verify each gate with its own exit code ($?); never chain assertions with && through a pipe, they mask red tests.",
+    "Truncate a command at the line that opens a heredoc (<<), keeping the previous statement.",
+    "Rejected: passing the prompt as a CLI argument — over ~24KB it gets offloaded to a file the model may not read."
+  ]
+}
+```
+
+Each point is injected at the top of the prompt as mandatory to preserve, **and
+then verified mechanically** in the result by its distinctive terms — a missing
+one is a blocking finding.
+
+Why it exists: method rules and invariants were lost in **6 of 6** runs, across
+both models, at ~100k input tokens. That is not context saturation — those rules
+are diffuse in the transcript and nothing marks them. The agent running the
+session does know them.
+
+### Hearing it (`narrate`)
+
+```json
+{ "focus": "handoff", "narrate": true }
+```
+
+The spoken digest is produced in the *same* call that writes the document, so it
+costs no extra round-trip. Do not try to get it by passing the finished document
+to `agy_say`: measured on a 36KB handoff, plain narration speaks 1029 characters
+(2.8%, cut mid-sentence) and the polish path only ever sees the first 12000
+characters — so the pending work and the findings, which live at the end, never
+reach the ear. The saved document never contains the digest.
+
+### Verification (`strict`)
+
+A mechanical check **always** runs and cannot hallucinate: it compares the
+document against facts extracted from the log and against git — commit SHAs
+cited, the version the session actually ended at, file coverage, and the declared
+`key_points`. Its findings are reported with every summary.
+
+`strict: true` makes a blocking finding fail the call instead of only reporting
+it, and adds a second adversarial pass over the transcript for what a machine
+cannot check. **That second pass is advisory and never blocks**: measured, it
+returned RECHAZADO accusing a correct document of inventing `daemon.sh`, `bash -n`
+and `systemd`, terms that appeared 62, 6 and 71 times in the transcript it was
+given. A summarizer that misses material omits; a reviewer that misses material
+accuses, and does it in convincing prose.
 
 ### Specific session by ID
 ```
