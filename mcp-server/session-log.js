@@ -13,6 +13,12 @@
  * aparte porque cubren la sesion entera aunque la ventana del transcript se
  * trunque, y porque un modelo no deberia tener que reconstruir leyendo prosa
  * algo que esta literal en los inputs de las herramientas.
+ *
+ * DUPLICACION CONOCIDA: bundles/claude-compact/scripts/parse_claude_session.js
+ * parsea el mismo JSONL. No es un descuido y no se puede unificar: esa skill se
+ * instala en ~/.gemini/config/skills/ y corre dentro de Antigravity, sin acceso
+ * a este repositorio. Si arreglas algo del parseo aqui, mira si aplica alla --
+ * es donde se descubrio primero que los tool_result van anidados.
  */
 const fs = require('fs');
 

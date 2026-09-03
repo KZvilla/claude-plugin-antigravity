@@ -9,8 +9,13 @@ SESSION-SUMMARY.md
 # docs/ es material de trabajo: propuestas, revisiones y notas de sesion.
 docs/*
 docs/
+# bundles/ nacio como material de trabajo, pero claude-compact dejo de serlo:
+# es la skill de Antigravity de la que salio el modo `handoff` y los hechos
+# derivados de agy_session_summary, y hasta ahora existia en un solo disco, sin
+# historial ni copia. Se versiona la fuente; el .zip es artefacto de empaquetado.
 bundles/*
-bundles/
+!bundles/claude-compact
+bundles/*.zip
 
 # Security & Secrets (Standard §11.1)
 .env

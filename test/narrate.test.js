@@ -840,6 +840,16 @@ async function main() {
       !!(t && /never contains the digest/i.test(t.inputSchema.properties.narrate.description)));
   });
 
+  await group('el umbral de modelo mide el prompt, no el log crudo', () => {
+    const t = tools.find(x => x.name === 'agy_session_summary');
+    check('la descripcion dice que mide el prompt preprocesado',
+      !!(t && /PREPROCESSED prompt, not of the raw log/.test(t.inputSchema.properties.model.description)));
+    check('explica por que el tamano del log dejo de servir',
+      !!(t && /stopped predicting anything/.test(t.inputSchema.properties.model.description)));
+    check('la documentacion ya no promete el umbral viejo',
+      !!(t && !/for logs up to 1MB/.test(t.inputSchema.properties.model.description)));
+  });
+
   report();
 }
 

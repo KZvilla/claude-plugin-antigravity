@@ -919,6 +919,48 @@ console.log('✔ Test 35 [BE-007]: importar bot.js no crea directorios ni migra 
 }
 console.log('✔ Test 36 [BE-008]: el .env sobrevive a un plugin update sin cambiar la precedencia');
 
+// Test 37 [SEC-003]: el contenido que se sube a Telegram se redacta.
+// `deny_paths` decide QUE fichero puede salir; esto decide QUE va dentro. Son
+// controles distintos y hacen falta los dos: un resumen de sesion es un fichero
+// perfectamente permitido cuyo contenido se deriva del transcript -- rutas,
+// lineas de comando completas, salidas de herramientas. Si por una de esas
+// lineas paso un token, viajaba a los servidores de Telegram sin filtrar.
+{
+  const notify = await import('./notify.js');
+  const dirTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-upload-'));
+  const TOKEN_FALSO = '1234567890:AAFakeTokenParaEsteTestNoEsReal';
+
+  const md = path.join(dirTmp, 'handoff.md');
+  const contenido = '# Handoff\n\nSe exporto TELEGRAM_BOT_TOKEN=' + TOKEN_FALSO + ' en la consola.\n';
+  fs.writeFileSync(md, contenido);
+
+  const subido = notify.leerParaSubir(md, 'handoff.md').toString('utf8');
+  assert(!subido.includes('AAFakeTokenParaEsteTest'), 'El token no debe viajar dentro del .md subido');
+  assert(subido.includes('[REDACTED]'), 'La redaccion debe quedar marcada');
+  assert(subido.includes('# Handoff'), 'El resto del documento se conserva');
+
+  const enDisco = fs.readFileSync(md, 'utf8');
+  assert.strictEqual(enDisco, contenido, 'El fichero en disco NO se modifica');
+
+  // Un binario se sube tal cual: redactarlo lo corromperia.
+  const bin = path.join(dirTmp, 'nota.ogg');
+  const bytes = Buffer.from([0x4f, 0x67, 0x67, 0x53, 0x00, 0xff, 0xfe, 0x01]);
+  fs.writeFileSync(bin, bytes);
+  assert(notify.leerParaSubir(bin, 'nota.ogg').equals(bytes), 'Un binario se sube byte a byte');
+
+  // Un texto sin secretos vuelve identico.
+  const limpio = path.join(dirTmp, 'limpio.md');
+  fs.writeFileSync(limpio, '# Sin secretos\n');
+  assert.strictEqual(
+    notify.leerParaSubir(limpio, 'limpio.md').toString('utf8'),
+    '# Sin secretos\n',
+    'Un texto limpio no cambia'
+  );
+
+  fs.rmSync(dirTmp, { recursive: true, force: true });
+}
+console.log('✔ Test 37 [SEC-003]: la subida de ficheros redacta secretos y no toca el disco');
+
 // Limpieza: solo el directorio temporal de test
 try {
   fs.rmSync(path.dirname(TEST_STATE_FILE), { recursive: true, force: true });

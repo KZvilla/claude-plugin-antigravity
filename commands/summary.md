@@ -18,5 +18,6 @@ Instructions:
    the saved file path, turns processed, source log size, and focus. Report only what
    appears in the tool output — do not guess whether the transcript was truncated.
 4. Do not pick a model unless the user asks for one. The tool chooses on its own:
-   the configured default up to a 1MB log, `gemini-3.1-pro` above that. Its output
+   the configured default up to a 700KB preprocessed prompt, `gemini-3.1-pro` above
+   that. It measures the prompt, not the raw log. Its output
    reports the model, the effort and — when it switched — why. Relay that.

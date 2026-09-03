@@ -795,7 +795,7 @@ const TOOLS = [
         },
         model: {
           type: 'string',
-          description: 'Model override for summarization. Leave unset and the tool picks: the configured default for logs up to 1MB, and "gemini-3.1-pro" above that, since flash loses the thread on very long transcripts. Setting this always wins, and the chosen model is reported in the output.'
+          description: 'Model override for summarization. Leave unset and the tool picks by the size of the PREPROCESSED prompt, not of the raw log: the configured default up to 700KB, and "gemini-3.1-pro" above that. The raw log size stopped predicting anything once the transcript became capped at 1MB — a 20MB log and a 7MB one now produce similar prompts. Setting this always wins, and the chosen model is reported in the output.'
         },
         effort: {
           type: 'string',
@@ -1926,13 +1926,31 @@ function validarModeloEsfuerzo(cliArgs) {
   return null;
 }
 
-// Por encima de este tamano de log, Flash deja de sostener la transcripcion
-// entera y empieza a rellenar huecos. Es el umbral que ya publicaban
-// commands/summary.md y el skill de resumenes.
-const RESUMEN_UMBRAL_PRO = 1024 * 1024;
+// Por encima de este tamano, Flash deja de sostener la transcripcion entera y
+// empieza a rellenar huecos.
+//
+// Lo que se mide es el PROMPT ya preprocesado, no el JSONL crudo. El umbral
+// nacio mirando el tamano del fichero, y esa correlacion se rompio al arreglar
+// el preprocesado: hoy el transcript esta acotado a 1 MB pase lo que pase, asi
+// que un log de 20 MB y uno de 7 MB entregan prompts parecidos. Seguir mirando
+// el fichero mandaba a Pro por el peso de lo que se descarta.
+//
+// Medido sobre la sesion 35b61e70: 6,7 MB de log dan 431 KB de prompt (~100k
+// tokens de entrada). Con el fichero como criterio iba a Pro; con el prompt se
+// queda en el modelo por defecto, que en 3 corridas produjo documentos mas
+// completos en menos de la mitad de tiempo y sin una sola fabricacion.
+//
+// La regla NO se elimina: 3 corridas descartan un fallo frecuente, no uno raro,
+// y el caso que la motivo -- Flash inventando un SHA -- se observo una vez. Lo
+// que cambia es que ahora mide la variable que de verdad predice el riesgo.
+const RESUMEN_UMBRAL_PRO = 700 * 1024;
 const MODELO_RESUMEN_LARGO = 'gemini-3.1-pro';
 
-function elegirModeloResumen(args, config, fileSize) {
+/**
+ * @param {number} promptSize tamano en bytes del prompt YA preprocesado, no del
+ *   JSONL crudo. Ver el comentario de RESUMEN_UMBRAL_PRO.
+ */
+function elegirModeloResumen(args, config, promptSize) {
   // Peticion explicita: no se toca, ni el modelo ni el esfuerzo.
   if (args.model) {
     return {
@@ -1943,11 +1961,15 @@ function elegirModeloResumen(args, config, fileSize) {
   }
 
   const porDefecto = config.defaultModel;
-  if (fileSize <= RESUMEN_UMBRAL_PRO) {
+  const kb = (promptSize / 1024).toFixed(0);
+  const umbralKb = (RESUMEN_UMBRAL_PRO / 1024).toFixed(0);
+
+  if (promptSize <= RESUMEN_UMBRAL_PRO) {
     return {
       model: porDefecto,
       effort: args.effort || config.defaultEffort || 'high',
-      nota: null
+      nota: `Prompt de ${kb} KB, por debajo del umbral de ${umbralKb} KB: se usa el modelo por defecto.`
+        + ' El umbral mira el prompt preprocesado, no el tamano del log.'
     };
   }
 
@@ -1957,8 +1979,7 @@ function elegirModeloResumen(args, config, fileSize) {
   const pedido = args.effort || config.defaultEffort || 'high';
   const effort = pedido === 'medium' ? 'high' : pedido;
 
-  const mb = (fileSize / 1024 / 1024).toFixed(1);
-  let nota = `Log de ${mb} MB, por encima del umbral de 1 MB: se usa \`${MODELO_RESUMEN_LARGO}\``
+  let nota = `Prompt de ${kb} KB, por encima del umbral de ${umbralKb} KB: se usa \`${MODELO_RESUMEN_LARGO}\``
     + ` en vez de \`${porDefecto || 'el modelo por defecto de agy'}\`.`;
   if (effort !== pedido) {
     nota += ` El esfuerzo sube de \`${pedido}\` a \`high\`: la familia Pro no admite \`medium\`.`;
@@ -3043,12 +3064,12 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // `args.model || config.defaultModel`, sin mirar el tamano: una sesion de
       // 8,3 MB se resumio con Flash y el resultado perdio el hilo -- invento un
       // SHA de commit que no existe en el repositorio, presentado como dato.
-      // El umbral de 1 MB ya estaba documentado en el comando y en el skill;
+      // El umbral ya estaba documentado en el comando y en el skill;
       // solo faltaba aplicarlo.
       //
       // Un `model` explicito siempre manda: esto solo decide cuando nadie eligio.
       const { model: effectiveModel, effort: effectiveEffort, nota: notaModelo } =
-        elegirModeloResumen(args, config, fileSize);
+        elegirModeloResumen(args, config, fullPrompt.length);
       const perms = resolvePermissions(args.permissions, config);
 
       // Sin --output-format: lo fija executeAgyStdin en stream-json, y pasarlo

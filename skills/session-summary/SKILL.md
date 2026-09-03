@@ -85,7 +85,7 @@ If you detect that the user's session has been long and productive (many tool ca
 | 100KB - 1MB | Filtered (noise removed, tool results condensed) |
 | > 1MB | Truncated: first 10 turns + most recent turns that fit in 500K chars |
 
-Above 1MB the tool switches to `gemini-3.1-pro` by itself, because flash loses the
+Above a 700KB preprocessed prompt the tool switches to `gemini-3.1-pro` by itself, because flash loses the
 thread on transcripts that long — an 8.3MB session summarised with flash invented a
 commit SHA that did not exist in the repository, printed as fact. Passing `model`
 explicitly always overrides the choice, and the output says which model ran.

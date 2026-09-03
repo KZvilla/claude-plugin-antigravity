@@ -18,7 +18,9 @@
     "bridge:daemon:uninstall": "npm --prefix telegram-bridge run daemon:uninstall",
     "bridge:daemon:start": "npm --prefix telegram-bridge run daemon:start",
     "bridge:daemon:stop": "npm --prefix telegram-bridge run daemon:stop",
-    "bridge:daemon:logs": "npm --prefix telegram-bridge run daemon:logs"
+    "bridge:daemon:logs": "npm --prefix telegram-bridge run daemon:logs",
+    "gates": "node scripts/gates.mjs",
+    "gates:quick": "node scripts/gates.mjs --quick"
   },
   "keywords": [
     "claude-code",

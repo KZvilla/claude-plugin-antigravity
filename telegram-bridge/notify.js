@@ -108,6 +108,42 @@ async function telegramApiCall(method, payload) {
   return data.result;
 }
 
+// Extensiones cuyo contenido es texto y por tanto se puede sanear. Lo que no
+// esté aquí sube tal cual: redactar un binario lo corrompería.
+const EXTENSIONES_TEXTO = new Set([
+  '.md', '.txt', '.log', '.json', '.csv', '.tsv', '.yml', '.yaml',
+  '.xml', '.html', '.ini', '.conf', '.js', '.mjs', '.cjs', '.ts',
+  '.sh', '.ps1', '.py', '.diff', '.patch'
+]);
+
+/**
+ * Lee el archivo que va a subirse, redactando secretos si es texto.
+ *
+ * `deny_paths` decide QUÉ archivo puede salir; esto decide QUÉ va dentro. Son
+ * controles distintos y hacían falta los dos: un resumen de sesión es un
+ * archivo perfectamente permitido cuyo contenido se deriva del transcript —
+ * rutas, líneas de comando completas, salidas de herramientas. Si por una de
+ * esas líneas pasó un token, viajaba a los servidores de Telegram sin filtrar.
+ *
+ * El bridge ya redacta todo lo que emite como mensaje (`bot.js`); la subida de
+ * ficheros era la única salida que no pasaba por ahí.
+ *
+ * Nunca se toca el fichero en disco: se sanea el buffer que se envía.
+ */
+export function leerParaSubir(filePath, fileName) {
+  const ext = path.extname(fileName).toLowerCase();
+  if (!EXTENSIONES_TEXTO.has(ext)) {
+    return fs.readFileSync(filePath);
+  }
+
+  const original = fs.readFileSync(filePath, 'utf8');
+  const saneado = redactSecrets(original);
+  if (saneado !== original) {
+    console.error(`[UPLOAD] Se redactaron secretos en ${fileName} antes de subirlo (el fichero en disco no se modifica).`);
+  }
+  return Buffer.from(saneado, 'utf8');
+}
+
 /**
  * Envía un archivo binario (multipart/form-data) al Telegram Bot API
  */
@@ -136,8 +172,8 @@ async function telegramUploadCall(method, fieldName, filePath, extraParams = {})
     }
   }
 
-  const buffer = fs.readFileSync(filePath);
   const fileName = path.basename(filePath);
+  const buffer = leerParaSubir(filePath, fileName);
   const blob = new Blob([buffer]);
   formData.append(fieldName, blob, fileName);
 
