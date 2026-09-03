@@ -18,7 +18,8 @@ const {
   getPolishPrompt
 } = require('./spoken-text.js');
 const { extractLastCheckpoint } = require('./checkpoint.js');
-const { preprocessSessionLog } = require('./session-log.js');
+const { preprocessSessionLog, renderFacts } = require('./session-log.js');
+const { getSummaryPrompt, recuperarDocumentoEnlazado } = require('./summary-doc.js');
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
 
@@ -757,8 +758,8 @@ const TOOLS = [
         },
         focus: {
           type: 'string',
-          enum: ['full', 'decisions', 'changes', 'debugging'],
-          description: 'Summary focus area. "full" (default) covers everything. "decisions" emphasizes architectural/design choices. "changes" focuses on files modified. "debugging" highlights problems and resolutions.'
+          enum: ['full', 'decisions', 'changes', 'debugging', 'handoff'],
+          description: 'Summary focus area. "full" (default) covers everything. "decisions" emphasizes architectural/design choices. "changes" focuses on files modified. "debugging" highlights problems and resolutions. "handoff" produces a different document: a context transfer written for a fresh session starting cold, prioritizing findings that exist only in the conversation over anything recoverable from git, and ending in a copy-paste prompt. Use it before compacting or when the session is about to end.'
         },
         model: {
           type: 'string',
@@ -1239,54 +1240,6 @@ function findSessionFile(logDir, sessionId) {
     .sort((a, b) => b.mtime - a.mtime);
 
   return files.length > 0 ? files[0].path : null;
-}
-
-function getSummaryPrompt(focus = 'full') {
-  const focusInstructions = {
-    full: 'Cover all sections thoroughly and equally.',
-    decisions: 'Emphasize the "Decisions Made" section. Go deeper on rationale, alternatives considered, and trade-offs.',
-    changes: 'Emphasize the "Changes Made" section. List every file with detailed change descriptions.',
-    debugging: 'Emphasize the "Problems Found and Resolutions" section. Detail each bug, error, or blocker with root cause analysis.'
-  };
-
-  return `You are a Session Documentation Specialist. Analyze the following transcript of a Claude Code development session and generate a structured summary document.
-
-## Required Sections (in this exact order):
-
-### 1. Executive Summary
-- One sentence describing the main objective of the session
-- Duration and key timestamps
-
-### 2. Decisions Made
-- Numbered list of each technical or design decision
-- For each: context → decision → justification
-
-### 3. Changes Made
-- Files created, modified, or deleted
-- For each file: what changed and why
-- If tests were run: results
-
-### 4. Problems Found and Resolutions
-- Bugs, errors, or blockers encountered during the session
-- How they were resolved (or if they remain pending)
-
-### 5. Current State and Next Steps
-- What was working at the end of the session
-- Explicit pending tasks
-- Dependencies or blockers for continuation
-
-### 6. Context for Continuation
-- The minimum information an agent or human needs to resume work where it was left off
-- Relevant environment variables, branches, or configurations
-
-## Focus: ${focusInstructions[focus] || focusInstructions.full}
-
-## Rules:
-- DO NOT invent information not present in the transcript
-- Cite specific files when mentioning them
-- If something is unclear, mark it as "[unclear in transcript]"
-- Be concise: the document should not exceed 500 lines
-- Write in the same language the user used in the session (if the session is in Spanish, write in Spanish)`;
 }
 
 function saveSummary(content, sessionId, sessionMeta, outputPath, cwd = process.cwd()) {
@@ -3040,7 +2993,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // 5. Build the summarization prompt
       const focus = args.focus || 'full';
       const summarySystemPrompt = getSummaryPrompt(focus);
-      const fullPrompt = `${summarySystemPrompt}\n\n---\n\n## Session Metadata\n- Project: ${processed.sessionMeta.cwd || cwd}\n- Branch: ${processed.sessionMeta.branch || 'unknown'}\n- Claude Version: ${processed.sessionMeta.version || 'unknown'}\n- Session Start: ${processed.sessionMeta.startTime || 'unknown'}\n- Session End: ${processed.sessionMeta.endTime || 'unknown'}\n- Total Turns: ${processed.totalTurns}\n- Log File Size: ${(fileSize / 1024).toFixed(1)}KB\n\n---\n\n## Session Transcript\n\n${processed.transcript}`;
+      const factsBlock = renderFacts(processed.facts);
+      const fullPrompt = `${summarySystemPrompt}\n\n---\n\n## Session Metadata\n- Project: ${processed.sessionMeta.cwd || cwd}\n- Branch: ${processed.sessionMeta.branch || 'unknown'}\n- Claude Version: ${processed.sessionMeta.version || 'unknown'}\n- Session Start: ${processed.sessionMeta.startTime || 'unknown'}\n- Session End: ${processed.sessionMeta.endTime || 'unknown'}\n- Total Turns: ${processed.totalTurns}\n- Log File Size: ${(fileSize / 1024).toFixed(1)}KB\n\n---\n\n${factsBlock ? `${factsBlock}\n\n---\n\n` : ''}## Session Transcript\n\n${processed.transcript}`;
 
       // 6. Delegate to agy for summarization
       //
@@ -3099,7 +3053,14 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       }
 
       // 7. Save the summary document
-      const responseText = resData.response || result.rawOutput || '';
+      let responseText = resData.response || result.rawOutput || '';
+      let notaRecuperado = '';
+      const recuperado = recuperarDocumentoEnlazado(responseText);
+      if (recuperado) {
+        process.stderr.write(`[antigravity-mcp] Response was a pointer; recovered document from ${recuperado.ruta}\n`);
+        responseText = recuperado.contenido;
+        notaRecuperado = recuperado.ruta;
+      }
       let savedPath;
       try {
         savedPath = saveSummary(responseText, sessionId, processed.sessionMeta, args.output_path, cwd);
@@ -3121,6 +3082,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       formatted += `- Turns Processed: ${processed.totalTurns}\n`;
       formatted += `- Focus: \`${focus}\`\n`;
       formatted += `- Saved to: \`${savedPath}\`\n`;
+      if (notaRecuperado) formatted += `- Recovered: la respuesta era un enlace; se guardo el documento leido de \`${notaRecuperado}\`\n`;
       if (effectiveModel) formatted += `- Model: \`${effectiveModel}\`\n`;
       formatted += `- Effort: \`${effectiveEffort}\`\n`;
       if (notaModelo) formatted += `- Model choice: ${notaModelo}\n`;

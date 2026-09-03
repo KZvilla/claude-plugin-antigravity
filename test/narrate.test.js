@@ -17,8 +17,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { startServer, REPO_ROOT } = require('./lib/mcp-client');
-const { preprocessSessionLog } = require(path.join(__dirname, '..', 'mcp-server', 'session-log.js'));
+const { preprocessSessionLog, renderFacts } = require(path.join(__dirname, '..', 'mcp-server', 'session-log.js'));
 const { check, group, report } = require('./lib/assert');
+const { getSummaryPrompt, recuperarDocumentoEnlazado } = require(path.join(__dirname, '..', 'mcp-server', 'summary-doc.js'));
 const {
   normalizeSpokenText,
   getPolishPrompt,
@@ -336,6 +337,153 @@ async function main() {
       transcript.includes('X'.repeat(300) + '...') && !transcript.includes('X'.repeat(301)));
     check('los turnos contabilizados incluyen llamadas y resultados',
       totalTurns === 7, String(totalTurns));
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await group('preprocessSessionLog deriva hechos que el resumidor no debe reconstruir', () => {
+    // Un resumen que se olvida de un archivo manda a la proxima sesion a
+    // buscarlo a mano. Los hechos salen de los inputs de las herramientas, no
+    // de la prosa, y cubren la sesion entera aunque el transcript se trunque.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'facts-'));
+    const log = path.join(dir, 's.jsonl');
+
+    const linea = (o) => JSON.stringify(o);
+    const usuario = (t) => linea({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: t }] } });
+    const toolUse = (id, name, input) => linea({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] } });
+    const resultado = (id, content, isError) => linea({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content, is_error: Boolean(isError) }] } });
+    const pensando = (t) => linea({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'thinking', thinking: t }] } });
+
+    fs.writeFileSync(log, [
+      usuario('arregla el parser'),
+      pensando('Descarte usar una regex sobre el JSONL crudo porque los heredocs rompen el matcheo; voy por JSON.parse linea a linea.'),
+      toolUse('a', 'Edit', { file_path: 'mcp-server/session-log.js' }),
+      resultado('a', 'ok', false),
+      toolUse('b', 'Bash', { command: 'npm test\n--- segunda linea que no debe aparecer ---' }),
+      resultado('b', 'Error: 1 suite failed', false),
+      toolUse('c', 'Bash', { command: 'npm test' }),
+      resultado('c', 'all green', false),
+      toolUse('d', 'Write', { file_path: 'test/nuevo.test.js' }),
+      resultado('d', 'written', false)
+    ].join('\n') + '\n');
+
+    const { transcript, facts } = preprocessSessionLog(log);
+
+    check('los archivos tocados se listan desde los inputs de tool_use',
+      facts.modifiedFiles.includes('mcp-server/session-log.js') && facts.modifiedFiles.includes('test/nuevo.test.js'),
+      JSON.stringify(facts.modifiedFiles));
+    check('no cuenta como archivo un tool_use sin ruta', facts.totalFiles === 2, String(facts.totalFiles));
+    check('los comandos quedan registrados', facts.executedCommands.some(c => c.startsWith('npm test')),
+      JSON.stringify(facts.executedCommands));
+    check('el comando se corta en la primera linea',
+      !facts.executedCommands.some(c => c.includes('segunda linea')),
+      JSON.stringify(facts.executedCommands));
+    check('los comandos repetidos se deduplican', facts.executedCommands.length === 1,
+      JSON.stringify(facts.executedCommands));
+    check('totalCommands cuenta las ejecuciones, no las unicas', facts.totalCommands === 2,
+      String(facts.totalCommands));
+    check('una salida con "Error:" se registra como fallo aunque is_error sea false',
+      facts.errors.length === 1 && facts.errors[0].includes('1 suite failed'),
+      JSON.stringify(facts.errors));
+    check('y se marca ERROR en el transcript', transcript.includes('[Result ERROR] Error: 1 suite failed'));
+    check('el razonamiento del asistente se preserva',
+      transcript.includes('Razonamiento:') && transcript.includes('los heredocs rompen el matcheo'),
+      transcript.slice(0, 400));
+    check('nada se trunco en una sesion chica', facts.truncatedTurns === 0, String(facts.truncatedTurns));
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await group('preprocessSessionLog descarta el ruido que inyecta el harness', () => {
+    // Sin filtrar, el resumen le atribuye al usuario texto que nunca escribio.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ruido-'));
+    const log = path.join(dir, 's.jsonl');
+    const caveat = '<local-command-caveat>Caveat: generado por comandos locales</local-command-caveat>';
+    const reminder = '<system-reminder>contexto inyectado</system-reminder>';
+
+    fs.writeFileSync(log, [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: caveat + 'TEXTO-REAL-DEL-USUARIO' }] } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: reminder } }),
+      JSON.stringify({ type: 'file-history-delta', message: { role: 'user', content: 'delta' } })
+    ].join('\n') + '\n');
+
+    const { transcript, totalTurns } = preprocessSessionLog(log);
+
+    check('el texto real del usuario se conserva', transcript.includes('TEXTO-REAL-DEL-USUARIO'));
+    check('el caveat del harness se descarta', !transcript.includes('Caveat:'), transcript);
+    check('el system-reminder se descarta', !transcript.includes('contexto inyectado'), transcript);
+    check('un turno que era solo ruido no se emite', totalTurns === 1, String(totalTurns));
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await group('renderFacts entrega los hechos como seccion aparte del transcript', () => {
+    const vacio = renderFacts({ modifiedFiles: [], executedCommands: [], errors: [], totalFiles: 0, totalCommands: 0 });
+    check('sin hechos no ensucia el prompt', vacio === '', JSON.stringify(vacio));
+
+    const texto = renderFacts({
+      modifiedFiles: ['a.js'], executedCommands: ['npm test'], errors: ['Error: boom'],
+      totalFiles: 5, totalCommands: 9
+    });
+    check('lista los archivos', texto.includes('- a.js'));
+    check('lista los comandos', texto.includes('npm test'));
+    check('lista los fallos', texto.includes('Error: boom'));
+    check('avisa cuando la lista esta recortada', texto.includes('showing 1 of 5'), texto);
+    check('se declara autoritativa para cobertura', /authoritative/i.test(texto));
+  });
+
+  await group('el prompt exige el documento inline, no un enlace', () => {
+    // Fallo observado: agy escribio el resumen en su directorio brain/ y
+    // respondio con un enlace. La herramienta guardo esa respuesta, asi que la
+    // ruta canonica quedo con un puntero de 90 palabras a una ruta efimera.
+    for (const focus of ['full', 'decisions', 'changes', 'debugging', 'handoff']) {
+      const p = getSummaryPrompt(focus);
+      check(`focus "${focus}" prohibe escribir a archivo`, /Do NOT write it to a file/.test(p));
+      check(`focus "${focus}" prohibe responder con una ruta`, /do NOT reply with a link, a path/.test(p));
+      check(`focus "${focus}" exige cubrir toda la sesion`, /from the first timestamp to the last/.test(p));
+    }
+    check('handoff es un documento distinto, no un enfasis',
+      getSummaryPrompt('handoff') !== getSummaryPrompt('full'));
+    check('handoff prioriza lo que solo existe en la conversacion',
+      /Hallazgos Pendientes/.test(getSummaryPrompt('handoff')));
+    check('handoff termina en un prompt copiable',
+      /Prompt para Iniciar Nueva Sesion/.test(getSummaryPrompt('handoff')));
+    check('un focus desconocido cae en el documento completo',
+      getSummaryPrompt('inventado') === getSummaryPrompt('full'));
+  });
+
+  await group('recuperarDocumentoEnlazado rescata el documento cuando agy responde un puntero', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rescate-'));
+    const doc = path.join(dir, 'resumen.md');
+    const cuerpo = '# Resumen real\n\n' + 'contenido sustancioso. '.repeat(80);
+    fs.writeFileSync(doc, cuerpo);
+
+    const comoUrl = `Listo. Puedes verlo aqui:\n[resumen.md](file:///${doc.replace(/\\/g, '/')})`;
+    const r1 = recuperarDocumentoEnlazado(comoUrl);
+    check('recupera el contenido desde un enlace file://', !!(r1 && r1.contenido.includes('Resumen real')),
+      r1 ? r1.contenido.slice(0, 60) : 'null');
+
+    const comoRuta = `Guardado en ${doc}`;
+    const r2 = recuperarDocumentoEnlazado(comoRuta);
+    check('recupera tambien desde una ruta suelta', !!(r2 && r2.contenido.includes('Resumen real')));
+    check('informa de donde lo saco', !!(r2 && r2.ruta));
+
+    // El camino normal no debe tocarse: una respuesta que ya es el documento se
+    // deja como esta, aunque mencione un .md.
+    const documentoReal = '# Resumen\n\n' + `Se modifico ${doc} durante la sesion. `.repeat(120);
+    check('una respuesta larga se deja intacta', recuperarDocumentoEnlazado(documentoReal) === null);
+
+    check('un enlace a un archivo inexistente no rompe',
+      recuperarDocumentoEnlazado('mira file:///C:/no/existe/nada.md') === null);
+    check('una respuesta vacia no rompe', recuperarDocumentoEnlazado('') === null);
+    check('sin argumento no rompe', recuperarDocumentoEnlazado(undefined) === null);
+
+    // Si el "documento" enlazado es mas pobre que el propio puntero, no hay nada
+    // que ganar cambiandolo.
+    const flaco = path.join(dir, 'flaco.md');
+    fs.writeFileSync(flaco, 'ok');
+    check('no sustituye por algo mas corto que el puntero',
+      recuperarDocumentoEnlazado(`El resultado quedo en ${flaco} y deberia ser bastante mas largo que eso`) === null);
 
     fs.rmSync(dir, { recursive: true, force: true });
   });
