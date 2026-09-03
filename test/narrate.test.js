@@ -17,6 +17,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { startServer, REPO_ROOT } = require('./lib/mcp-client');
+const { preprocessSessionLog } = require(path.join(__dirname, '..', 'mcp-server', 'session-log.js'));
 const { check, group, report } = require('./lib/assert');
 const {
   normalizeSpokenText,
@@ -287,6 +288,54 @@ async function main() {
     const r = cp.extractLastCheckpoint(log);
     check('se detectan las dos ejecuciones', r.testExecutions.length === 2, String(r.testExecutions.length));
     check('el checkpoint refleja el fallo', r.overallTestStatus === 'FAILED', r.overallTestStatus);
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await group('preprocessSessionLog preserva las salidas de herramientas', () => {
+    // Regresion: la funcion ramificaba sobre obj.type === 'tool_result', un tipo
+    // raiz que no existe en el JSONL de Claude Code, y aplanaba el contenido de
+    // usuario con (c.text || c.type). Resultado: cada salida de herramienta se
+    // reducia a la palabra literal "tool_result" y se perdia el grueso del log.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'preprocess-'));
+    const log = path.join(dir, 's.jsonl');
+
+    const linea = (o) => JSON.stringify(o);
+    const usuario = (t) => linea({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: t }] } });
+    const toolUse = (id, name, input) => linea({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] } });
+    const resultado = (id, content, isError) => linea({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content, is_error: Boolean(isError) }] } });
+
+    const largo = 'X'.repeat(500);
+    fs.writeFileSync(log, [
+      usuario('corre los tests'),
+      toolUse('a', 'Bash', { command: 'npm test' }),
+      resultado('a', 'ESTA-SALIDA-DEBE-SOBREVIVIR: 71/71 checks passed', false),
+      toolUse('b', 'Bash', { command: 'npm run lint' }),
+      resultado('b', [{ type: 'text', text: 'SALIDA-EN-BLOQUES' }], true),
+      toolUse('c', 'Read', { file_path: 'x.js' }),
+      resultado('c', largo, false)
+    ].join('\n') + '\n');
+
+    const { transcript, totalTurns } = preprocessSessionLog(log);
+    const cuenta = (re) => (transcript.match(re) || []).length;
+
+    check('la salida de la herramienta sobrevive al preprocesado',
+      transcript.includes('ESTA-SALIDA-DEBE-SOBREVIVIR: 71/71 checks passed'),
+      transcript.slice(0, 300));
+    check('el contenido no se degrada a la palabra literal "tool_result"',
+      !/\[USER\][^\[]*\btool_result\b/.test(transcript),
+      transcript.slice(0, 300));
+    check('un evento user que solo trae tool_result no genera turno de usuario',
+      cuenta(/\[USER\]/g) === 1, String(cuenta(/\[USER\]/g)));
+    check('se emite un turno tool_result por cada resultado',
+      cuenta(/\[TOOL_RESULT\]/g) === 3, String(cuenta(/\[TOOL_RESULT\]/g)));
+    check('el content en bloques {type:text} se aplana a texto',
+      transcript.includes('SALIDA-EN-BLOQUES'));
+    check('is_error queda marcado en el turno', transcript.includes('[Result ERROR]'));
+    check('las salidas largas se condensan a 300 chars',
+      transcript.includes('X'.repeat(300) + '...') && !transcript.includes('X'.repeat(301)));
+    check('los turnos contabilizados incluyen llamadas y resultados',
+      totalTurns === 7, String(totalTurns));
 
     fs.rmSync(dir, { recursive: true, force: true });
   });

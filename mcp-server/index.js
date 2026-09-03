@@ -18,6 +18,7 @@ const {
   getPolishPrompt
 } = require('./spoken-text.js');
 const { extractLastCheckpoint } = require('./checkpoint.js');
+const { preprocessSessionLog } = require('./session-log.js');
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
 
@@ -1238,121 +1239,6 @@ function findSessionFile(logDir, sessionId) {
     .sort((a, b) => b.mtime - a.mtime);
 
   return files.length > 0 ? files[0].path : null;
-}
-
-function preprocessSessionLog(filePath, maxChars = 500000) {
-  const content = fs.readFileSync(filePath, 'utf8');
-  const lines = content.split('\n').filter(l => l.trim());
-
-  const turns = [];
-  let sessionMeta = { cwd: null, branch: null, version: null, startTime: null, endTime: null };
-
-  for (const line of lines) {
-    let obj;
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
-    // Skip queue operations (noise)
-    if (obj.type === 'queue-operation') continue;
-
-    // Extract session metadata from first user message
-    if (obj.cwd && !sessionMeta.cwd) sessionMeta.cwd = obj.cwd;
-    if (obj.gitBranch && !sessionMeta.branch) sessionMeta.branch = obj.gitBranch;
-    if (obj.version && !sessionMeta.version) sessionMeta.version = obj.version;
-    if (obj.timestamp) {
-      if (!sessionMeta.startTime) sessionMeta.startTime = obj.timestamp;
-      sessionMeta.endTime = obj.timestamp;
-    }
-
-    // Skip meta/system messages
-    if (obj.isMeta) continue;
-
-    // Process based on type
-    if (obj.type === 'user' && obj.message) {
-      const content = typeof obj.message.content === 'string'
-        ? obj.message.content
-        : (Array.isArray(obj.message.content)
-          ? obj.message.content.map(c => c.text || c.type || '').join(' ')
-          : '');
-      if (content.trim()) {
-        turns.push({ role: 'user', content: content.trim(), ts: obj.timestamp });
-      }
-    } else if (obj.type === 'assistant' && obj.message) {
-      const content = typeof obj.message.content === 'string'
-        ? obj.message.content
-        : (Array.isArray(obj.message.content)
-          ? obj.message.content
-            .filter(c => c.type === 'text')
-            .map(c => c.text || '')
-            .join('\n')
-          : '');
-      if (content.trim()) {
-        turns.push({ role: 'assistant', content: content.trim(), ts: obj.timestamp });
-      }
-
-      // Also extract tool_use blocks as condensed references
-      if (Array.isArray(obj.message.content)) {
-        for (const block of obj.message.content) {
-          if (block.type === 'tool_use') {
-            const toolName = block.name || 'unknown_tool';
-            const inputPreview = block.input
-              ? JSON.stringify(block.input).slice(0, 200)
-              : '';
-            turns.push({
-              role: 'tool_call',
-              content: `[Tool: ${toolName}] ${inputPreview}`,
-              ts: obj.timestamp
-            });
-          }
-        }
-      }
-    } else if (obj.type === 'tool_result' && obj.message) {
-      // Condense tool results to first 300 chars
-      const content = typeof obj.message.content === 'string'
-        ? obj.message.content
-        : (Array.isArray(obj.message.content)
-          ? obj.message.content.map(c => c.text || '').join(' ')
-          : '');
-      if (content.trim()) {
-        const truncated = content.trim().slice(0, 300);
-        turns.push({
-          role: 'tool_result',
-          content: `[Result] ${truncated}${content.length > 300 ? '...' : ''}`,
-          ts: obj.timestamp
-        });
-      }
-    }
-  }
-
-  // Build the pre-processed transcript text
-  let transcript = '';
-  const totalTurns = turns.length;
-
-  // If the full transcript is too large, keep first 10 + last turns that fit
-  const headerTurns = turns.slice(0, 10);
-  const remainingTurns = turns.slice(10);
-
-  for (const turn of headerTurns) {
-    transcript += `[${turn.role.toUpperCase()}]${turn.ts ? ` (${turn.ts})` : ''}\n${turn.content}\n\n`;
-  }
-
-  // Add remaining turns from newest first until we hit the limit
-  let tailTranscript = '';
-  for (let i = remainingTurns.length - 1; i >= 0; i--) {
-    const turn = remainingTurns[i];
-    const entry = `[${turn.role.toUpperCase()}]${turn.ts ? ` (${turn.ts})` : ''}\n${turn.content}\n\n`;
-    if (transcript.length + entry.length + tailTranscript.length > maxChars) {
-      transcript += `\n[... ${i + 1} earlier turns truncated for size ...]\n\n`;
-      break;
-    }
-    tailTranscript = entry + tailTranscript;
-  }
-  transcript += tailTranscript;
-
-  return { transcript, sessionMeta, totalTurns, filePath };
 }
 
 function getSummaryPrompt(focus = 'full') {
