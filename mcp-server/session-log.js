@@ -21,6 +21,29 @@ const LIMITE_PENSAMIENTO = 250;
 const MAX_ARCHIVOS = 120;
 const MAX_COMANDOS = 120;
 const MAX_ERRORES = 40;
+const MAX_HITOS = 60;
+const TURNOS_COLA = 20;
+const LIMITE_TURNO_COLA = 1500;
+
+// Comandos que marcan una transicion de estado del repositorio. Se listan con su
+// timestamp para dar un esqueleto cronologico.
+//
+// Existe por un fallo medido dos veces: con la sesion entera en el prompt y sin
+// truncar nada, el modelo se ancla en el principio. Un resumen dijo que la
+// sesion llego a v0.11.8 cuando termino en v0.12.1; el siguiente se detuvo en
+// v0.9.0 y perdio el unico hallazgo que no estaba escrito en el repo. Pedirlo
+// por prompt ("cover the whole session") no lo movio: hace falta darle el
+// esqueleto ya derivado.
+const PATRONES_HITO = [
+  /\bgit\s+commit\b/,
+  /\bgit\s+tag\b/,
+  /\bgit\s+push\b/,
+  /\bgit\s+merge\b/,
+  /\bgit\s+revert\b/,
+  /\bnpm\s+version\b/,
+  /\bnpm\s+run\s+release/,
+  /\bnpm\s+publish\b/
+];
 
 // Las rutas llegan bajo nombres distintos segun la herramienta: Claude Code,
 // Antigravity y los MCP de terceros no comparten convencion.
@@ -56,6 +79,42 @@ function primeraLinea(texto, limite) {
   return linea.length > limite ? linea.slice(0, limite) + '...' : linea;
 }
 
+// Un hito NO se corta en la primera linea. Los commits se escriben con heredoc
+// (`git commit -F- <<'MSGEOF'`), asi que la primera linea termina justo donde
+// empieza el mensaje: cortar ahi deja treinta entradas identicas e inutiles.
+// Colapsando el salto de linea, el asunto del commit queda visible, que es
+// precisamente lo que dice a que version llego la sesion.
+function firmaDeHito(comando, limite = 200) {
+  const bruto = String(comando);
+
+  // Hay que quitar el delimitador del heredoc en sus dos apariciones: la que lo
+  // abre (`<<'MSGEOF'`) y la linea suelta que lo cierra. Solo la primera deja el
+  // marcador colgando al final de la firma.
+  const delimitadores = new Set(
+    (bruto.match(/<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/g) || [])
+      .map(m => m.replace(/^<<-?\s*['"]?/, '').replace(/['"]$/, ''))
+  );
+
+  let plano = bruto
+    .replace(/^\s*cd\s+("[^"]*"|'[^']*'|\S+)\s*&&\s*/, '')
+    .replace(/<<-?\s*['"]?[A-Za-z_][A-Za-z0-9_]*['"]?/g, '');
+  for (const d of delimitadores) {
+    plano = plano.replace(new RegExp(`^\\s*${d}\\s*$`, 'gm'), '');
+  }
+  plano = plano.replace(/\s+/g, ' ').trim();
+  let firma = plano.length > limite ? plano.slice(0, limite) + '...' : plano;
+
+  // Una release suele ir en un solo comando compuesto (bump, commit, tag, pin),
+  // asi que el `git tag -a vX.Y.Z` cae fuera del recorte justo cuando la version
+  // es el dato que decide donde termino la sesion. Se rescata aparte.
+  const versiones = Array.from(new Set(
+    (bruto.match(/\bv\d+\.\d+\.\d+\b/g) || [])
+  )).filter(v => !firma.includes(v));
+  if (versiones.length) firma += `  [versiones: ${versiones.join(', ')}]`;
+
+  return firma;
+}
+
 function preprocessSessionLog(filePath, maxChars = 1000000) {
   const content = fs.readFileSync(filePath, 'utf8');
   const lines = content.split(/\r?\n/).filter(l => l.trim());
@@ -67,6 +126,7 @@ function preprocessSessionLog(filePath, maxChars = 1000000) {
   const archivos = new Set();
   const comandos = [];
   const errores = [];
+  const hitos = [];
 
   for (const line of lines) {
     let obj;
@@ -157,7 +217,13 @@ function preprocessSessionLog(filePath, maxChars = 1000000) {
             if (input[clave]) { archivos.add(String(input[clave])); break; }
           }
           for (const clave of CLAVES_COMANDO) {
-            if (input[clave]) { comandos.push(String(input[clave])); break; }
+            if (!input[clave]) continue;
+            const cmd = String(input[clave]);
+            comandos.push(cmd);
+            if (hitos.length < MAX_HITOS && PATRONES_HITO.some(p => p.test(cmd))) {
+              hitos.push({ ts: obj.timestamp || null, command: firmaDeHito(cmd) });
+            }
+            break;
           }
 
           const inputPreview = block.input ? JSON.stringify(block.input).slice(0, 200) : '';
@@ -198,17 +264,43 @@ function preprocessSessionLog(filePath, maxChars = 1000000) {
   }
   transcript += tailTranscript;
 
+  // El final de la sesion se repite aparte, literal. Es redundante con el
+  // transcript a proposito: enterrado al fondo de 400 KB el modelo lo saltea, y
+  // el estado final es justo lo que una sesion nueva necesita heredar.
+  const cola = turns.slice(-TURNOS_COLA);
+  const finalState = cola
+    .map(t => {
+      const cuerpo = t.content.length > LIMITE_TURNO_COLA
+        ? t.content.slice(0, LIMITE_TURNO_COLA) + '...'
+        : t.content;
+      return `[${t.role.toUpperCase()}]${t.ts ? ` (${t.ts})` : ''}\n${cuerpo}`;
+    })
+    .join('\n\n');
+
   const comandosUnicos = Array.from(new Set(comandos.map(c => primeraLinea(c, 160))));
   const facts = {
     modifiedFiles: Array.from(archivos).slice(0, MAX_ARCHIVOS),
     executedCommands: comandosUnicos.slice(-MAX_COMANDOS),
     errors: errores,
+    milestones: hitos,
     totalFiles: archivos.size,
     totalCommands: comandos.length,
+    tailTurns: cola.length,
     truncatedTurns
   };
 
-  return { transcript, sessionMeta, totalTurns, facts, filePath };
+  return { transcript, sessionMeta, totalTurns, facts, finalState, filePath };
+}
+
+// El estado final, marcado como tal y con su propio encabezado.
+function renderFinalState(finalState, facts) {
+  if (!finalState) return '';
+  const n = (facts && facts.tailTurns) || 0;
+  return `## Final State — the last ${n} turns of the session, verbatim\n\n`
+    + 'These are the CLOSING turns. Whatever state they describe is the state the session ended in: '
+    + 'the version reached, the last verdict, the last thing the user asked for. '
+    + 'If anything earlier in the transcript contradicts them, these win.\n\n'
+    + finalState;
 }
 
 // Los hechos van al prompt en su propia seccion: si la ventana del transcript se
@@ -238,9 +330,17 @@ function renderFacts(facts) {
     for (const e of facts.errors) lineas.push(`- ${e}`);
   }
 
+  if (facts.milestones && facts.milestones.length) {
+    lineas.push(`${lineas.length ? '\n' : ''}### Session timeline (state-changing commands, in order)`);
+    lineas.push('The LAST entry here is where the session ended. Do not report an earlier state as the final one.');
+    for (const h of facts.milestones) {
+      lineas.push(`- ${h.ts ? `${h.ts} — ` : ''}\`${h.command}\``);
+    }
+  }
+
   if (!lineas.length) return '';
   return '## Derived Facts\n\nExtracted mechanically from the log. This list covers the whole session even if the transcript below was truncated, so treat it as authoritative for coverage.\n\n'
     + lineas.join('\n');
 }
 
-module.exports = { preprocessSessionLog, toolResultText, renderFacts };
+module.exports = { preprocessSessionLog, toolResultText, renderFacts, renderFinalState };

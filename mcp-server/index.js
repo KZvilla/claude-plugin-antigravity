@@ -18,8 +18,27 @@ const {
   getPolishPrompt
 } = require('./spoken-text.js');
 const { extractLastCheckpoint } = require('./checkpoint.js');
-const { preprocessSessionLog, renderFacts } = require('./session-log.js');
-const { getSummaryPrompt, recuperarDocumentoEnlazado } = require('./summary-doc.js');
+const { preprocessSessionLog, renderFacts, renderFinalState } = require('./session-log.js');
+const { getSummaryPrompt, recuperarDocumentoEnlazado, validarDocumento, separarDigest, MARCA_DIGEST } = require('./summary-doc.js');
+const { executeAgyStdin } = require('./agy-stream.js');
+const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
+
+// Verdad de campo para la verificacion. Si el directorio no es un repositorio
+// git, se devuelve vacio y los chequeos que dependen de esto simplemente no
+// opinan: es preferible a inventar un veredicto.
+function leerShasDelRepo(cwd) {
+  try {
+    return execFileSync('git', ['log', '--format=%H', '-300'], { cwd, encoding: 'utf8' })
+      .trim().split(/\r?\n/).filter(Boolean);
+  } catch { return []; }
+}
+
+function leerTagsDelRepo(cwd) {
+  try {
+    return execFileSync('git', ['tag', '-l'], { cwd, encoding: 'utf8' })
+      .trim().split(/\r?\n/).filter(Boolean);
+  } catch { return []; }
+}
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
 
@@ -755,6 +774,19 @@ const TOOLS = [
         output_path: {
           type: 'string',
           description: 'Custom file path for the summary. Must resolve inside the project root or ~/.claude. Defaults to ~/.claude/session-summaries/<date>-<session-id-short>.md'
+        },
+        narrate: {
+          type: 'boolean',
+          description: 'Speak a short digest of the summary aloud (Voicebox, and Telegram if configured). The digest is produced in the SAME call that writes the document, so it costs no extra model round-trip and is written by something that just read the whole session. Do not try to get this by passing the finished document to agy_say: measured on a 36 KB handoff, plain narration speaks 1029 characters (2.8%, cut mid-sentence) and the polish path only ever sees the first 12000 characters, so the pending work and the findings — which live at the end — never reach the ear. The saved document never contains the digest.'
+        },
+        key_points: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Short points YOU know matter, declared from inside the session before summarizing. Each one is injected at the top of the prompt as mandatory to preserve, AND checked mechanically in the result: a missing one is a blocking finding. Use it for what a reader of the log cannot recover — method rules and invariants the session established the hard way ("verify each gate with its own exit code, never chain them through a pipe"), findings whose evidence is scattered, and approaches already tried and discarded. Measured: this class of content was lost in 6 of 6 runs across both models, and it is not a context-length problem. One sentence each, naming the concrete identifier, file or flag involved — that is what makes it verifiable. Not a substitute for the transcript: everything else is derived from the log.'
+        },
+        strict: {
+          type: 'boolean',
+          description: 'Verification level. A mechanical check always runs and never hallucinates: it compares the document against facts extracted from the log and against git (commit SHAs cited, the version the session actually ended at, file coverage). strict:true makes a mechanical blocking finding fail the call instead of only reporting it, and adds a second adversarial pass over the transcript for what a machine cannot check — unsupported causation, test verdicts with no command behind them, invented specifics. That second pass is ADVISORY: measured, it returned RECHAZADO accusing a correct document of inventing terms that appeared dozens of times in the transcript it was given, so its verdict never blocks. Roughly doubles time and tokens.'
         },
         focus: {
           type: 'string',
@@ -2992,9 +3024,18 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
       // 5. Build the summarization prompt
       const focus = args.focus || 'full';
-      const summarySystemPrompt = getSummaryPrompt(focus);
+      const summarySystemPrompt = getSummaryPrompt(focus, Boolean(args.narrate));
+      const keyPoints = Array.isArray(args.key_points)
+        ? args.key_points.map(p => String(p).trim()).filter(Boolean)
+        : [];
+      const keyBlock = renderKeyPoints(keyPoints);
       const factsBlock = renderFacts(processed.facts);
-      const fullPrompt = `${summarySystemPrompt}\n\n---\n\n## Session Metadata\n- Project: ${processed.sessionMeta.cwd || cwd}\n- Branch: ${processed.sessionMeta.branch || 'unknown'}\n- Claude Version: ${processed.sessionMeta.version || 'unknown'}\n- Session Start: ${processed.sessionMeta.startTime || 'unknown'}\n- Session End: ${processed.sessionMeta.endTime || 'unknown'}\n- Total Turns: ${processed.totalTurns}\n- Log File Size: ${(fileSize / 1024).toFixed(1)}KB\n\n---\n\n${factsBlock ? `${factsBlock}\n\n---\n\n` : ''}## Session Transcript\n\n${processed.transcript}`;
+      const finalBlock = renderFinalState(processed.finalState, processed.facts);
+      const fullPrompt = `${summarySystemPrompt}\n\n---\n\n## Session Metadata\n- Project: ${processed.sessionMeta.cwd || cwd}\n- Branch: ${processed.sessionMeta.branch || 'unknown'}\n- Claude Version: ${processed.sessionMeta.version || 'unknown'}\n- Session Start: ${processed.sessionMeta.startTime || 'unknown'}\n- Session End: ${processed.sessionMeta.endTime || 'unknown'}\n- Total Turns: ${processed.totalTurns}\n- Log File Size: ${(fileSize / 1024).toFixed(1)}KB\n\n---\n\n${keyBlock ? `${keyBlock}
+
+---
+
+` : ''}${factsBlock ? `${factsBlock}\n\n---\n\n` : ''}${finalBlock ? `${finalBlock}\n\n---\n\n` : ''}## Session Transcript\n\n${processed.transcript}`;
 
       // 6. Delegate to agy for summarization
       //
@@ -3010,8 +3051,9 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         elegirModeloResumen(args, config, fileSize);
       const perms = resolvePermissions(args.permissions, config);
 
+      // Sin --output-format: lo fija executeAgyStdin en stream-json, y pasarlo
+      // dos veces deja a agy con dos formatos de salida contradictorios.
       const cliArgs = [
-        '--output-format', 'json',
         '--dangerously-skip-permissions',
         '--mode', 'plan',
         '--effort', effectiveEffort
@@ -3025,12 +3067,19 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         cliArgs.push('--model', effectiveModel);
       }
 
-      cliArgs.push('-p', applyGuardrails(fullPrompt, buildSecurityRules(perms, { readOnly: true })));
+      // El prompt va por stdin, no como argumento. Con 400+ KB de transcripcion
+      // el camino de `-p` obliga a volcar el prompt a un PROMPT.md y pasarle un
+      // puntero, y eso convierte el trabajo en un paso que el modelo puede
+      // saltear: medido, tres corridas dieron tres comportamientos distintos y
+      // una devolvio "I'm ready for your next request". Ver agy-stream.js.
+      const promptFinal = applyGuardrails(fullPrompt, buildSecurityRules(perms, { readOnly: true }));
 
       const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
-      const result = await executeAgy(cliArgs, {
+      const result = await executeAgyStdin(AGY_BIN, promptFinal, cliArgs, {
         cwd,
-        timeoutMinutes: timeoutMin
+        timeoutMinutes: timeoutMin,
+        log: (m) => process.stderr.write(m),
+        terminate: (child) => terminateTree(child)
       });
 
       const resData = result.data || {};
@@ -3061,6 +3110,87 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         responseText = recuperado.contenido;
         notaRecuperado = recuperado.ruta;
       }
+      // Nunca pisar un resumen bueno con una respuesta que no es un documento.
+      const veredicto = validarDocumento(responseText);
+      if (!veredicto.ok) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `El resumen NO se guardo: ${veredicto.motivo}.\n\n`
+              + `Nada se sobrescribio, el archivo anterior de esta sesion sigue intacto.\n\n`
+              + `Respuesta recibida de Antigravity:\n---\n${String(responseText).trim().slice(0, 1000)}\n---\n\n`
+              + `Session: \`${sessionId}\` | Turns: ${processed.totalTurns} | Focus: \`${focus}\``
+              + (conversationId ? ` | Conversation ID: \`${conversationId}\`` : '')
+              + `\n\nEsto suele pasar cuando el prompt no cabe en un argumento y agy ignora el fichero PROMPT.md al que se le apunta. Reintentar suele bastar.`
+          }]
+        };
+      }
+
+      // El digest se separa ANTES de validar y guardar: el documento archivado
+      // no debe llevar una seccion escrita para el oido.
+      let digestHablado = null;
+      if (args.narrate) {
+        const partido = separarDigest(responseText);
+        if (partido.digest) {
+          responseText = partido.documento;
+          digestHablado = partido.digest;
+        } else {
+          process.stderr.write('[antigravity-mcp] narrate: el modelo no emitio la seccion de digest\n');
+        }
+      }
+
+      // Verificacion mecanica: siempre. No cuesta una llamada y no puede
+      // inventar, porque compara contra los `facts` del log y contra git.
+      const auditoria = auditarDocumento(responseText, {
+        facts: processed.facts,
+        shasReales: leerShasDelRepo(cwd),
+        keyPoints,
+        tagsReales: leerTagsDelRepo(cwd)
+      });
+
+      // Pase adversarial: solo con strict, y solo para lo que no se puede
+      // comprobar mecanicamente. Se le pasan los hallazgos deterministas para
+      // que no los repita.
+      let revisionStrict = null;
+      if (args.strict) {
+        const promptRevision = getStrictReviewPrompt(responseText, auditoria)
+          + `\n\n---\n\n## SESSION TRANSCRIPT\n\n${processed.transcript}`;
+        const rev = await executeAgyStdin(AGY_BIN, applyGuardrails(promptRevision, buildSecurityRules(perms, { readOnly: true })), cliArgs, {
+          cwd,
+          timeoutMinutes: timeoutMin,
+          log: (m) => process.stderr.write(m),
+          terminate: (child) => terminateTree(child)
+        });
+        revisionStrict = rev.success
+          ? ((rev.data && rev.data.response) || '').trim()
+          : `(el pase de revision fallo: ${rev.error})`;
+      }
+
+      // El veredicto adversarial NO bloquea, y esto se midio: en la primera
+      // prueba real devolvio RECHAZADO acusando al documento de inventar
+      // `daemon.sh`, `bash -n`, systemd y loginctl. Los cuatro terminos estaban
+      // en el transcript que el propio revisor recibio -- systemd 71 veces,
+      // daemon.sh 62. La capa mecanica dijo "sin hallazgos" y acerto.
+      //
+      // El fallo es asimetrico y por eso importa: un resumidor que no atiende a
+      // todo el material omite, un revisor que no atiende a todo acusa, y lo
+      // hace con prosa convincente. Darle poder de bloqueo convierte un falso
+      // positivo en trabajo perdido. Se reporta como opinion, etiquetada.
+      if (args.strict && auditoria.bloqueantes > 0) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `El resumen NO se guardo: strict activo y la verificacion encontro problemas.\n\n`
+              + `Nada se sobrescribio.\n\n${renderAuditoria(auditoria)}\n\n`
+              + (revisionStrict ? `### Revision adversarial\n\n${revisionStrict}\n\n` : '')
+              + `Session: \`${sessionId}\` | Focus: \`${focus}\`\n\n`
+              + `El documento generado va debajo para que puedas juzgarlo:\n\n---\n\n${responseText.trim()}`
+          }]
+        };
+      }
+
       let savedPath;
       try {
         savedPath = saveSummary(responseText, sessionId, processed.sessionMeta, args.output_path, cwd);
@@ -3083,12 +3213,45 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       formatted += `- Focus: \`${focus}\`\n`;
       formatted += `- Saved to: \`${savedPath}\`\n`;
       if (notaRecuperado) formatted += `- Recovered: la respuesta era un enlace; se guardo el documento leido de \`${notaRecuperado}\`\n`;
+      formatted += `- Strict: ${args.strict ? 'si' : 'no (solo verificacion mecanica)'}\n`;
+
+      // Narracion al final: el documento ya esta guardado, asi que un fallo de
+      // voz no puede costar el resumen. Es el mismo canje que hace agy_say al
+      // narrar el texto original cuando el pulido falla.
+      if (args.narrate) {
+        if (!digestHablado) {
+          formatted += `- Narracion: no se emitio (el modelo no incluyo la seccion \`${MARCA_DIGEST}\`; el documento se guardo igual)\n`;
+        } else {
+          const destino = await prepareNarrationTarget(args, config);
+          if (destino.error) {
+            formatted += `- Narracion: fallo la preparacion de voz; el digest va abajo en texto\n`;
+          } else {
+            const { text: textoHablado } = normalizeSpokenText(digestHablado);
+            const emision = await emitNarration({
+              spokenText: textoHablado,
+              voiceboxUrl: destino.voiceboxUrl,
+              profile: destino.profile,
+              language: destino.language,
+              personality: Boolean(args.personality),
+              localPlayback: args.local_playback !== false,
+              sendTelegram: args.send_telegram !== false
+            });
+            formatted += `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : 'emitida'}\n`;
+          }
+          formatted += `\n**Digest hablado:** ${digestHablado}\n`;
+        }
+      }
       if (effectiveModel) formatted += `- Model: \`${effectiveModel}\`\n`;
       formatted += `- Effort: \`${effectiveEffort}\`\n`;
       if (notaModelo) formatted += `- Model choice: ${notaModelo}\n`;
       formatted += `- Duration: ${duration ? `${duration.toFixed(1)}s` : 'unknown'}\n`;
       if (conversationId) {
         formatted += `- Conversation ID: \`${conversationId}\`\n`;
+      }
+      formatted += `\n${renderAuditoria(auditoria)}\n`;
+      if (revisionStrict) {
+        formatted += `\n### Revision adversarial (orientativa, NO bloqueante)\n\n`
+          + `Un segundo modelo releyo el transcript buscando afirmaciones sin respaldo. Sus hallazgos son pistas, no veredictos: en pruebas devolvio RECHAZADO acusando de inventar terminos que aparecian decenas de veces en el material que el mismo recibio. Verifica cada punto antes de actuar.\n\n${revisionStrict}\n`;
       }
 
       return {

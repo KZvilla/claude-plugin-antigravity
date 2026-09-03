@@ -17,9 +17,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { startServer, REPO_ROOT } = require('./lib/mcp-client');
-const { preprocessSessionLog, renderFacts } = require(path.join(__dirname, '..', 'mcp-server', 'session-log.js'));
+const { preprocessSessionLog, renderFacts, renderFinalState } = require(path.join(__dirname, '..', 'mcp-server', 'session-log.js'));
 const { check, group, report } = require('./lib/assert');
-const { getSummaryPrompt, recuperarDocumentoEnlazado } = require(path.join(__dirname, '..', 'mcp-server', 'summary-doc.js'));
+const { crearAcumuladorStream } = require(path.join(__dirname, '..', 'mcp-server', 'agy-stream.js'));
+const { auditarDocumento, versionFinalReal, getStrictReviewPrompt, renderKeyPoints, terminosDistintivos, verificarPuntosClave } = require(path.join(__dirname, '..', 'mcp-server', 'summary-audit.js'));
+const { getSummaryPrompt, recuperarDocumentoEnlazado, validarDocumento, MIN_LONGITUD_DOCUMENTO, separarDigest, MARCA_DIGEST } = require(path.join(__dirname, '..', 'mcp-server', 'summary-doc.js'));
 const {
   normalizeSpokenText,
   getPolishPrompt,
@@ -67,6 +69,16 @@ async function main() {
     check('informa el .env efectivo', !!(texto && /Credenciales/.test(texto)));
     check('informa el estado compartido', !!(texto && /Estado compartido/.test(texto)));
     check('nombra el directorio de datos', !!(texto && /antigravity-telegram-bridge/.test(texto)));
+  });
+
+  await group('agy_session_summary expone strict y handoff', () => {
+    const t = tools.find(x => x.name === 'agy_session_summary');
+    check('la tool existe', !!t);
+    check('acepta strict como booleano', !!(t && t.inputSchema.properties.strict && t.inputSchema.properties.strict.type === 'boolean'));
+    check('handoff esta en el enum de focus', !!(t && t.inputSchema.properties.focus.enum.includes('handoff')));
+    check('strict dice que la verificacion mecanica siempre corre', !!(t && /always runs/i.test(t.inputSchema.properties.strict.description)));
+    check('strict advierte del coste', !!(t && /doubles/i.test(t.inputSchema.properties.strict.description)));
+    check('strict aclara que el pase adversarial no bloquea', !!(t && /ADVISORY/.test(t.inputSchema.properties.strict.description)));
   });
 
   await group('agy_say rechaza una llamada sin texto util', async () => {
@@ -486,6 +498,346 @@ async function main() {
       recuperarDocumentoEnlazado(`El resultado quedo en ${flaco} y deberia ser bastante mas largo que eso`) === null);
 
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await group('la cola y la linea de tiempo hacen visible donde termino la sesion', () => {
+    // Medido dos veces: con la sesion entera en el prompt y sin truncar nada, el
+    // modelo se anclaba en el principio y daba por final un estado intermedio.
+    // Pedirlo por prompt no alcanzo; esto se lo entrega ya derivado.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cola-'));
+    const log = path.join(dir, 's.jsonl');
+
+    const bash = (cmd, ts) => JSON.stringify({
+      type: 'assistant', timestamp: ts,
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'x' + ts, name: 'Bash', input: { command: cmd } }] }
+    });
+    const dice = (t, ts) => JSON.stringify({
+      type: 'user', timestamp: ts, message: { role: 'user', content: [{ type: 'text', text: t }] }
+    });
+
+    const lineas = [dice('arrancamos', '2026-01-01T00:00:00Z')];
+    // Ruido en el medio para que la cola no coincida con el principio.
+    for (let i = 0; i < 60; i++) lineas.push(bash(`echo relleno-${i}`, `2026-01-01T00:${String(i).padStart(2, '0')}:00Z`));
+    lineas.push(bash('git tag -a v0.9.0 -m "vieja"', '2026-01-01T01:00:00Z'));
+    lineas.push(bash('npm run release:stamp', '2026-01-01T01:05:00Z'));
+    lineas.push(bash('git tag -a v0.12.1 -m "la ultima"', '2026-01-01T02:00:00Z'));
+    lineas.push(dice('ULTIMO-PEDIDO-DEL-USUARIO', '2026-01-01T02:10:00Z'));
+    fs.writeFileSync(log, lineas.join('\n') + '\n');
+
+    const r = preprocessSessionLog(log);
+    const facts = renderFacts(r.facts);
+    const final = renderFinalState(r.finalState, r.facts);
+
+    check('la cola trae los ultimos turnos', r.facts.tailTurns === 20, String(r.facts.tailTurns));
+    check('el ultimo turno del usuario esta en la cola',
+      final.includes('ULTIMO-PEDIDO-DEL-USUARIO'), final.slice(-200));
+    check('la cola se anuncia como el cierre', /Final State/.test(final) && /CLOSING turns/.test(final));
+    check('la cola gana ante contradicciones', /these win/i.test(final));
+
+    check('los hitos capturan los tags', r.facts.milestones.some(h => h.command.includes('v0.12.1')),
+      JSON.stringify(r.facts.milestones.map(h => h.command)));
+    check('los hitos capturan el release stamp', r.facts.milestones.some(h => h.command.includes('release:stamp')));
+    check('el relleno no ensucia los hitos', !r.facts.milestones.some(h => h.command.includes('relleno')),
+      String(r.facts.milestones.length));
+    check('los hitos van en orden y el ultimo es el final real',
+      r.facts.milestones[r.facts.milestones.length - 1].command.includes('v0.12.1'),
+      JSON.stringify(r.facts.milestones.map(h => h.command)));
+    check('los hitos llevan timestamp', r.facts.milestones.every(h => !!h.ts));
+
+    // Los commits de este repo se escriben con heredoc: cortar en la primera
+    // linea deja treinta entradas identicas ("git commit -F- <<'MSGEOF'") y la
+    // linea de tiempo pierde todo su valor.
+    const heredoc = preprocessSessionLog((() => {
+      const f = path.join(dir, 'heredoc.jsonl');
+      fs.writeFileSync(f, [
+        bash('cd "C:/repo" && git add -A && git commit -F- <<\'MSGEOF\'\nfix(algo): EL-ASUNTO-DEL-COMMIT\n\ncuerpo\nMSGEOF', '2026-01-01T03:00:00Z'),
+        bash('npm version patch && git tag -a v9.9.9 -m "release" && git push --follow-tags', '2026-01-01T04:00:00Z')
+      ].join('\n') + '\n');
+      return f;
+    })()).facts.milestones;
+
+    check('el asunto del commit sobrevive al heredoc',
+      heredoc[0].command.includes('EL-ASUNTO-DEL-COMMIT'), heredoc[0].command);
+    check('el prefijo cd se descarta', !heredoc[0].command.startsWith('cd '), heredoc[0].command);
+    check('el marcador del heredoc no ensucia', !heredoc[0].command.includes('MSGEOF'), heredoc[0].command);
+    check('la version se rescata aunque caiga fuera del recorte',
+      heredoc[1].command.includes('v9.9.9'), heredoc[1].command);
+    check('la linea de tiempo sale en el bloque de hechos',
+      /Session timeline/.test(facts) && facts.includes('v0.12.1'));
+    check('la linea de tiempo avisa que la ultima entrada manda',
+      /LAST entry here is where the session ended/.test(facts));
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await group('el prompt apunta a la cola y a la linea de tiempo', () => {
+    for (const focus of ['full', 'handoff']) {
+      const p = getSummaryPrompt(focus);
+      check(`focus "${focus}" manda leer Final State primero`, /read the "Final State" section/.test(p));
+      check(`focus "${focus}" nombra el peor fallo posible`,
+        /Reporting an intermediate state as if it were the final one/.test(p));
+    }
+  });
+
+  await group('renderFinalState y renderFacts toleran entradas incompletas', () => {
+    check('sin finalState no emite nada', renderFinalState('', { tailTurns: 0 }) === '');
+    check('sin argumentos no rompe', renderFinalState(undefined, undefined) === '');
+    const sinHitos = renderFacts({
+      modifiedFiles: ['a.js'], executedCommands: [], errors: [], totalFiles: 1, totalCommands: 0
+    });
+    check('sin hitos no aparece la linea de tiempo', !/Session timeline/.test(sinHitos), sinHitos);
+  });
+
+  await group('validarDocumento impide que una respuesta fallida pise un resumen bueno', () => {
+    // Paso de verdad: un handoff de 6,9 KB quedo reemplazado por 341 bytes con
+    // "I'm ready for your next request". La ruta de guardado es la misma por
+    // sesion, asi que una generacion fallida destruye la anterior.
+    const saludo = "I'm ready for your next request. What would you like to work on?";
+    check('un saludo no pasa por documento', validarDocumento(saludo).ok === false);
+    check('y explica por que', /caracteres|encabezado/.test(validarDocumento(saludo).motivo),
+      validarDocumento(saludo).motivo);
+    check('vacio no pasa', validarDocumento('').ok === false);
+    check('undefined no rompe', validarDocumento(undefined).ok === false);
+
+    // Largo pero sin estructura: una parrafada tampoco es el documento.
+    const parrafada = 'texto plano sin secciones. '.repeat(60);
+    check('largo sin encabezados no pasa', validarDocumento(parrafada).ok === false,
+      validarDocumento(parrafada).motivo);
+
+    const doc = ['# Handoff', '', 'a'.repeat(300), '', '### Decisiones', '', 'b'.repeat(200)].join('\n');
+    const v = validarDocumento(doc);
+    check('un documento real pasa', v.ok === true, v.motivo);
+    check('informa su longitud', v.longitud > MIN_LONGITUD_DOCUMENTO, String(v.longitud));
+    check('cuenta los encabezados', v.encabezados === 2, String(v.encabezados));
+  });
+
+  await group('el acumulador NDJSON entiende el esquema real de agy', () => {
+    // Lineas sondeadas en vivo contra agy (2026-09-03). El payload va ANIDADO
+    // bajo una clave homonima del evento; leerlo plano deja la respuesta vacia
+    // sin que nada falle, que es el peor modo de fallo posible.
+    const a = crearAcumuladorStream();
+    const cid = '37390b09-cd00-4a48-b3cb-4113f5998455';
+    a.onLine(JSON.stringify({ event: 'init', conversation_id: cid, init: {} }));
+    a.onLine(JSON.stringify({ event: 'step_update', step_update: { conversation_id: cid, step_index: 0, state: 'DONE', step_type: 'user_input', text_delta: 'ECO-DEL-PROMPT' } }));
+    a.onLine(JSON.stringify({ event: 'step_update', step_update: { conversation_id: cid, step_index: 1, state: 'ACTIVE', step_type: 'agent_response', text_delta: '# Doc' } }));
+    a.onLine(JSON.stringify({ event: 'step_update', step_update: { conversation_id: cid, step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: '\ncuerpo' } }));
+    a.onLine(JSON.stringify({ event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: '# Doc\ncuerpo', duration_seconds: 2.26, usage: { total_tokens: 18518 } } }));
+
+    const r = a.resultado();
+    check('captura el conversation_id', r.conversationId === cid, String(r.conversationId));
+    check('la respuesta sale del payload anidado', r.response === '# Doc\ncuerpo', JSON.stringify(r.response));
+    check('el eco del prompt no contamina la respuesta',
+      !r.response.includes('ECO-DEL-PROMPT'), JSON.stringify(r.response));
+    check('captura el usage anidado', r.usage && r.usage.total_tokens === 18518, JSON.stringify(r.usage));
+    check('captura la duracion', r.durationSeconds === 2.26, String(r.durationSeconds));
+    check('marca el turno como cerrado', r.cerrado === true);
+    check('sin error', r.error === null, String(r.error));
+
+    // Si `result` no trae texto, los deltas del agente son el respaldo.
+    const b = crearAcumuladorStream();
+    b.onLine(JSON.stringify({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'desde-deltas' } }));
+    b.onLine(JSON.stringify({ event: 'result', result: { status: 'SUCCESS' } }));
+    check('los deltas respaldan si result viene sin texto',
+      b.resultado().response === 'desde-deltas', JSON.stringify(b.resultado().response));
+
+    const c = crearAcumuladorStream();
+    c.onLine(JSON.stringify({ event: 'result', result: { status: 'ERROR', error: 'se rompio' } }));
+    check('propaga el error del result', c.resultado().error === 'se rompio', String(c.resultado().error));
+
+    const d = crearAcumuladorStream();
+    d.onLine('esto no es json');
+    d.onLine('');
+    d.onLine(JSON.stringify({ event: 'result', result: { response: 'igual funciona' } }));
+    check('una linea ilegible no invalida la corrida',
+      d.resultado().response === 'igual funciona');
+    check('las lineas ilegibles quedan registradas', d.resultado().lineasIlegibles.length === 1);
+
+    const e = crearAcumuladorStream();
+    check('sin eventos no rompe', e.resultado().response === '' && e.resultado().eventos === 0);
+  });
+
+  await group('auditarDocumento verifica el resumen contra verdad de campo', () => {
+    // Un LLM revisando a otro relee el mismo material y puede alucinar igual.
+    // Esto compara contra datos ya extraidos: o el sha esta en git log o no.
+    const facts = {
+      milestones: [
+        { ts: '2026-01-01T01:00:00Z', command: 'git tag -a v0.9.0 -m x' },
+        { ts: '2026-01-01T02:00:00Z', command: 'git commit -F- release  [versiones: v0.12.1]' }
+      ],
+      modifiedFiles: ['mcp-server/index.js', 'test/narrate.test.js'],
+      errors: []
+    };
+    const ctx = { facts, shasReales: ['5dc67e6f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d'], tagsReales: ['v0.9.0', 'v0.12.1'] };
+    const base = '# Handoff\n\n### Objetivo\nSe trabajo en `mcp-server/index.js` y `test/narrate.test.js`.\n';
+
+    check('la version final real sale del ultimo hito',
+      versionFinalReal(facts) === '0.12.1', String(versionFinalReal(facts)));
+
+    const bueno = auditarDocumento(base + '\nLa sesion cerro en la version v0.12.1.\n', ctx);
+    check('un documento correcto no dispara nada', bueno.bloqueantes === 0,
+      JSON.stringify(bueno.hallazgos.map(h => h.tipo)));
+
+    // El fallo historico #1: "desde la v0.9.0 hasta la v0.11.8", sin nombrar
+    // nunca 0.12.1. No hay formula de "cerro en X" que detectar; lo que falla
+    // es la ausencia.
+    const historico1 = auditarDocumento(
+      base + '\nAbarco varias versiones (desde la v0.9.0 hasta la v0.11.8).\n', ctx);
+    check('atrapa el resumen que se detuvo en v0.11.8',
+      historico1.hallazgos.some(h => h.tipo === 'version_final_ausente'),
+      JSON.stringify(historico1.hallazgos.map(h => h.tipo)));
+    check('y lo marca bloqueante', historico1.bloqueantes >= 1);
+
+    // El fallo historico #2: "se preparo el release de la version 0.9.0".
+    const historico2 = auditarDocumento(
+      base + '\nSe preparo el release de la version 0.9.0.\n', ctx);
+    check('atrapa el handoff que se detuvo en v0.9.0',
+      historico2.hallazgos.some(h => h.tipo === 'version_final_ausente'));
+
+    // Declarar explicitamente una version de cierre equivocada.
+    const equivocada = auditarDocumento(base + '\nLa sesion cerro en v0.9.0. Tambien se llego a v0.12.1 antes.\n', ctx);
+    check('atrapa una version de cierre que contradice al ultimo hito',
+      equivocada.hallazgos.some(h => h.tipo === 'version_final_incorrecta'),
+      JSON.stringify(equivocada.hallazgos.map(h => h.tipo)));
+
+    // Sha inventado, presentado como commit.
+    const shaMalo = auditarDocumento(base + '\nCerro en v0.12.1. Ver el commit `abc1234`.\n', ctx);
+    check('atrapa un sha que no existe',
+      shaMalo.hallazgos.some(h => h.tipo === 'sha_inexistente'), JSON.stringify(shaMalo.hallazgos));
+
+    const shaBueno = auditarDocumento(base + '\nCerro en v0.12.1. Ver el commit `5dc67e6`.\n', ctx);
+    check('no marca un sha real', !shaBueno.hallazgos.some(h => h.tipo === 'sha_inexistente'));
+
+    // Falso positivo que un auditor ingenuo SI cometio: `d572a2f0` es el UUID
+    // de otra sesion, citado correctamente, no un commit inventado.
+    const uuid = auditarDocumento(
+      base + '\nCerro en v0.12.1. Se analizo la sesion `d572a2f0-0bd7-4c81-9894-26f90fc0ede8`.\n', ctx);
+    check('no confunde un UUID de sesion con un commit',
+      !uuid.hallazgos.some(h => h.tipo === 'sha_inexistente'), JSON.stringify(uuid.hallazgos));
+
+    // Un hex suelto sin etiquetarlo de commit tampoco se marca.
+    const hexSuelto = auditarDocumento(base + '\nCerro en v0.12.1. El token empieza por 1234567890ab.\n', ctx);
+    check('un hex que no se presenta como commit no se marca',
+      !hexSuelto.hallazgos.some(h => h.tipo === 'sha_inexistente'));
+
+    // Cobertura de archivos y de fallos.
+    const sinArchivos = auditarDocumento('# H\n\n### X\nCerro en v0.12.1, sin detalles.\n', ctx);
+    check('avisa de archivos omitidos',
+      sinArchivos.hallazgos.some(h => h.tipo === 'archivos_omitidos'));
+    check('el aviso no bloquea', sinArchivos.bloqueantes === 0, String(sinArchivos.bloqueantes));
+
+    const conErrores = auditarDocumento(base + '\nCerro en v0.12.1. Todo perfecto.\n',
+      { ...ctx, facts: { ...facts, errors: ['Error: boom', 'Error: otra'] } });
+    check('avisa si hubo fallos y el documento no los menciona',
+      conErrores.hallazgos.some(h => h.tipo === 'fallos_no_reportados'));
+
+    check('sin contexto no rompe', auditarDocumento('texto', {}).bloqueantes === 0);
+    check('documento vacio no rompe', auditarDocumento('', { facts }).hallazgos.length >= 0);
+  });
+
+  await group('el prompt del pase strict no re-hace el trabajo mecanico', () => {
+    const p = getStrictReviewPrompt('# Doc\ncontenido', {
+      hallazgos: [{ severidad: 'bloqueante', tipo: 'sha_inexistente', detalle: 'X' }]
+    });
+    check('le pasa los hallazgos deterministas', /sha_inexistente/.test(p));
+    check('le prohibe repetirlos', /Do NOT repeat that work/.test(p));
+    check('pide veredicto binario', /APROBADO/.test(p) && /RECHAZADO/.test(p));
+    check('apunta a los veredictos de tests', /Test verdicts/.test(p));
+    check('apunta a las reglas de metodo', /Method rules dropped/.test(p));
+    check('incluye el documento a revisar', /DOCUMENT UNDER REVIEW/.test(p) && /contenido/.test(p));
+  });
+
+  await group('los puntos clave declarados se exigen y se verifican', () => {
+    // La clase de contenido que se perdio en 6 de 6 corridas, con los dos
+    // modelos y a la mitad del contexto util: las reglas de metodo. No es
+    // saturacion; estan diluidas y nada las marca. Quien invoca si las sabe.
+    const reglas = [
+      'Verifica cada puerta con su propio codigo de salida ($?), nunca encadenadas con && a traves de un pipe.',
+      'Trunca el comando en la linea que abre un heredoc (<<) conservando la sentencia anterior.',
+      'node -e no se analiza como shell; bash -c si.'
+    ];
+
+    check('extrae terminos verificables de una regla',
+      terminosDistintivos(reglas[0]).includes('$?'), JSON.stringify(terminosDistintivos(reglas[0])));
+    check('reconoce identificadores con punto',
+      terminosDistintivos('Arregla mcp-server/session-log.js').includes('mcp-server/session-log.js'),
+      JSON.stringify(terminosDistintivos('Arregla mcp-server/session-log.js')));
+    check('cae en palabras largas si no hay identificadores',
+      terminosDistintivos('Preservar siempre el razonamiento derivado').length > 0);
+
+    const conRegla = 'El documento explica que hay que verificar cada puerta con su propio $? y no encadenar.';
+    check('detecta una regla presente aunque parafraseada',
+      verificarPuntosClave(conRegla, [reglas[0]]).length === 0);
+    check('detecta una regla ausente',
+      verificarPuntosClave('Un documento sobre otra cosa totalmente distinta.', [reglas[0]]).length === 1);
+
+    const facts = { milestones: [{ ts: 'x', command: 'git tag v0.12.1' }], modifiedFiles: [], errors: [] };
+    const ctx = { facts, shasReales: [], tagsReales: ['v0.12.1'], keyPoints: reglas };
+
+    const omite = auditarDocumento('# H\n\n### X\nLa sesion cerro en v0.12.1 sin mas detalle.\n', ctx);
+    check('omitir puntos clave es bloqueante',
+      omite.hallazgos.filter(h => h.tipo === 'punto_clave_ausente').length === 3,
+      JSON.stringify(omite.hallazgos.map(h => h.tipo)));
+    check('y suma a los bloqueantes', omite.bloqueantes >= 3, String(omite.bloqueantes));
+    check('el hallazgo dice que se busco',
+      /se buscaron/.test(omite.hallazgos.find(h => h.tipo === 'punto_clave_ausente').detalle));
+
+    const cumple = auditarDocumento(
+      '# H\n\n### X\nCerro en v0.12.1. Cada puerta se verifica con su propio $?. El comando se trunca en el heredoc (<<). Y `node -e` no se analiza como shell.\n',
+      ctx);
+    check('un documento que los conserva no dispara nada',
+      cumple.bloqueantes === 0, JSON.stringify(cumple.hallazgos.map(h => h.tipo)));
+
+    check('sin puntos clave el chequeo no opina',
+      auditarDocumento('cualquier cosa', { facts, keyPoints: [] }).hallazgos
+        .every(h => h.tipo !== 'punto_clave_ausente'));
+
+    // El bloque va con instrucciones de conservacion, no como sugerencia.
+    const bloque = renderKeyPoints(reglas);
+    check('el bloque numera los puntos', /^1\. /m.test(bloque));
+    check('exige que aparezcan todos', /MUST appear/.test(bloque));
+    check('prohibe fusionarlos', /do not merge them/i.test(bloque));
+    check('sin puntos no ensucia el prompt', renderKeyPoints([]) === '');
+  });
+
+  await group('el digest hablado se produce en la misma llamada, no narrando el documento', () => {
+    // Medido sobre el handoff real de 36 KB: narrarlo tal cual da 1029 chars
+    // (2,8%, cortado a media frase) y con `polish` getPolishPrompt hace
+    // slice(0, 12000), o sea solo el primer tercio. Los pendientes viven al
+    // final, asi que por ninguno de los dos caminos llegan al oido.
+    check('sin narrate el prompt no pide digest',
+      !new RegExp(MARCA_DIGEST).test(getSummaryPrompt('handoff', false)));
+    check('con narrate si lo pide',
+      new RegExp(MARCA_DIGEST).test(getSummaryPrompt('handoff', true)));
+    check('tambien en los focus normales',
+      new RegExp(MARCA_DIGEST).test(getSummaryPrompt('full', true)));
+    check('pide prosa hablada, no markdown',
+      /no markdown, no bullets/.test(getSummaryPrompt('handoff', true)));
+    check('prohibe contradecir o agregar', /must not contradict/.test(getSummaryPrompt('handoff', true)));
+
+    const conDigest = '# Handoff\n\n### Pendientes\nArreglar X.\n\n' + MARCA_DIGEST + '\nLa sesion cerro en la doce uno. Queda pendiente arreglar el parser.';
+    const r = separarDigest(conDigest);
+    check('el digest se separa del documento', r.digest === 'La sesion cerro en la doce uno. Queda pendiente arreglar el parser.', JSON.stringify(r.digest));
+    check('el documento guardado no lo lleva',
+      !r.documento.includes(MARCA_DIGEST) && !r.documento.includes('doce uno'), r.documento);
+    check('el documento conserva su contenido', r.documento.includes('Arreglar X.'));
+
+    // Si el modelo no lo emite, el documento tiene que volver intacto: narrar
+    // es opcional y no puede costar el resumen.
+    const sin = separarDigest('# Handoff\n\n### Pendientes\nArreglar X.');
+    check('sin marcador el digest es null', sin.digest === null);
+    check('y el documento queda entero', sin.documento.includes('Arreglar X.'));
+    check('vacio no rompe', separarDigest('').digest === null);
+    check('undefined no rompe', separarDigest(undefined).documento === '');
+
+    // Un digest vacio detras del marcador tampoco debe pasar por bueno.
+    check('marcador sin contenido da null', separarDigest('# D\ncuerpo\n\n' + MARCA_DIGEST + '\n   ').digest === null);
+
+    const t = tools.find(x => x.name === 'agy_session_summary');
+    check('la tool expone narrate', !!(t && t.inputSchema.properties.narrate));
+    check('narrate explica por que no se usa agy_say',
+      !!(t && /2\.8%/.test(t.inputSchema.properties.narrate.description)));
+    check('narrate aclara que el documento guardado no lo lleva',
+      !!(t && /never contains the digest/i.test(t.inputSchema.properties.narrate.description)));
   });
 
   report();

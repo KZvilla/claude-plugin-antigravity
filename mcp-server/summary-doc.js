@@ -21,6 +21,8 @@ const path = require('path');
 const SUMMARY_OUTPUT_RULES = `## Output Rules (mandatory):
 - Output the ENTIRE document inline as your response text. Do NOT write it to a file, do NOT use any file-writing tool, and do NOT reply with a link, a path, or a note saying where it can be found. A response that points somewhere else instead of containing the document is a failed response.
 - Cover the WHOLE session, from the first timestamp to the last. State the real version/state reached at the END of the session, not at the point where you stopped paying attention.
+- Before writing anything, read the "Final State" section and the last entry of the "Session timeline". Those two define where the session ended. Write the document backwards from there: the ending is the part a fresh session actually inherits, the beginning is context.
+- Reporting an intermediate state as if it were the final one is the single worst failure of this document, worse than being too short. If the timeline's last entry is a tag or a commit, the session ended at that version — not at an earlier one mentioned in the middle of the transcript.
 - Use the "Derived Facts" section as the authoritative checklist of files and commands: every file listed there must be accounted for.
 
 ## Content Rules:
@@ -36,7 +38,7 @@ const SUMMARY_OUTPUT_RULES = `## Output Rules (mandatory):
 // plantilla, no el modelo. Vive aca como `focus` y no como herramienta aparte
 // porque dos tools que dicen "resume una sesion" degradan la seleccion — el
 // mismo argumento que abre test/narrate.test.js.
-function getHandoffPrompt() {
+function getHandoffPrompt(conDigest = false) {
   return `You are a Session Handoff Specialist. Analyze the following transcript of a Claude Code development session and produce a handoff document that lets a FRESH session resume the work with no access to this conversation.
 
 Optimize for one reader: an agent starting cold. Anything they can get from \`git log\`, \`git diff\` or by reading the code is cheap — spend the space on what exists only in this conversation.
@@ -68,11 +70,11 @@ Numbered, concrete, in execution order. Mark anything already resolved during th
 ### Prompt para Iniciar Nueva Sesion
 A copy-paste block the user can hand to a fresh session, containing: a 3-5 line state summary, the key files, and the immediate task.
 
-${SUMMARY_OUTPUT_RULES}`;
+${SUMMARY_OUTPUT_RULES}${conDigest ? INSTRUCCION_DIGEST : ''}`;
 }
 
-function getSummaryPrompt(focus = 'full') {
-  if (focus === 'handoff') return getHandoffPrompt();
+function getSummaryPrompt(focus = 'full', conDigest = false) {
+  if (focus === 'handoff') return getHandoffPrompt(conDigest);
 
   const focusInstructions = {
     full: 'Cover all sections thoroughly and equally.',
@@ -114,7 +116,7 @@ function getSummaryPrompt(focus = 'full') {
 ## Focus: ${focusInstructions[focus] || focusInstructions.full}
 
 ${SUMMARY_OUTPUT_RULES}
-- Be thorough but bounded: the document should not exceed 500 lines`;
+- Be thorough but bounded: the document should not exceed 500 lines${conDigest ? INSTRUCCION_DIGEST : ''}`;
 }
 
 // Red de seguridad para el modo de fallo observado: pese a la regla del prompt,
@@ -153,4 +155,75 @@ function recuperarDocumentoEnlazado(responseText) {
   return null;
 }
 
-module.exports = { getSummaryPrompt, getHandoffPrompt, recuperarDocumentoEnlazado, SUMMARY_OUTPUT_RULES };
+// El resumen se guarda SIEMPRE en la misma ruta por sesion, asi que una
+// generacion fallida pisa una buena. Paso de verdad: un handoff de 6,9 KB
+// quedo reemplazado por 341 bytes con "I'm ready for your next request" --
+// agy ignoro el prompt y devolvio un saludo, y la herramienta lo archivo como
+// si fuera el documento.
+//
+// Un resumen valido es largo y tiene estructura. Si no cumple, es mejor fallar
+// ruidosamente y dejar intacto lo que ya habia.
+// Marcador del digest hablado. Se pide en la MISMA llamada que el documento
+// porque ahi el modelo ya leyo la sesion entera.
+//
+// La alternativa era narrar el documento ya escrito, y esta medida: un handoff
+// de 36 KB pasado a agy_say sin pulir da 1029 caracteres hablados, el 2,8% y
+// cortado a media frase; con `polish`, getPolishPrompt hace slice(0, 12000), o
+// sea que solo ve el primer tercio y condensa desde ahi. En los dos casos los
+// pendientes y los hallazgos -- que viven al final -- nunca llegan al oido.
+const MARCA_DIGEST = '## DIGEST HABLADO';
+
+const INSTRUCCION_DIGEST = `
+
+---
+
+## Spoken digest (required, last section)
+
+After the document, add one final section headed exactly \`${MARCA_DIGEST}\` containing 3 to 5 sentences meant to be HEARD, not read.
+
+- Say where the session ended and what state it is in, then the single most important thing waiting for the next session.
+- Plain spoken prose: no markdown, no bullets, no file paths, no code, no version strings read out character by character (say "cero doce uno" style only if it reads naturally, otherwise omit it).
+- It must not contradict the document, and it must not add anything that is not in it.
+- This section is extracted and spoken aloud; everything above it is what gets saved.`;
+
+const MIN_LONGITUD_DOCUMENTO = 400;
+
+/**
+ * Separa el digest hablado del documento. Si el modelo no lo emitio, el
+ * documento vuelve intacto y el digest es null: narrar es opcional y no debe
+ * poder romper el resultado principal.
+ */
+function separarDigest(texto) {
+  const t = String(texto || '');
+  const i = t.lastIndexOf(MARCA_DIGEST);
+  if (i === -1) return { documento: t.trim(), digest: null };
+  const digest = t.slice(i + MARCA_DIGEST.length).trim();
+  return {
+    documento: t.slice(0, i).trim(),
+    digest: digest || null
+  };
+}
+
+function validarDocumento(texto) {
+  const t = String(texto || '').trim();
+  if (!t) return { ok: false, motivo: 'la respuesta vino vacia' };
+  if (t.length < MIN_LONGITUD_DOCUMENTO) {
+    return { ok: false, motivo: `la respuesta tiene ${t.length} caracteres, por debajo del minimo de ${MIN_LONGITUD_DOCUMENTO} para un documento` };
+  }
+  const encabezados = (t.match(/^#{1,4}\s+\S/gm) || []).length;
+  if (encabezados < 2) {
+    return { ok: false, motivo: `la respuesta trae ${encabezados} encabezado(s) markdown; un resumen estructurado tiene varios` };
+  }
+  return { ok: true, encabezados, longitud: t.length };
+}
+
+module.exports = {
+  separarDigest,
+  MARCA_DIGEST,
+  getSummaryPrompt,
+  getHandoffPrompt,
+  recuperarDocumentoEnlazado,
+  validarDocumento,
+  SUMMARY_OUTPUT_RULES,
+  MIN_LONGITUD_DOCUMENTO
+};
