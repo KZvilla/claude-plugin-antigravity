@@ -1584,9 +1584,18 @@ console.log('✔ Test 47 [FEAT-001 / BE-008]: Cambio de proyecto (F-03) reemplaz
   assert.strictEqual(mergedA.hasTrustDialogAccepted, true, 'Debe fusionar a true si alguna entrada aceptó trust');
   assert.strictEqual(mergedA.spawnMode, 'worktree', 'Debe adoptar el spawnMode explícito');
 
+  // 1.4 F-06 / F-07: Comprobar que un workspace untrusted es excluido por defecto de la allowlist
+  assert.strictEqual(
+    claudeLauncher.isWorkspaceAllowed(dirUntrusted, { claudeJsonPath: mockClaudeTrustJson }),
+    false,
+    'dirUntrusted debe ser excluido de la Project Allowlist por no tener hasTrustDialogAccepted: true'
+  );
+
+  // Guarda en lanzamiento: si se omite el allowlist check, la guarda F-06 lo rechaza explícitamente
   const resUntrusted = claudeLauncher.launchClaudeRemoteSession({
     workspacePath: dirUntrusted,
-    allowlistOptions: { claudeJsonPath: mockClaudeTrustJson }
+    skipAllowlistCheck: true,
+    allowlistOptions: { claudeJsonPath: mockClaudeTrustJson, requireTrust: false }
   });
   assert.strictEqual(resUntrusted.success, false);
   assert(resUntrusted.error.includes('Workspace no confiable'), 'Debe reportar workspace no confiable');

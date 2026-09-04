@@ -239,7 +239,8 @@ export function getProjectAllowlist({
   claudeJsonPath = resolveClaudeJsonPath(),
   existsFn = (p) => fs.existsSync(p),
   allowedWorkspacesSet = parseAllowedWorkspacesEnv(),
-  denyPaths = null
+  denyPaths = null,
+  requireTrust = true
 } = {}) {
   let rawContent;
   try {
@@ -350,7 +351,8 @@ export function getProjectAllowlist({
     }
   }
 
-  const validWorkspaces = Array.from(workspacesByDedup.values());
+  const validWorkspaces = Array.from(workspacesByDedup.values())
+    .filter((ws) => !requireTrust || ws.hasTrustDialogAccepted !== false);
 
   // Contar frecuencias del nombre base para desambiguar displayName si hay colisiones
   const nameCounts = new Map();
