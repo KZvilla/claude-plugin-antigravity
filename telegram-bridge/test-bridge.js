@@ -18,6 +18,7 @@ const { splitMessage, markdownToTelegramHtml, escapeHtml, formatElapsed, finalPr
 const state = await import('./state.js');
 const queue = await import('./queue.js');
 const { Api, Context } = await import('grammy');
+const claudeLauncher = await import('./claude-launcher.js');
 
 console.log('--- 🧪 Iniciando Verificación de telegram-bridge ---');
 console.log(`    (estado de test en ${TEST_STATE_FILE})`);
@@ -960,6 +961,81 @@ console.log('✔ Test 36 [BE-008]: el .env sobrevive a un plugin update sin camb
   fs.rmSync(dirTmp, { recursive: true, force: true });
 }
 console.log('✔ Test 37 [SEC-003]: la subida de ficheros redacta secretos y no toca el disco');
+
+// Test 38 [FEAT-001 / BE-008]: getKnownWorkspaces lee proyectos, normaliza, descarta WSL y deduplica por casing
+{
+  const dirTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-launcher-test-'));
+  const fakeConfig = path.join(dirTmp, '.claude.json');
+
+  const dir1 = path.join(dirTmp, 'app1', 'frontend');
+  const dir2 = path.join(dirTmp, 'app2', 'frontend');
+  const dir3 = path.join(dirTmp, 'landing');
+  fs.mkdirSync(dir1, { recursive: true });
+  fs.mkdirSync(dir2, { recursive: true });
+  fs.mkdirSync(dir3, { recursive: true });
+
+  const fakeJson = {
+    projects: {
+      [dir1]: {},
+      [dir1.toLowerCase()]: {}, // Duplicado de casing
+      [dir2]: {}, // Misma base "frontend" pero padre "app2"
+      [dir3]: {},
+      [path.join(dirTmp, 'no_existe')]: {}, // Inexistente
+      'wsl:ubuntu-24.04:/home/user/backend': {} // WSL
+    }
+  };
+
+  const rawOriginal = JSON.stringify(fakeJson, null, 2);
+  fs.writeFileSync(fakeConfig, rawOriginal, 'utf8');
+
+  const workspaces = claudeLauncher.getKnownWorkspaces({ claudeJsonPath: fakeConfig });
+
+  // 1. Debe haber exactamente 3 proyectos válidos (dir1, dir2, dir3)
+  assert.strictEqual(workspaces.length, 3, 'Debe descartar inexistentes, WSL y duplicados de casing');
+
+  // 2. Comprobar desambiguación de nombres duplicados ("frontend (app1)" y "frontend (app2)")
+  const ws1 = workspaces.find((w) => w.path.toLowerCase() === dir1.toLowerCase());
+  const ws2 = workspaces.find((w) => w.path.toLowerCase() === dir2.toLowerCase());
+  const ws3 = workspaces.find((w) => w.path.toLowerCase() === dir3.toLowerCase());
+
+  assert(ws1 && ws2 && ws3, 'Todos los proyectos reales deben encontrarse');
+  assert.strictEqual(ws1.name, 'frontend');
+  assert.strictEqual(ws2.name, 'frontend');
+  assert(ws1.displayName.includes('app1'), 'ws1 debe estar desambiguado con su carpeta padre app1');
+  assert(ws2.displayName.includes('app2'), 'ws2 debe estar desambiguado con su carpeta padre app2');
+  assert.strictEqual(ws3.displayName, 'landing', 'ws3 sin colisión conserva su nombre directo');
+
+  // 3. Comprobar que los IDs sean compactos y secuenciales (para callback_data de Telegram)
+  assert(workspaces.every((w, idx) => w.id === idx), 'Los IDs deben ser índices numéricos secuenciales');
+
+  // 4. Invariante de seguridad: el archivo fuente NUNCA se modifica
+  const rawDespues = fs.readFileSync(fakeConfig, 'utf8');
+  assert.strictEqual(rawOriginal, rawDespues, 'El archivo .claude.json nunca debe ser modificado por la lectura');
+
+  fs.rmSync(dirTmp, { recursive: true, force: true });
+}
+console.log('✔ Test 38 [FEAT-001 / BE-008]: getKnownWorkspaces lee proyectos, normaliza, descarta WSL y deduplica por casing sin tocar disco');
+
+// Test 39 [BE-008]: getKnownWorkspaces ante archivo inexistente o JSON corrupto
+{
+  const noExiste = path.join(os.tmpdir(), 'archivo_que_no_existe_jamas.json');
+  assert.deepStrictEqual(claudeLauncher.getKnownWorkspaces({ claudeJsonPath: noExiste }), [], 'Archivo inexistente retorna []');
+
+  const dirTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-launcher-badjson-'));
+  const badJson = path.join(dirTmp, 'corrupt.json');
+  fs.writeFileSync(badJson, '{ "projects": { invalid JSON ...', 'utf8');
+  assert.deepStrictEqual(claudeLauncher.getKnownWorkspaces({ claudeJsonPath: badJson }), [], 'JSON corrupto retorna [] sin lanzar');
+  fs.rmSync(dirTmp, { recursive: true, force: true });
+}
+console.log('✔ Test 39 [BE-008]: getKnownWorkspaces es resiliente a fichero ausente o JSON corrupto');
+
+// Test 40 [FEAT-002]: resolveClaudeBin localiza el ejecutable de Claude Code
+{
+  const binClaude = claudeLauncher.resolveClaudeBin();
+  assert(typeof binClaude === 'string' && binClaude.length > 0, 'resolveClaudeBin debe retornar una cadena no vacía');
+  assert(/claude(\.exe|\.cmd)?$/i.test(binClaude), `El binario debe apuntar a claude: ${binClaude}`);
+}
+console.log('✔ Test 40 [FEAT-002]: resolveClaudeBin localiza el ejecutable de Claude Code en el sistema');
 
 // Limpieza: solo el directorio temporal de test
 try {
