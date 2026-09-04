@@ -9,6 +9,12 @@ import {
   clearActiveClaudeSession
 } from './state.js';
 
+export {
+  getActiveClaudeSession,
+  setActiveClaudeSession,
+  clearActiveClaudeSession
+};
+
 /**
  * Resuelve la ruta canónica del archivo .claude.json en el perfil del usuario.
  * Permite inyectar una ruta personalizada para entornos de prueba.

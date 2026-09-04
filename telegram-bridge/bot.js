@@ -15,9 +15,14 @@ import {
   clearConversationId,
   resolvePendingAsk,
   getPendingAsk,
-  getStateFilePath
 } from './state.js';
 import { enqueueTask, dequeueTask, getQueueLength, getQueueSnapshot, clearQueue } from './queue.js';
+import {
+  getKnownWorkspaces,
+  launchClaudeRemoteSession,
+  stopClaudeRemoteSession,
+  getActiveClaudeSession
+} from './claude-launcher.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -390,6 +395,20 @@ async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = nu
 // ==============================================================================
 
 /**
+ * Construye el InlineKeyboard de selección de proyectos para Remote Control.
+ * Mantiene los identificadores compactos (rc_start:<id>) para respetar el límite
+ * de 64 bytes de la API de Telegram.
+ */
+export function buildWorkspacesKeyboard(workspaces) {
+  const keyboard = new InlineKeyboard();
+  for (const ws of workspaces) {
+    keyboard.text(`📁 ${ws.displayName}`, `rc_start:${ws.id}`).row();
+  }
+  keyboard.text('❌ Cancelar', 'rc_cancel');
+  return keyboard;
+}
+
+/**
  * Construye el bot con todos sus handlers registrados. No abre conexiones ni
  * toca el lockfile: eso es cosa de `main()`.
  */
@@ -444,19 +463,74 @@ export function createBot({
 Puente móvil autónomo conectado a tu entorno local.
 
 *Comandos disponibles:*
-• \`/plan <instrucción>\` — Genera un plan de acción de solo lectura con botón para aprobarlo.
-• \`/run <instrucción>\` — Abre una sesión nueva y ejecuta, permitiendo edición de código y tests.
-• \`/resume <instrucción>\` — Continúa la sesión de trabajo actual.
-• \`/status\` — Consulta estado del binario, versión, sesión activa y política de permisos.
-• \`/queue\` — Muestra la tarea en curso y las encoladas.
-• \`/cancel\` — Aborta la tarea en curso y vacía la cola.
-• \`/reset\` — Reinicia la conversación y olvida el contexto actual.
+• `/plan <instrucción>` — Genera un plan de acción de solo lectura con botón para aprobarlo.
+• `/run <instrucción>` — Abre una sesión nueva y ejecuta, permitiendo edición de código y tests.
+• `/resume <instrucción>` — Continúa la sesión de trabajo actual.
+• `/claude` — Inicia o gestiona una sesión de Claude Code con Remote Control en tus workspaces.
+• `/status` — Consulta estado del binario, versión, sesión activa y política de permisos.
+• `/queue` — Muestra la tarea en curso y las encoladas.
+• `/cancel` — Aborta la tarea en curso y vacía la cola.
+• `/reset` — Reinicia la conversación y olvida el contexto actual.
 
 *Sesión activa:* ${convId ? `\`${convId}\`` : '_Ninguna (el próximo mensaje abrirá una nueva)_'}
 
 _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero verás qué se haría y decides con el botón «Ejecutar cambios». Para escribir directamente sin ese paso, usa \`/run\`._`;
 
     await sendSafeChunk(ctx, helpText);
+  });
+
+  bot.command('claude', async (ctx) => {
+    const sub = ctx.match?.trim().toLowerCase();
+
+    if (sub === 'stop') {
+      const res = stopClaudeRemoteSession();
+      if (!res.success) {
+        return sendSafeChunk(ctx, `⚠️ ${res.error}`);
+      }
+      return sendSafeChunk(ctx, `🛑 *Sesión de Claude Code finalizada* (PID: ${res.pid}).\nEl túnel de Remote Control ha sido cerrado.`);
+    }
+
+    if (sub === 'status') {
+      const active = getActiveClaudeSession();
+      if (!active) {
+        return sendSafeChunk(ctx, '📭 No hay ninguna sesión activa de Claude Code en este momento.\nUsa `/claude` para ver tus workspaces disponibles e iniciar una.');
+      }
+      const keyboard = new InlineKeyboard()
+        .text('🛑 Detener sesión', 'rc_stop')
+        .text('🔄 Ver workspaces', 'rc_list');
+      const msg = `🎮 *Sesión de Claude Code Activa (Remote Control)*\n` +
+        `• *Proyecto:* \`${active.projectPath}\`\n` +
+        `• *Sesión:* \`${active.sessionName}\`\n` +
+        `• *PID:* \`${active.pid}\`\n` +
+        `• *Iniciada:* ${active.startedAt}\n\n` +
+        `📲 Ya está disponible en tu aplicación móvil de Claude.`;
+      return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
+    }
+
+    // Sin subcomando: comprobar si ya hay sesión activa o listar proyectos
+    const active = getActiveClaudeSession();
+    if (active) {
+      const keyboard = new InlineKeyboard()
+        .text('🛑 Detener sesión', 'rc_stop')
+        .text('🔄 Cambiar de proyecto', 'rc_list');
+      const msg = `🎮 *Sesión de Claude Code Activa*\n\n` +
+        `Actualmente hay una sesión de Remote Control en ejecución:\n` +
+        `• *Proyecto:* \`${active.projectPath}\`\n` +
+        `• *Sesión:* \`${active.sessionName}\`\n` +
+        `• *PID:* \`${active.pid}\`\n\n` +
+        `¿Deseas detenerla o cambiar a otro workspace?`;
+      return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
+    }
+
+    const workspaces = getKnownWorkspaces();
+    if (workspaces.length === 0) {
+      return sendSafeChunk(ctx, '⚠️ No se encontraron workspaces registrados en `~/.claude.json` con carpetas existentes en tu equipo.');
+    }
+
+    const keyboard = buildWorkspacesKeyboard(workspaces);
+    const msg = `📱 *Claude Code — Remote Control*\n\n` +
+      `Selecciona el proyecto donde deseas iniciar la sesión interactiva:`;
+    return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
   });
 
   bot.command('status', async (ctx) => {
@@ -643,6 +717,70 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
       await ctx.answerCallbackQuery({ text: 'Plan descartado' });
       try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
       await ctx.reply('🗑️ Plan descartado. Puedes enviar una nueva solicitud cuando desees.');
+    }
+
+    if (data.startsWith('rc_start:')) {
+      const idStr = data.slice('rc_start:'.length).trim();
+      const wsId = parseInt(idStr, 10);
+      const workspaces = getKnownWorkspaces();
+      const ws = workspaces.find((w) => w.id === wsId);
+
+      if (!ws) {
+        await ctx.answerCallbackQuery({ text: 'Proyecto no encontrado o ya no existe en disco.' });
+        try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: `Iniciando Claude en ${ws.name}...` });
+      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+
+      const launch = launchClaudeRemoteSession({ workspacePath: ws.path });
+      if (!launch.success) {
+        return sendSafeChunk(ctx, `❌ *No se pudo iniciar Claude Code:*\n${launch.error}`);
+      }
+
+      const keyboard = new InlineKeyboard().text('🛑 Detener sesión', 'rc_stop');
+      const msg = `🚀 *Sesión de Claude Code iniciada con éxito*\n\n` +
+        `• *Proyecto:* \`${launch.projectPath}\`\n` +
+        `• *Nombre:* \`${launch.sessionName}\`\n` +
+        `• *PID:* \`${launch.pid}\`\n\n` +
+        `📲 *Abre la app de Claude en tu teléfono* (o claude.ai) en la sección **Remote Control** para interactuar.\n\n` +
+        `_Para detenerla más tarde, escribe_ \`/claude stop\` _o pulsa el botón de abajo._`;
+
+      return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
+    }
+
+    if (data === 'rc_stop') {
+      await ctx.answerCallbackQuery({ text: 'Deteniendo sesión...' });
+      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+
+      const res = stopClaudeRemoteSession();
+      if (!res.success) {
+        return sendSafeChunk(ctx, `⚠️ ${res.error}`);
+      }
+      return sendSafeChunk(ctx, `🛑 *Sesión de Claude Code finalizada* (PID: ${res.pid}).\nEl túnel de Remote Control ha sido cerrado.`);
+    }
+
+    if (data === 'rc_list') {
+      await ctx.answerCallbackQuery({ text: 'Cargando workspaces...' });
+      const workspaces = getKnownWorkspaces();
+      if (workspaces.length === 0) {
+        return sendSafeChunk(ctx, '⚠️ No se encontraron workspaces registrados en `~/.claude.json`.');
+      }
+      const keyboard = buildWorkspacesKeyboard(workspaces);
+      const msg = `📱 *Claude Code — Remote Control*\n\nSelecciona el proyecto donde deseas iniciar la sesión interactiva:`;
+      try {
+        await ctx.editMessageText(msg, { parse_mode: 'Markdown', reply_markup: keyboard });
+      } catch {
+        await sendSafeChunk(ctx, msg, { reply_markup: keyboard });
+      }
+      return;
+    }
+
+    if (data === 'rc_cancel') {
+      await ctx.answerCallbackQuery({ text: 'Operación cancelada' });
+      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+      return ctx.reply('Operación cancelada.');
     }
   });
 

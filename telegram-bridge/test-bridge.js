@@ -558,7 +558,7 @@ console.log('✔ Test 27 [SEC-003]: resolvePendingAsk es atómico y no se resuel
 // módulo, importarlo tomaba el lockfile, validaba el token y abría el long
 // polling, así que ningún handler suyo podía probarse.
 process.env.TELEGRAM_BOT_TOKEN = FAKE_TOKEN;
-const { createBot, resetRuntimeState, avisoDeDespacho } = await import('./bot.js');
+const { createBot, resetRuntimeState, avisoDeDespacho, buildWorkspacesKeyboard } = await import('./bot.js');
 
 // Test 28 [BE-003]: el aviso anuncia la posición real en la fila, no el índice
 // de la cola. Con una tarea corriendo, el primero en cola es el segundo en fila.
@@ -812,7 +812,7 @@ console.log('✔ Test 34 [BE-007]: TELEGRAM_BRIDGE_STATE_FILE tiene precedencia 
   const codigo = path.join(raiz, 'telegram-bridge');
   const datos = path.join(raiz, 'datos');
   fs.mkdirSync(codigo, { recursive: true });
-  for (const f of ['bot.js', 'state.js', 'paths.js', 'policy.js', 'logrotate.js', 'executor.js', 'formatter.js', 'queue.js']) {
+  for (const f of ['bot.js', 'state.js', 'paths.js', 'policy.js', 'logrotate.js', 'executor.js', 'formatter.js', 'queue.js', 'claude-launcher.js']) {
     fs.copyFileSync(path.join(import.meta.dirname, f), path.join(codigo, f));
   }
   fs.symlinkSync(path.join(import.meta.dirname, 'node_modules'), path.join(codigo, 'node_modules'), 'junction');
@@ -1253,6 +1253,126 @@ console.log('✔ Test 42 [FEAT-003 / SEC-005]: launchClaudeRemoteSession inicia 
   fs.rmSync(dirTmp, { recursive: true, force: true });
 }
 console.log('✔ Test 43 [FEAT-003 / BE-009]: stopClaudeRemoteSession termina el árbol de procesos y limpia el estado');
+
+// Test 44 [FEAT-001 / BE-008]: buildWorkspacesKeyboard genera teclado interactivo con callback_data compacto
+{
+  const mockWorkspaces = [
+    { id: 0, path: 'C:\\vs work\\app1\\frontend', name: 'frontend', displayName: 'frontend (app1)' },
+    { id: 1, path: 'C:\\vs work\\app2\\frontend', name: 'frontend', displayName: 'frontend (app2)' },
+    { id: 2, path: 'C:\\vs work\\landing', name: 'landing', displayName: 'landing' }
+  ];
+
+  const keyboard = buildWorkspacesKeyboard(mockWorkspaces);
+  const inline = keyboard.inline_keyboard;
+
+  // 3 filas para los proyectos + 1 fila para el botón Cancelar = 4 filas
+  assert.strictEqual(inline.length, 4, 'Debe haber 4 filas en el teclado');
+  assert.strictEqual(inline[0][0].text, '📁 frontend (app1)');
+  assert.strictEqual(inline[0][0].callback_data, 'rc_start:0');
+  assert.strictEqual(inline[1][0].text, '📁 frontend (app2)');
+  assert.strictEqual(inline[1][0].callback_data, 'rc_start:1');
+  assert.strictEqual(inline[2][0].text, '📁 landing');
+  assert.strictEqual(inline[2][0].callback_data, 'rc_start:2');
+  assert.strictEqual(inline[3][0].text, '❌ Cancelar');
+  assert.strictEqual(inline[3][0].callback_data, 'rc_cancel');
+
+  // Verificar que NINGÚN callback_data exceda el límite de 64 bytes de Telegram
+  for (const fila of inline) {
+    for (const btn of fila) {
+      const bytes = Buffer.byteLength(btn.callback_data, 'utf8');
+      assert(bytes <= 64, `callback_data "${btn.callback_data}" excede 64 bytes (${bytes} bytes)`);
+    }
+  }
+}
+console.log('✔ Test 44 [FEAT-001 / BE-008]: buildWorkspacesKeyboard genera teclado con callback_data compacto');
+
+// Test 45 [FEAT-001 / FEAT-002]: Comando /claude responde con estado o lista de workspaces
+{
+  const { bot, llamadas } = botDePrueba();
+  resetRuntimeState();
+  state.clearActiveClaudeSession();
+
+  const updateCmd = (cmd, args = '', updateId = 100) => {
+    const text = args ? `/${cmd} ${args}` : `/${cmd}`;
+    return {
+      update_id: updateId,
+      message: {
+        message_id: 100 + updateId,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: Number(USUARIO_OK), type: 'private' },
+        from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+        text,
+        entities: [{ type: 'bot_command', offset: 0, length: cmd.length + 1 }]
+      }
+    };
+  };
+
+  // 1. /claude status cuando no hay sesión
+  await bot.handleUpdate(updateCmd('claude', 'status', 100));
+  assert(llamadas.length > 0, 'Debe haber respondido a /claude status');
+  assert(llamadas[0].payload.text.includes('No hay ninguna sesión activa'), 'Avisa que no hay sesión');
+
+  // 2. /claude stop cuando no hay sesión
+  llamadas.length = 0;
+  await bot.handleUpdate(updateCmd('claude', 'stop', 101));
+  assert(llamadas.length > 0, 'Debe haber respondido a /claude stop');
+  assert(llamadas[0].payload.text.includes('No hay ninguna sesión activa'), 'Reporta que no hay sesión');
+
+  // 3. /claude cuando hay sesión activa inyectada
+  llamadas.length = 0;
+  state.setActiveClaudeSession({
+    pid: process.pid,
+    projectPath: 'C:\\fake\\project',
+    sessionName: 'Mobile-test'
+  });
+
+  await bot.handleUpdate(updateCmd('claude', '', 102));
+  assert(llamadas[0].payload.text.includes('Sesión de Claude Code Activa'), 'Detecta sesión activa');
+  assert(llamadas[0].payload.text.includes('Mobile-test'), 'Muestra nombre de sesión');
+  assert(llamadas[0].payload.reply_markup, 'Ofrece botones para detener o cambiar');
+
+  // 4. Limpiamos sesión activa
+  state.clearActiveClaudeSession();
+  resetRuntimeState();
+}
+console.log('✔ Test 45 [FEAT-001 / FEAT-002]: Comando /claude responde con estado y gestión de sesión');
+
+// Test 46 [FEAT-001 / BE-008]: Callbacks interactivos rc_cancel y rc_stop
+{
+  const { bot, llamadas } = botDePrueba();
+  resetRuntimeState();
+
+  const callback = (data, updateId) => ({
+    update_id: updateId,
+    callback_query: {
+      id: String(updateId),
+      from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+      chat_instance: 'ci',
+      data,
+      message: {
+        message_id: 500 + updateId,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: Number(USUARIO_OK), type: 'private' },
+        from: { id: 1, is_bot: true, first_name: 'bot' },
+        text: 'prompt'
+      }
+    }
+  });
+
+  // Callback rc_cancel
+  await bot.handleUpdate(callback('rc_cancel', 200));
+  const ansCancel = llamadas.find((c) => c.method === 'answerCallbackQuery' && c.payload.text === 'Operación cancelada');
+  assert(ansCancel, 'rc_cancel responde con acuse');
+
+  // Callback rc_start con id inexistente
+  llamadas.length = 0;
+  await bot.handleUpdate(callback('rc_start:9999', 201));
+  const ansInvalido = llamadas.find((c) => c.method === 'answerCallbackQuery' && c.payload.text.includes('no encontrado'));
+  assert(ansInvalido, 'rc_start con ID inválido responde que no fue encontrado');
+
+  resetRuntimeState();
+}
+console.log('✔ Test 46 [FEAT-001 / BE-008]: Callbacks interactivos rc_cancel y validación de IDs en rc_start');
 
 // Limpieza: solo el directorio temporal de test
 try {
