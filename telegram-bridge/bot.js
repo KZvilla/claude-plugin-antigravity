@@ -503,6 +503,7 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
         `• *Proyecto:* \`${active.projectPath}\`\n` +
         `• *Sesión:* \`${active.sessionName}\`\n` +
         `• *PID:* \`${active.pid}\`\n` +
+        (active.spawnMode ? `• *Modo:* \`${active.spawnMode}\`\n` : '') +
         `• *Iniciada:* ${active.startedAt}\n\n` +
         `📲 Ya está disponible en tu aplicación móvil de Claude.`;
       return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
@@ -518,8 +519,9 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
         `Actualmente hay una sesión de Remote Control en ejecución:\n` +
         `• *Proyecto:* \`${active.projectPath}\`\n` +
         `• *Sesión:* \`${active.sessionName}\`\n` +
-        `• *PID:* \`${active.pid}\`\n\n` +
-        `¿Deseas detenerla o cambiar a otro workspace?`;
+        `• *PID:* \`${active.pid}\`\n` +
+        (active.spawnMode ? `• *Modo:* \`${active.spawnMode}\`\n` : '') +
+        `\n¿Deseas detenerla o cambiar a otro workspace?`;
       return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
     }
 
@@ -722,9 +724,8 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
 
     if (data.startsWith('rc_start:')) {
       const idStr = data.slice('rc_start:'.length).trim();
-      const wsId = parseInt(idStr, 10);
       const workspaces = getKnownWorkspaces();
-      const ws = workspaces.find((w) => w.id === wsId);
+      const ws = workspaces.find((w) => String(w.id) === idStr || String(w.numericId) === idStr);
 
       if (!ws) {
         await ctx.answerCallbackQuery({ text: 'Proyecto no encontrado o ya no existe en disco.' });
@@ -732,10 +733,19 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
         return;
       }
 
+      // F-03: Si ya existía una sesión activa (ej. al cambiar de proyecto), detenerla limpiamente primero
+      const active = getActiveClaudeSession();
+      if (active) {
+        stopClaudeRemoteSession();
+      }
+
       await ctx.answerCallbackQuery({ text: `Iniciando Claude en ${ws.name}...` });
       try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
 
-      const launch = launchClaudeRemoteSession({ workspacePath: ws.path });
+      const launch = launchClaudeRemoteSession({
+        workspacePath: ws.path,
+        spawnMode: ws.spawnMode
+      });
       if (!launch.success) {
         return sendSafeChunk(ctx, `❌ *No se pudo iniciar Claude Code:*\n${launch.error}`);
       }
@@ -744,8 +754,9 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
       const msg = `🚀 *Sesión de Claude Code iniciada con éxito*\n\n` +
         `• *Proyecto:* \`${launch.projectPath}\`\n` +
         `• *Nombre:* \`${launch.sessionName}\`\n` +
-        `• *PID:* \`${launch.pid}\`\n\n` +
-        `📲 *Abre la app de Claude en tu teléfono* (o claude.ai) en la sección **Remote Control** para interactuar.\n\n` +
+        `• *PID:* \`${launch.pid}\`\n` +
+        `• *Modo:* \`${launch.spawnMode || 'same-dir'}\`\n\n` +
+        `📲 *Abre la app de Claude en tu teléfono* (o claude.ai/code) en la sección **Remote Control** para interactuar.\n\n` +
         `_Para detenerla más tarde, escribe_ \`/claude stop\` _o pulsa el botón de abajo._`;
 
       return sendSafeChunk(ctx, msg, { reply_markup: keyboard });

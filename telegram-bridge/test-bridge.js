@@ -1005,8 +1005,9 @@ console.log('✔ Test 37 [SEC-003]: la subida de ficheros redacta secretos y no 
   assert(ws2.displayName.includes('app2'), 'ws2 debe estar desambiguado con su carpeta padre app2');
   assert.strictEqual(ws3.displayName, 'landing', 'ws3 sin colisión conserva su nombre directo');
 
-  // 3. Comprobar que los IDs sean compactos y secuenciales (para callback_data de Telegram)
-  assert(workspaces.every((w, idx) => w.id === idx), 'Los IDs deben ser índices numéricos secuenciales');
+  // 3. Comprobar que los IDs sean compactos y estables (hash de 8 caracteres) y mantengan numericId
+  assert(workspaces.every((w) => typeof w.id === 'string' && /^[0-9a-f]{8}$/.test(w.id)), 'Los IDs deben ser hashes hexadecimales estables de 8 caracteres');
+  assert(workspaces.every((w, idx) => w.numericId === idx), 'numericId debe ser secuencial para compatibilidad retroactiva');
 
   // 4. Invariante de seguridad: el archivo fuente NUNCA se modifica
   const rawDespues = fs.readFileSync(fakeConfig, 'utf8');
@@ -1102,12 +1103,16 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
   assert.strictEqual(resInexistente.success, false, 'Debe fallar si workspacePath no existe');
   assert(resInexistente.error.includes('no existe'), 'Error debe indicar que la ruta no existe');
 
-  // 2. Simular spawnFn para capturar invocación exacta
+  // 2. Simular spawnFn para capturar invocación exacta y registrar listeners
   const spawnCalls = [];
   let unrefCalled = false;
+  let errorHandler = null;
   const mockChild = {
     pid: process.pid, // Usamos process.pid para que getActiveClaudeSession lo considere vivo
-    unref: () => { unrefCalled = true; }
+    unref: () => { unrefCalled = true; },
+    on: (event, fn) => {
+      if (event === 'error') errorHandler = fn;
+    }
   };
   const mockSpawn = (bin, args, opts) => {
     spawnCalls.push({ bin, args, opts });
@@ -1126,15 +1131,20 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
   assert.strictEqual(resOk.success, true, 'El lanzamiento debe ser exitoso');
   assert.strictEqual(resOk.pid, process.pid, 'Debe retornar el PID del proceso');
   assert.strictEqual(resOk.projectPath, dirTmp, 'Debe retornar el projectPath');
+  assert.strictEqual(resOk.spawnMode, 'same-dir', 'Debe usar same-dir por defecto');
   const expectedDefaultName = `Mobile-${path.basename(dirTmp)}`;
   assert.strictEqual(resOk.sessionName, expectedDefaultName, 'Debe formatear Mobile-<basename> por defecto');
   assert.strictEqual(unrefCalled, true, 'child.unref() debe haber sido llamado');
 
-  // Verificar llamada a spawnFn
+  // Verificar llamada a spawnFn (subcomando headless remote-control con flag --spawn)
   assert.strictEqual(spawnCalls.length, 1, 'Debe haber llamado a spawnFn una vez');
   const call = spawnCalls[0];
   assert.strictEqual(call.bin, claudeLauncher.resolveClaudeBin(), 'Debe usar el binario resuelto de Claude');
-  assert.deepStrictEqual(call.args, ['--remote-control', expectedDefaultName], 'Argumentos deben ser [--remote-control, sessionName]');
+  assert.deepStrictEqual(
+    call.args,
+    ['remote-control', '--name', expectedDefaultName, '--spawn=same-dir'],
+    'Argumentos deben ser [remote-control, --name, sessionName, --spawn=same-dir]'
+  );
   assert.strictEqual(call.opts.cwd, dirTmp, 'cwd debe ser workspacePath');
   assert.strictEqual(call.opts.detached, true, 'detached debe ser true');
   assert.strictEqual(call.opts.stdio, 'ignore', 'stdio debe ser ignore');
@@ -1149,7 +1159,7 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
   assert(activeSession !== null, 'La sesión debe estar registrada en state');
   assert.strictEqual(activeSession.sessionName, expectedDefaultName);
 
-  // 4. Validar prevención de doble sesión cuando ya hay una activa
+  // 4. Validar prevención de doble sesión cuando ya hay una activa (sin replaceActive)
   const resDoble = claudeLauncher.launchClaudeRemoteSession({
     workspacePath: dirTmp,
     spawnFn: mockSpawn
@@ -1159,22 +1169,50 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
   assert(resDoble.session && resDoble.session.pid === process.pid, 'Debe retornar la sesión activa');
   assert.strictEqual(spawnCalls.length, 1, 'No debe haber llamado a spawnFn de nuevo');
 
-  // 5. Invocación con sessionName personalizado
+  // 5. Invocación con sessionName y spawnMode personalizados
   state.clearActiveClaudeSession();
   const resCustom = claudeLauncher.launchClaudeRemoteSession({
     workspacePath: dirTmp,
     sessionName: 'MiSesionPersonalizada',
+    spawnMode: 'worktree',
     spawnFn: mockSpawn
   });
   assert.strictEqual(resCustom.success, true);
   assert.strictEqual(resCustom.sessionName, 'MiSesionPersonalizada');
-  assert.deepStrictEqual(spawnCalls[1].args, ['--remote-control', 'MiSesionPersonalizada']);
+  assert.strictEqual(resCustom.spawnMode, 'worktree');
+  assert.deepStrictEqual(spawnCalls[1].args, ['remote-control', '--name', 'MiSesionPersonalizada', '--spawn=worktree']);
+
+  // 6. Validar F-01: child.on('error') limpia la sesión activa si el proceso falla asíncronamente
+  assert(typeof errorHandler === 'function', 'Debe haber registrado listener para child.on("error")');
+  errorHandler(new Error('Simulated spawn ENOENT'));
+  assert.strictEqual(state.getActiveClaudeSession(), null, 'El error en proceso hijo debe limpiar activeSession');
+
+  // 7. Validar F-02: binario terminado en .cmd en Windows se envuelve en cmd.exe /d /s /c
+  if (process.platform === 'win32') {
+    const cmdCalls = [];
+    const mockSpawnCmd = (bin, args, opts) => {
+      cmdCalls.push({ bin, args, opts });
+      return mockChild;
+    };
+    claudeLauncher.launchClaudeRemoteSession({
+      workspacePath: dirTmp,
+      claudeBin: 'C:\\fake\\npm\\claude.cmd',
+      spawnFn: mockSpawnCmd
+    });
+    assert.strictEqual(cmdCalls.length, 1);
+    assert(cmdCalls[0].bin.toLowerCase().endsWith('cmd.exe'), 'Debe usar cmd.exe como binario de spawn');
+    assert.strictEqual(cmdCalls[0].args[0], '/d');
+    assert.strictEqual(cmdCalls[0].args[1], '/s');
+    assert.strictEqual(cmdCalls[0].args[2], '/c');
+    assert.strictEqual(cmdCalls[0].args[3], 'C:\\fake\\npm\\claude.cmd');
+    assert.strictEqual(cmdCalls[0].args[4], 'remote-control');
+  }
 
   // Limpieza
   state.clearActiveClaudeSession();
   fs.rmSync(dirTmp, { recursive: true, force: true });
 }
-console.log('✔ Test 42 [FEAT-003 / SEC-005]: launchClaudeRemoteSession inicia sesión desacoplada sin secretos en entorno');
+console.log('✔ Test 42 [FEAT-003 / SEC-005 / BE-008]: launchClaudeRemoteSession desacoplado, sin secretos, headless y con guardas F-01/F-02');
 
 // Test 43 [FEAT-003 / BE-009]: stopClaudeRemoteSession termina el árbol de procesos y limpia el estado
 {
@@ -1257,9 +1295,9 @@ console.log('✔ Test 43 [FEAT-003 / BE-009]: stopClaudeRemoteSession termina el
 // Test 44 [FEAT-001 / BE-008]: buildWorkspacesKeyboard genera teclado interactivo con callback_data compacto
 {
   const mockWorkspaces = [
-    { id: 0, path: 'C:\\vs work\\app1\\frontend', name: 'frontend', displayName: 'frontend (app1)' },
-    { id: 1, path: 'C:\\vs work\\app2\\frontend', name: 'frontend', displayName: 'frontend (app2)' },
-    { id: 2, path: 'C:\\vs work\\landing', name: 'landing', displayName: 'landing' }
+    { id: 'a1b2c3d4', path: 'C:\\vs work\\app1\\frontend', name: 'frontend', displayName: 'frontend (app1)' },
+    { id: 'e5f60718', path: 'C:\\vs work\\app2\\frontend', name: 'frontend', displayName: 'frontend (app2)' },
+    { id: '293a4b5c', path: 'C:\\vs work\\landing', name: 'landing', displayName: 'landing' }
   ];
 
   const keyboard = buildWorkspacesKeyboard(mockWorkspaces);
@@ -1268,11 +1306,11 @@ console.log('✔ Test 43 [FEAT-003 / BE-009]: stopClaudeRemoteSession termina el
   // 3 filas para los proyectos + 1 fila para el botón Cancelar = 4 filas
   assert.strictEqual(inline.length, 4, 'Debe haber 4 filas en el teclado');
   assert.strictEqual(inline[0][0].text, '📁 frontend (app1)');
-  assert.strictEqual(inline[0][0].callback_data, 'rc_start:0');
+  assert.strictEqual(inline[0][0].callback_data, 'rc_start:a1b2c3d4');
   assert.strictEqual(inline[1][0].text, '📁 frontend (app2)');
-  assert.strictEqual(inline[1][0].callback_data, 'rc_start:1');
+  assert.strictEqual(inline[1][0].callback_data, 'rc_start:e5f60718');
   assert.strictEqual(inline[2][0].text, '📁 landing');
-  assert.strictEqual(inline[2][0].callback_data, 'rc_start:2');
+  assert.strictEqual(inline[2][0].callback_data, 'rc_start:293a4b5c');
   assert.strictEqual(inline[3][0].text, '❌ Cancelar');
   assert.strictEqual(inline[3][0].callback_data, 'rc_cancel');
 
@@ -1370,9 +1408,63 @@ console.log('✔ Test 45 [FEAT-001 / FEAT-002]: Comando /claude responde con est
   const ansInvalido = llamadas.find((c) => c.method === 'answerCallbackQuery' && c.payload.text.includes('no encontrado'));
   assert(ansInvalido, 'rc_start con ID inválido responde que no fue encontrado');
 
+  // Callback rc_stop cuando no hay sesión activa
+  llamadas.length = 0;
+  state.clearActiveClaudeSession();
+  await bot.handleUpdate(callback('rc_stop', 202));
+  const ansStopNoSession = llamadas.find((c) => c.method === 'answerCallbackQuery' && c.payload.text.includes('Deteniendo'));
+  assert(ansStopNoSession, 'rc_stop responde con acuse');
+  const msgNoSession = llamadas.find((c) => c.method === 'sendMessage' && c.payload.text.includes('No hay ninguna sesión activa'));
+  assert(msgNoSession, 'rc_stop informa que no hay sesión activa');
+
   resetRuntimeState();
 }
-console.log('✔ Test 46 [FEAT-001 / BE-008]: Callbacks interactivos rc_cancel y validación de IDs en rc_start');
+console.log('✔ Test 46 [FEAT-001 / BE-008]: Callbacks interactivos rc_cancel, rc_stop y validación de IDs en rc_start');
+
+// Test 47 [FEAT-001 / BE-008]: Cambio de proyecto (F-03) detiene la sesión activa previa y lanza la nueva
+{
+  state.clearActiveClaudeSession();
+  const dirTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-switch-test-'));
+
+  // Simular sesión activa previa
+  state.setActiveClaudeSession({
+    pid: process.pid,
+    projectPath: 'C:\\fake\\old-proj',
+    sessionName: 'Mobile-old'
+  });
+  assert(state.getActiveClaudeSession() !== null, 'Debe haber sesión activa previa');
+
+  // Mock para execFileSyncFn y spawnFn
+  let killCalledWith = null;
+  const mockKill = (bin, args) => {
+    killCalledWith = { bin, args };
+  };
+
+  let mockSpawnCalled = false;
+  const mockSpawn = () => {
+    mockSpawnCalled = true;
+    return { pid: process.pid, unref: () => {}, on: () => {} };
+  };
+
+  const resSwitch = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirTmp,
+    replaceActive: true,
+    spawnFn: mockSpawn,
+    stopOptions: { execFileSyncFn: mockKill, platform: 'win32' }
+  });
+
+  assert.strictEqual(resSwitch.success, true, 'El reemplazo de sesión debe ser exitoso');
+  assert(killCalledWith !== null, 'Debe haber llamado a taskkill mockeado');
+  assert.strictEqual(killCalledWith.args[1], String(process.pid));
+  assert.strictEqual(mockSpawnCalled, true, 'Debe haber invocado spawnFn para la nueva sesión');
+  const active = state.getActiveClaudeSession();
+  assert(active !== null, 'Debe haber nueva sesión activa');
+  assert.strictEqual(active.projectPath, dirTmp, 'La nueva sesión debe apuntar al nuevo proyecto');
+
+  state.clearActiveClaudeSession();
+  fs.rmSync(dirTmp, { recursive: true, force: true });
+}
+console.log('✔ Test 47 [FEAT-001 / BE-008]: Cambio de proyecto (F-03) reemplaza sesión activa limpiamente');
 
 // Limpieza: solo el directorio temporal de test
 try {

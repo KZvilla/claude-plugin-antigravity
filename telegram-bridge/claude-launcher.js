@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { sanitizeEnv } from './policy.js';
 import {
@@ -150,11 +151,17 @@ export function getKnownWorkspaces({
 
     seenPaths.add(dedupKey);
 
+    const projectConfig = (rawProjects[rawPath] && typeof rawProjects[rawPath] === 'object')
+      ? rawProjects[rawPath]
+      : {};
+    const spawnMode = projectConfig.remoteControlSpawnMode || 'same-dir';
+
     const base = path.basename(normalized) || normalized;
     validWorkspaces.push({
       path: normalized,
       name: base,
-      parent: path.basename(path.dirname(normalized)) || ''
+      parent: path.basename(path.dirname(normalized)) || '',
+      spawnMode
     });
   }
 
@@ -170,32 +177,43 @@ export function getKnownWorkspaces({
       ? `${ws.name} (${ws.parent})`
       : ws.name;
 
+    // F-05: Generar un ID determinista y compacto (8 chars hex) derivado de la ruta normalizada
+    const hashId = crypto.createHash('sha256').update(ws.path.toLowerCase()).digest('hex').slice(0, 8);
+
     return {
-      id: index,
+      id: hashId,
+      numericId: index,
       path: ws.path,
       name: ws.name,
-      displayName
+      displayName,
+      spawnMode: ws.spawnMode
     };
   });
 }
 
 /**
- * Inicia una sesión desacoplada de Claude Code en modo control remoto (--remote-control).
+ * Inicia una sesión desacoplada de Claude Code en modo control remoto (remote-control).
  * Valida la existencia del workspace, verifica que no exista una sesión previa activa,
  * sanea el entorno para no heredar secretos de Telegram y persiste el PID atómicamente.
  *
  * @param {Object} options
  * @param {string} options.workspacePath Ruta física al proyecto
  * @param {string} [options.sessionName] Nombre para la sesión remota (default: Mobile-<basename>)
+ * @param {string} [options.spawnMode] Modo de spawn: same-dir o worktree (default: same-dir)
  * @param {string} [options.claudeBin] Ruta al binario de Claude (default: resolveClaudeBin())
  * @param {Function} [options.spawnFn] Función de spawn inyectable para testing (default: spawn)
- * @returns {{ success: boolean, pid?: number, sessionName?: string, projectPath?: string, error?: string, session?: object }}
+ * @param {boolean} [options.replaceActive] Detiene la sesión previa si existía (default: false)
+ * @param {Object} [options.stopOptions] Opciones inyectables para stopClaudeRemoteSession (testing)
+ * @returns {{ success: boolean, pid?: number, sessionName?: string, projectPath?: string, spawnMode?: string, error?: string, session?: object }}
  */
 export function launchClaudeRemoteSession({
   workspacePath,
   sessionName,
+  spawnMode,
   claudeBin = resolveClaudeBin(),
-  spawnFn = spawn
+  spawnFn = spawn,
+  replaceActive = false,
+  stopOptions = {}
 } = {}) {
   if (!workspacePath || typeof workspacePath !== 'string' || !fs.existsSync(workspacePath)) {
     return {
@@ -206,22 +224,39 @@ export function launchClaudeRemoteSession({
 
   const active = getActiveClaudeSession();
   if (active) {
-    return {
-      success: false,
-      error: 'Ya existe una sesión activa de Claude',
-      session: active
-    };
+    if (replaceActive) {
+      stopClaudeRemoteSession(stopOptions);
+    } else {
+      return {
+        success: false,
+        error: 'Ya existe una sesión activa de Claude',
+        session: active
+      };
+    }
   }
 
   const effectiveSessionName = (typeof sessionName === 'string' && sessionName.trim().length > 0)
     ? sessionName.trim()
     : `Mobile-${path.basename(workspacePath)}`;
 
+  const effectiveSpawnMode = (typeof spawnMode === 'string' && spawnMode.trim().length > 0)
+    ? spawnMode.trim()
+    : 'same-dir';
+
+  // F-02: En Windows Node 20+, invocar .cmd/.bat con shell: false lanza EINVAL (CVE-2024-27980)
+  const isWin = process.platform === 'win32';
+  const isCmdWrapper = isWin && /\.(cmd|bat)$/i.test(claudeBin);
+
+  const spawnBin = isCmdWrapper ? (process.env.ComSpec || 'cmd.exe') : claudeBin;
+  const spawnArgs = isCmdWrapper
+    ? ['/d', '/s', '/c', claudeBin, 'remote-control', '--name', effectiveSessionName, `--spawn=${effectiveSpawnMode}`]
+    : ['remote-control', '--name', effectiveSessionName, `--spawn=${effectiveSpawnMode}`];
+
   let child;
   try {
     child = spawnFn(
-      claudeBin,
-      ['--remote-control', effectiveSessionName],
+      spawnBin,
+      spawnArgs,
       {
         cwd: workspacePath,
         detached: true,
@@ -236,19 +271,27 @@ export function launchClaudeRemoteSession({
     };
   }
 
+  // F-01: Proteger el daemon contra eventos de error no capturados en el proceso hijo
+  child.on?.('error', (err) => {
+    console.error(`[claude-launcher] Error en el proceso hijo de Claude: ${err.message}`);
+    clearActiveClaudeSession();
+  });
+
   child.unref?.();
 
   setActiveClaudeSession({
     pid: child.pid,
     projectPath: workspacePath,
-    sessionName: effectiveSessionName
+    sessionName: effectiveSessionName,
+    spawnMode: effectiveSpawnMode
   });
 
   return {
     success: true,
     pid: child.pid,
     sessionName: effectiveSessionName,
-    projectPath: workspacePath
+    projectPath: workspacePath,
+    spawnMode: effectiveSpawnMode
   };
 }
 
@@ -260,13 +303,15 @@ export function launchClaudeRemoteSession({
  * En POSIX envía señales SIGTERM y SIGKILL.
  *
  * @param {Object} [options]
- * @param {Function} [options.execFileFn] Función de ejecución de comandos (default: execFile)
+ * @param {Function} [options.execFileSyncFn] Función síncrona de ejecución (default: execFileSync)
+ * @param {Function} [options.execFileFn] Función de compatibilidad para testing (default: null)
  * @param {string} [options.platform] Plataforma de destino (default: process.platform)
  * @param {Function} [options.killFn] Función de envío de señales para POSIX testing (default: process.kill)
  * @returns {{ success: boolean, pid?: number, sessionName?: string, error?: string }}
  */
 export function stopClaudeRemoteSession({
-  execFileFn = execFile,
+  execFileSyncFn = null,
+  execFileFn = null,
   platform = process.platform,
   killFn = null
 } = {}) {
@@ -281,10 +326,12 @@ export function stopClaudeRemoteSession({
   const { pid, sessionName } = active;
 
   if (platform === 'win32') {
+    // F-04: Ejecución síncrona para asegurar que el árbol de procesos muera antes de limpiar el estado
+    const runner = execFileSyncFn || (execFileFn ? (cmd, args) => execFileFn(cmd, args, () => {}) : execFileSync);
     try {
-      execFileFn('taskkill', ['/pid', String(pid), '/T', '/F'], () => {});
+      runner('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
     } catch (err) {
-      console.warn(`[claude-launcher] Error al ejecutar taskkill: ${err.message}`);
+      console.warn(`[claude-launcher] Aviso en taskkill: ${err.message}`);
     }
   } else {
     const doKill = killFn || process.kill;
