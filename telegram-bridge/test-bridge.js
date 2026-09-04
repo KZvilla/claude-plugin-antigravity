@@ -1103,6 +1103,14 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
   assert.strictEqual(resInexistente.success, false, 'Debe fallar si workspacePath no existe');
   assert(resInexistente.error.includes('no existe'), 'Error debe indicar que la ruta no existe');
 
+  // 1.b Validar rechazo por Project Allowlist si la ruta no está autorizada
+  const resNoAllowlist = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirTmp,
+    skipAllowlistCheck: false
+  });
+  assert.strictEqual(resNoAllowlist.success, false, 'Debe fallar si no pertenece a la Project Allowlist');
+  assert(resNoAllowlist.error.includes('Project Allowlist'), 'Debe reportar violación de Project Allowlist');
+
   // 2. Simular spawnFn para capturar invocación exacta y registrar listeners
   const spawnCalls = [];
   let unrefCalled = false;
@@ -1125,7 +1133,9 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
   // 3. Invocación con sessionName por defecto (Mobile-<basename>)
   const resOk = claudeLauncher.launchClaudeRemoteSession({
     workspacePath: dirTmp,
-    spawnFn: mockSpawn
+    spawnFn: mockSpawn,
+    skipAllowlistCheck: true,
+    findExistingFn: () => null
   });
 
   assert.strictEqual(resOk.success, true, 'El lanzamiento debe ser exitoso');
@@ -1159,15 +1169,19 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
   assert(activeSession !== null, 'La sesión debe estar registrada en state');
   assert.strictEqual(activeSession.sessionName, expectedDefaultName);
 
-  // 4. Validar prevención de doble sesión cuando ya hay una activa (sin replaceActive)
+  // 4. Validar prevención de doble sesión cuando ya hay una activa en OTRO proyecto
+  const dirTmpOtro = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-launch-other-'));
   const resDoble = claudeLauncher.launchClaudeRemoteSession({
-    workspacePath: dirTmp,
-    spawnFn: mockSpawn
+    workspacePath: dirTmpOtro,
+    spawnFn: mockSpawn,
+    skipAllowlistCheck: true,
+    findExistingFn: () => null
   });
   assert.strictEqual(resDoble.success, false, 'No debe permitir lanzar si ya hay una sesión activa');
-  assert.strictEqual(resDoble.error, 'Ya existe una sesión activa de Claude', 'Mensaje de error exacto');
+  assert(resDoble.error.includes('Ya existe una sesión activa'), 'Mensaje de error indica sesión activa');
   assert(resDoble.session && resDoble.session.pid === process.pid, 'Debe retornar la sesión activa');
   assert.strictEqual(spawnCalls.length, 1, 'No debe haber llamado a spawnFn de nuevo');
+  fs.rmSync(dirTmpOtro, { recursive: true, force: true });
 
   // 5. Invocación con sessionName y spawnMode personalizados
   state.clearActiveClaudeSession();
@@ -1175,7 +1189,9 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
     workspacePath: dirTmp,
     sessionName: 'MiSesionPersonalizada',
     spawnMode: 'worktree',
-    spawnFn: mockSpawn
+    spawnFn: mockSpawn,
+    skipAllowlistCheck: true,
+    findExistingFn: () => null
   });
   assert.strictEqual(resCustom.success, true);
   assert.strictEqual(resCustom.sessionName, 'MiSesionPersonalizada');
@@ -1197,7 +1213,9 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
     claudeLauncher.launchClaudeRemoteSession({
       workspacePath: dirTmp,
       claudeBin: 'C:\\fake\\npm\\claude.cmd',
-      spawnFn: mockSpawnCmd
+      spawnFn: mockSpawnCmd,
+      skipAllowlistCheck: true,
+      findExistingFn: () => null
     });
     assert.strictEqual(cmdCalls.length, 1);
     assert(cmdCalls[0].bin.toLowerCase().endsWith('cmd.exe'), 'Debe usar cmd.exe como binario de spawn');
@@ -1450,6 +1468,8 @@ console.log('✔ Test 46 [FEAT-001 / BE-008]: Callbacks interactivos rc_cancel, 
     workspacePath: dirTmp,
     replaceActive: true,
     spawnFn: mockSpawn,
+    skipAllowlistCheck: true,
+    findExistingFn: () => null,
     stopOptions: { execFileSyncFn: mockKill, platform: 'win32' }
   });
 
@@ -1465,6 +1485,176 @@ console.log('✔ Test 46 [FEAT-001 / BE-008]: Callbacks interactivos rc_cancel, 
   fs.rmSync(dirTmp, { recursive: true, force: true });
 }
 console.log('✔ Test 47 [FEAT-001 / BE-008]: Cambio de proyecto (F-03) reemplaza sesión activa limpiamente');
+
+// Test 48 [SEC-006 / BE-010]: Separación estricta de Allowlists e Idempotencia del spawn (una sesión por proyecto)
+{
+  state.clearActiveClaudeSession();
+
+  // --- Parte 1: Separación de Allowlists (Project Allowlist) ---
+  const dirBase = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-allowlist-test-'));
+  const dirProjA = path.join(dirBase, 'proj-allowed');
+  const dirProjB = path.join(dirBase, 'proj-forbidden');
+  const dirSecret = path.join(dirBase, 'proj-secret');
+  fs.mkdirSync(dirProjA, { recursive: true });
+  fs.mkdirSync(dirProjB, { recursive: true });
+  fs.mkdirSync(dirSecret, { recursive: true });
+
+  const mockClaudeJson = path.join(dirBase, 'claude.json');
+  fs.writeFileSync(mockClaudeJson, JSON.stringify({
+    projects: {
+      [dirProjA]: { remoteControlSpawnMode: 'same-dir' },
+      [dirProjB]: { remoteControlSpawnMode: 'worktree' },
+      [dirSecret]: { remoteControlSpawnMode: 'same-dir' }
+    }
+  }, null, 2));
+
+  // 1.1 Con allowedWorkspacesSet restringiendo solo a 'proj-allowed'
+  const allowlistOnlyA = claudeLauncher.getProjectAllowlist({
+    claudeJsonPath: mockClaudeJson,
+    allowedWorkspacesSet: new Set(['proj-allowed']),
+    denyPaths: ['*secret*']
+  });
+  assert.strictEqual(allowlistOnlyA.length, 1, 'Solo debe incluir el proyecto permitido');
+  assert.strictEqual(path.resolve(allowlistOnlyA[0].path).toLowerCase(), path.resolve(dirProjA).toLowerCase());
+
+  // 1.2 isWorkspaceAllowed valida membresía
+  assert.strictEqual(
+    claudeLauncher.isWorkspaceAllowed(dirProjA, {
+      claudeJsonPath: mockClaudeJson,
+      allowedWorkspacesSet: new Set(['proj-allowed']),
+      denyPaths: ['*secret*']
+    }),
+    true,
+    'dirProjA debe ser permitido'
+  );
+
+  assert.strictEqual(
+    claudeLauncher.isWorkspaceAllowed(dirProjB, {
+      claudeJsonPath: mockClaudeJson,
+      allowedWorkspacesSet: new Set(['proj-allowed']),
+      denyPaths: ['*secret*']
+    }),
+    false,
+    'dirProjB debe ser rechazado por no estar en la allowlist explícita'
+  );
+
+  assert.strictEqual(
+    claudeLauncher.isWorkspaceAllowed(dirSecret, {
+      claudeJsonPath: mockClaudeJson,
+      denyPaths: ['*secret*']
+    }),
+    false,
+    'dirSecret debe ser rechazado por coincidir con deny_paths'
+  );
+
+  // 1.3 launchClaudeRemoteSession rechaza workspace no permitido sin invocar spawnFn
+  let unauthorizedSpawnInvoked = false;
+  const resDenied = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirProjB,
+    allowlistOptions: {
+      claudeJsonPath: mockClaudeJson,
+      allowedWorkspacesSet: new Set(['proj-allowed'])
+    },
+    spawnFn: () => {
+      unauthorizedSpawnInvoked = true;
+      return { pid: 99999, unref: () => {}, on: () => {} };
+    }
+  });
+  assert.strictEqual(resDenied.success, false, 'Debe fallar ante proyecto no autorizado');
+  assert(resDenied.error.includes('Project Allowlist'), 'Debe reportar que no pertenece a la Project Allowlist');
+  assert.strictEqual(unauthorizedSpawnInvoked, false, 'No debe invocar spawnFn bajo ninguna circunstancia');
+
+  // --- Parte 2: Idempotencia del Spawn (Una sesión por proyecto) ---
+  // 2.1 Idempotencia por Bridge State
+  state.setActiveClaudeSession({
+    pid: process.pid,
+    projectPath: dirProjA,
+    sessionName: 'Mobile-proj-allowed',
+    spawnMode: 'same-dir'
+  });
+
+  let duplicateSpawnCalled = false;
+  const resBridgeIdempotent = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirProjA,
+    allowlistOptions: {
+      claudeJsonPath: mockClaudeJson
+    },
+    spawnFn: () => {
+      duplicateSpawnCalled = true;
+      return { pid: 88888, unref: () => {}, on: () => {} };
+    }
+  });
+
+  assert.strictEqual(resBridgeIdempotent.success, true, 'Debe responder success ante sesión existente');
+  assert.strictEqual(resBridgeIdempotent.alreadyRunning, true, 'Debe indicar alreadyRunning: true');
+  assert.strictEqual(resBridgeIdempotent.source, 'bridge', 'Fuente debe ser bridge');
+  assert.strictEqual(resBridgeIdempotent.pid, process.pid, 'Debe retornar el PID existente');
+  assert.strictEqual(duplicateSpawnCalled, false, 'No debe disparar spawn repetido si ya está vivo en bridge');
+
+  state.clearActiveClaudeSession();
+
+  // 2.2 Idempotencia por Claude Native Pointer (~/.claude/projects/<slug>/bridge-pointer.json)
+  const mockClaudeHome = path.join(dirBase, 'claude-home');
+  const slugA = path.resolve(dirProjA).replace(/[^a-zA-Z0-9]/g, '-');
+  const pointerDir = path.join(mockClaudeHome, 'projects', slugA);
+  fs.mkdirSync(pointerDir, { recursive: true });
+  fs.writeFileSync(path.join(pointerDir, 'bridge-pointer.json'), JSON.stringify({
+    sessionId: 'session-xyz-123',
+    environmentId: 'env_native_456',
+    pid: process.pid,
+    source: 'standalone'
+  }));
+
+  let pointerSpawnCalled = false;
+  const resPointerIdempotent = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirProjA,
+    allowlistOptions: {
+      claudeJsonPath: mockClaudeJson
+    },
+    findExistingFn: (targetPath) => claudeLauncher.findExistingClaudeSession(targetPath, { claudeHome: mockClaudeHome }),
+    spawnFn: () => {
+      pointerSpawnCalled = true;
+      return { pid: 77777, unref: () => {}, on: () => {} };
+    }
+  });
+
+  assert.strictEqual(resPointerIdempotent.success, true);
+  assert.strictEqual(resPointerIdempotent.alreadyRunning, true);
+  assert.strictEqual(resPointerIdempotent.source, 'claude-pointer');
+  assert.strictEqual(resPointerIdempotent.environmentId, 'env_native_456');
+  assert.strictEqual(pointerSpawnCalled, false, 'No debe disparar spawn si existe bridge-pointer.json vivo');
+  assert.strictEqual(state.getActiveClaudeSession()?.pid, process.pid, 'Debe sincronizar la sesión viva en state');
+
+  state.clearActiveClaudeSession();
+
+  // 2.3 Idempotencia por tmux pane
+  let tmuxSpawnCalled = false;
+  const resTmuxIdempotent = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirProjA,
+    allowlistOptions: {
+      claudeJsonPath: mockClaudeJson
+    },
+    findExistingFn: () => ({
+      pid: process.pid,
+      source: 'tmux',
+      projectPath: dirProjA
+    }),
+    spawnFn: () => {
+      tmuxSpawnCalled = true;
+      return { pid: 66666, unref: () => {}, on: () => {} };
+    }
+  });
+
+  assert.strictEqual(resTmuxIdempotent.success, true);
+  assert.strictEqual(resTmuxIdempotent.alreadyRunning, true);
+  assert.strictEqual(resTmuxIdempotent.source, 'tmux');
+  assert.strictEqual(tmuxSpawnCalled, false, 'No debe disparar spawn si existe pane en tmux');
+
+  // Limpieza
+  state.clearActiveClaudeSession();
+  fs.rmSync(dirBase, { recursive: true, force: true });
+}
+console.log('✔ Test 48 [SEC-006 / BE-010]: Separación estricta de Allowlists e Idempotencia del spawn (una sesión por proyecto)');
 
 // Limpieza: solo el directorio temporal de test
 try {

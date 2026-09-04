@@ -509,6 +509,54 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
       return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
     }
 
+    // Si se pasa un argumento que no es status ni stop, validar contra Project Allowlist (sin interpolar input crudo)
+    if (sub) {
+      const workspaces = getKnownWorkspaces();
+      const ws = workspaces.find((w) => String(w.id) === sub || w.name.toLowerCase() === sub);
+      if (!ws) {
+        return sendSafeChunk(
+          ctx,
+          `⚠️ *Acceso denegado o workspace no reconocido*\n\n` +
+          `El identificador \`${sub}\` no pertenece a la lista de proyectos autorizados (Project Allowlist).\n` +
+          `Escribe \`/claude\` para ver la lista de proyectos permitidos.`
+        );
+      }
+
+      const launch = launchClaudeRemoteSession({
+        workspacePath: ws.path,
+        spawnMode: ws.spawnMode,
+        replaceActive: true
+      });
+      if (!launch.success) {
+        return sendSafeChunk(ctx, `❌ *No se pudo iniciar Claude Code:*\n${launch.error}`);
+      }
+
+      const keyboard = new InlineKeyboard()
+        .text('🛑 Detener sesión', 'rc_stop')
+        .text('🔄 Ver workspaces', 'rc_list');
+
+      if (launch.alreadyRunning) {
+        const msg = `ℹ️ *Sesión de Claude Code ya activa*\n\n` +
+          `Ya existe un proceso de Remote Control en ejecución para este workspace${launch.source === 'tmux' ? ' (en sesión de tmux)' : ''}:\n` +
+          `• *Proyecto:* \`${launch.projectPath}\`\n` +
+          `• *PID:* \`${launch.pid}\`\n` +
+          (launch.environmentId ? `• *Entorno:* \`${launch.environmentId}\`\n` : '') +
+          (launch.spawnMode ? `• *Modo:* \`${launch.spawnMode}\`\n` : '') +
+          `\n📲 *Abre la app de Claude en tu teléfono* (o claude.ai/code) para continuar. No se disparó un proceso duplicado.`;
+        return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
+      }
+
+      const msg = `🚀 *Sesión de Claude Code iniciada con éxito*\n\n` +
+        `• *Proyecto:* \`${launch.projectPath}\`\n` +
+        `• *Nombre:* \`${launch.sessionName}\`\n` +
+        `• *PID:* \`${launch.pid}\`\n` +
+        `• *Modo:* \`${launch.spawnMode || 'same-dir'}\`\n\n` +
+        `📲 *Abre la app de Claude en tu teléfono* (o claude.ai/code) en la sección **Remote Control** para interactuar.\n\n` +
+        `_Para detenerla más tarde, escribe_ \`/claude stop\` _o pulsa el botón de abajo._`;
+
+      return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
+    }
+
     // Sin subcomando: comprobar si ya hay sesión activa o listar proyectos
     const active = getActiveClaudeSession();
     if (active) {
@@ -733,24 +781,37 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
         return;
       }
 
-      // F-03: Si ya existía una sesión activa (ej. al cambiar de proyecto), detenerla limpiamente primero
+      // F-03: Si ya existía una sesión activa para OTRO proyecto, detenerla limpiamente primero
       const active = getActiveClaudeSession();
-      if (active) {
+      if (active && path.resolve(active.projectPath).toLowerCase() !== path.resolve(ws.path).toLowerCase()) {
         stopClaudeRemoteSession();
       }
 
-      await ctx.answerCallbackQuery({ text: `Iniciando Claude en ${ws.name}...` });
+      await ctx.answerCallbackQuery({ text: `Conectando con ${ws.name}...` });
       try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
 
       const launch = launchClaudeRemoteSession({
         workspacePath: ws.path,
-        spawnMode: ws.spawnMode
+        spawnMode: ws.spawnMode,
+        replaceActive: true
       });
       if (!launch.success) {
         return sendSafeChunk(ctx, `❌ *No se pudo iniciar Claude Code:*\n${launch.error}`);
       }
 
       const keyboard = new InlineKeyboard().text('🛑 Detener sesión', 'rc_stop');
+
+      if (launch.alreadyRunning) {
+        const msg = `ℹ️ *Sesión de Claude Code ya activa*\n\n` +
+          `Ya existe un proceso de Remote Control en ejecución para este workspace${launch.source === 'tmux' ? ' (en sesión de tmux)' : ''}:\n` +
+          `• *Proyecto:* \`${launch.projectPath}\`\n` +
+          `• *PID:* \`${launch.pid}\`\n` +
+          (launch.environmentId ? `• *Entorno:* \`${launch.environmentId}\`\n` : '') +
+          (launch.spawnMode ? `• *Modo:* \`${launch.spawnMode}\`\n` : '') +
+          `\n📲 *Abre la app de Claude en tu teléfono* (o claude.ai/code) para continuar. No se inició un proceso duplicado.`;
+        return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
+      }
+
       const msg = `🚀 *Sesión de Claude Code iniciada con éxito*\n\n` +
         `• *Proyecto:* \`${launch.projectPath}\`\n` +
         `• *Nombre:* \`${launch.sessionName}\`\n` +
