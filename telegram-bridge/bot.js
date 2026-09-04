@@ -15,6 +15,7 @@ import {
   clearConversationId,
   resolvePendingAsk,
   getPendingAsk,
+  getStateFilePath
 } from './state.js';
 import { enqueueTask, dequeueTask, getQueueLength, getQueueSnapshot, clearQueue } from './queue.js';
 import {
