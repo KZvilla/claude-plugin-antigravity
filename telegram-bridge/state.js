@@ -53,7 +53,7 @@ const ASK_GRACE_MS = 60 * 1000;
 const LEGACY_ASK_MAX_AGE_MS = 24 * 3600 * 1000;
 
 function emptyState() {
-  return { chats: {}, pendingAsks: {} };
+  return { chats: {}, pendingAsks: {}, claudeSession: null };
 }
 
 // ==============================================================================
@@ -145,7 +145,8 @@ function parseState(raw) {
     // descarta al leer para no rehidratar Contexts muertos ni tokens antiguos.
     return {
       chats: parsed.chats || {},
-      pendingAsks: parsed.pendingAsks || {}
+      pendingAsks: parsed.pendingAsks || {},
+      claudeSession: parsed.claudeSession || null
     };
   } catch (err) {
     console.error(`[state] Error leyendo state.json: ${err.message}. Reinicializando.`);
@@ -407,3 +408,82 @@ export function expirePendingAsk(askId) {
 export function getPendingAsk(askId) {
   return loadState().pendingAsks[askId] || null;
 }
+
+// ==============================================================================
+// Sesión Remota de Claude Code (Phase 3)
+// ==============================================================================
+
+/**
+ * Obtiene la sesión remota activa de Claude Code si su proceso sigue vivo.
+ * Si el proceso registrado ya terminó, limpia el estado de forma atómica y retorna null.
+ *
+ * @param {Object} [options]
+ * @param {(pid: number) => boolean} [options.isAliveFn] Función de verificación para tests
+ * @returns {{ pid: number, projectPath: string, sessionName: string, startedAt: string }|null}
+ */
+export function getActiveClaudeSession({ isAliveFn = null } = {}) {
+  const session = loadState().claudeSession;
+  if (!session || !session.pid) return null;
+
+  let alive = false;
+  if (typeof isAliveFn === 'function') {
+    try {
+      alive = Boolean(isAliveFn(session.pid));
+    } catch {
+      alive = false;
+    }
+  } else {
+    try {
+      process.kill(session.pid, 0);
+      alive = true;
+    } catch (err) {
+      alive = err.code === 'EPERM';
+    }
+  }
+
+  if (!alive) {
+    clearActiveClaudeSession();
+    return null;
+  }
+
+  return {
+    pid: session.pid,
+    projectPath: session.projectPath,
+    sessionName: session.sessionName,
+    startedAt: session.startedAt
+  };
+}
+
+/**
+ * Registra una sesión remota activa de Claude Code en state.json de forma atómica.
+ *
+ * @param {Object} params
+ * @param {number} params.pid
+ * @param {string} params.projectPath
+ * @param {string} params.sessionName
+ * @returns {{ pid: number, projectPath: string, sessionName: string, startedAt: string }}
+ */
+export function setActiveClaudeSession({ pid, projectPath, sessionName }) {
+  const session = {
+    pid,
+    projectPath,
+    sessionName,
+    startedAt: new Date().toISOString()
+  };
+
+  mutateState((state) => {
+    state.claudeSession = session;
+  });
+
+  return session;
+}
+
+/**
+ * Elimina la sesión remota activa de Claude Code de state.json de forma atómica.
+ */
+export function clearActiveClaudeSession() {
+  mutateState((state) => {
+    delete state.claudeSession;
+  });
+}
+

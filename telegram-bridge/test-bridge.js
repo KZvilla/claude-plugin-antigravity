@@ -1037,9 +1037,227 @@ console.log('✔ Test 39 [BE-008]: getKnownWorkspaces es resiliente a fichero au
 }
 console.log('✔ Test 40 [FEAT-002]: resolveClaudeBin localiza el ejecutable de Claude Code en el sistema');
 
+// Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de claudeSession
+{
+  // 1. Estado inicial limpio
+  state.clearActiveClaudeSession();
+  assert.strictEqual(state.getActiveClaudeSession(), null, 'Inicialmente no debe haber sesión activa');
+
+  // 2. Registrar sesión con el PID del proceso actual (proceso vivo conocido)
+  const dirTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-session-test-'));
+  const testSession = {
+    pid: process.pid,
+    projectPath: dirTmp,
+    sessionName: 'Mobile-test-project'
+  };
+  const registered = state.setActiveClaudeSession(testSession);
+  assert.strictEqual(registered.pid, process.pid, 'Debe registrar el PID indicado');
+  assert.strictEqual(registered.projectPath, dirTmp, 'Debe registrar el projectPath');
+  assert.strictEqual(registered.sessionName, 'Mobile-test-project', 'Debe registrar el sessionName');
+  assert(typeof registered.startedAt === 'string' && registered.startedAt.length > 0, 'Debe incluir timestamp startedAt');
+
+  // 3. getActiveClaudeSession debe retornar la sesión viva
+  const active = state.getActiveClaudeSession();
+  assert(active !== null, 'Debe retornar la sesión activa viva');
+  assert.strictEqual(active.pid, process.pid, 'El PID debe coincidir');
+  assert.strictEqual(active.projectPath, dirTmp, 'El projectPath debe coincidir');
+  assert.strictEqual(active.sessionName, 'Mobile-test-project', 'El sessionName debe coincidir');
+  assert.strictEqual(active.startedAt, registered.startedAt, 'startedAt debe coincidir');
+
+  // 4. Comprobar persistencia física en state.json
+  const rawState = JSON.parse(fs.readFileSync(TEST_STATE_FILE, 'utf8'));
+  assert(rawState.claudeSession, 'state.json debe contener la clave claudeSession');
+  assert.strictEqual(rawState.claudeSession.pid, process.pid, 'El PID debe estar persistido en disco');
+
+  // 5. Comprobar que un PID muerto es purgado automáticamente al consultar
+  const FAKE_DEAD_PID = 99999999;
+  state.setActiveClaudeSession({
+    pid: FAKE_DEAD_PID,
+    projectPath: dirTmp,
+    sessionName: 'Mobile-dead-session'
+  });
+  const deadActive = state.getActiveClaudeSession();
+  assert.strictEqual(deadActive, null, 'Un PID inexistente debe retornar null');
+  assert.strictEqual(state.loadState().claudeSession, null, 'El estado debe haberse limpiado automáticamente');
+
+  // 6. Comprobar clearActiveClaudeSession explícito
+  state.setActiveClaudeSession(testSession);
+  assert(state.getActiveClaudeSession() !== null, 'La sesión debe estar activa antes de limpiar');
+  state.clearActiveClaudeSession();
+  assert.strictEqual(state.getActiveClaudeSession(), null, 'clearActiveClaudeSession debe eliminar la sesión');
+  assert.strictEqual(state.loadState().claudeSession, null, 'El estado en caché/disco debe ser null');
+
+  fs.rmSync(dirTmp, { recursive: true, force: true });
+}
+console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de claudeSession validados');
+
+// Test 42 [FEAT-003 / SEC-005]: launchClaudeRemoteSession inicia sesión desacoplada sin secretos en entorno
+{
+  const dirTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-launch-test-'));
+  state.clearActiveClaudeSession();
+
+  // 1. Validar fallo si el directorio de trabajo no existe
+  const noExistePath = path.join(os.tmpdir(), 'no-existe-para-launch-test-xyz');
+  const resInexistente = claudeLauncher.launchClaudeRemoteSession({ workspacePath: noExistePath });
+  assert.strictEqual(resInexistente.success, false, 'Debe fallar si workspacePath no existe');
+  assert(resInexistente.error.includes('no existe'), 'Error debe indicar que la ruta no existe');
+
+  // 2. Simular spawnFn para capturar invocación exacta
+  const spawnCalls = [];
+  let unrefCalled = false;
+  const mockChild = {
+    pid: process.pid, // Usamos process.pid para que getActiveClaudeSession lo considere vivo
+    unref: () => { unrefCalled = true; }
+  };
+  const mockSpawn = (bin, args, opts) => {
+    spawnCalls.push({ bin, args, opts });
+    return mockChild;
+  };
+
+  // Asegurar que existe un secreto en process.env para verificar saneamiento
+  process.env.TELEGRAM_BOT_TOKEN = FAKE_TOKEN;
+
+  // 3. Invocación con sessionName por defecto (Mobile-<basename>)
+  const resOk = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirTmp,
+    spawnFn: mockSpawn
+  });
+
+  assert.strictEqual(resOk.success, true, 'El lanzamiento debe ser exitoso');
+  assert.strictEqual(resOk.pid, process.pid, 'Debe retornar el PID del proceso');
+  assert.strictEqual(resOk.projectPath, dirTmp, 'Debe retornar el projectPath');
+  const expectedDefaultName = `Mobile-${path.basename(dirTmp)}`;
+  assert.strictEqual(resOk.sessionName, expectedDefaultName, 'Debe formatear Mobile-<basename> por defecto');
+  assert.strictEqual(unrefCalled, true, 'child.unref() debe haber sido llamado');
+
+  // Verificar llamada a spawnFn
+  assert.strictEqual(spawnCalls.length, 1, 'Debe haber llamado a spawnFn una vez');
+  const call = spawnCalls[0];
+  assert.strictEqual(call.bin, claudeLauncher.resolveClaudeBin(), 'Debe usar el binario resuelto de Claude');
+  assert.deepStrictEqual(call.args, ['--remote-control', expectedDefaultName], 'Argumentos deben ser [--remote-control, sessionName]');
+  assert.strictEqual(call.opts.cwd, dirTmp, 'cwd debe ser workspacePath');
+  assert.strictEqual(call.opts.detached, true, 'detached debe ser true');
+  assert.strictEqual(call.opts.stdio, 'ignore', 'stdio debe ser ignore');
+
+  // Invariante de seguridad [SEC-005]: el entorno pasado NO debe contener secretos de Telegram
+  assert.strictEqual(call.opts.env.TELEGRAM_BOT_TOKEN, undefined, 'TELEGRAM_BOT_TOKEN no debe heredarse');
+  assert.strictEqual(call.opts.env.TELEGRAM_NOTIFY_CHAT_ID, undefined, 'TELEGRAM_NOTIFY_CHAT_ID no debe heredarse');
+  assert.strictEqual(call.opts.env.ALLOWED_USER_IDS, undefined, 'ALLOWED_USER_IDS no debe heredarse');
+
+  // Verificar que la sesión quedó registrada en state
+  const activeSession = state.getActiveClaudeSession();
+  assert(activeSession !== null, 'La sesión debe estar registrada en state');
+  assert.strictEqual(activeSession.sessionName, expectedDefaultName);
+
+  // 4. Validar prevención de doble sesión cuando ya hay una activa
+  const resDoble = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirTmp,
+    spawnFn: mockSpawn
+  });
+  assert.strictEqual(resDoble.success, false, 'No debe permitir lanzar si ya hay una sesión activa');
+  assert.strictEqual(resDoble.error, 'Ya existe una sesión activa de Claude', 'Mensaje de error exacto');
+  assert(resDoble.session && resDoble.session.pid === process.pid, 'Debe retornar la sesión activa');
+  assert.strictEqual(spawnCalls.length, 1, 'No debe haber llamado a spawnFn de nuevo');
+
+  // 5. Invocación con sessionName personalizado
+  state.clearActiveClaudeSession();
+  const resCustom = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirTmp,
+    sessionName: 'MiSesionPersonalizada',
+    spawnFn: mockSpawn
+  });
+  assert.strictEqual(resCustom.success, true);
+  assert.strictEqual(resCustom.sessionName, 'MiSesionPersonalizada');
+  assert.deepStrictEqual(spawnCalls[1].args, ['--remote-control', 'MiSesionPersonalizada']);
+
+  // Limpieza
+  state.clearActiveClaudeSession();
+  fs.rmSync(dirTmp, { recursive: true, force: true });
+}
+console.log('✔ Test 42 [FEAT-003 / SEC-005]: launchClaudeRemoteSession inicia sesión desacoplada sin secretos en entorno');
+
+// Test 43 [FEAT-003 / BE-009]: stopClaudeRemoteSession termina el árbol de procesos y limpia el estado
+{
+  state.clearActiveClaudeSession();
+
+  // 1. Validar error si no hay sesión activa
+  const resNoSession = claudeLauncher.stopClaudeRemoteSession();
+  assert.strictEqual(resNoSession.success, false, 'Debe fallar si no hay sesión activa');
+  assert.strictEqual(
+    resNoSession.error,
+    'No hay ninguna sesión activa de Claude para detener.',
+    'Debe retornar mensaje exacto de sesión inexistente'
+  );
+
+  // 2. Registrar sesión activa simulada con process.pid
+  const dirTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-stop-test-'));
+  state.setActiveClaudeSession({
+    pid: process.pid,
+    projectPath: dirTmp,
+    sessionName: 'Mobile-to-stop'
+  });
+  assert(state.getActiveClaudeSession() !== null, 'Debe haber sesión activa antes de detener');
+
+  // 3. Simular execFileFn para Windows
+  const execCalls = [];
+  const mockExecFile = (file, args, cb) => {
+    execCalls.push({ file, args });
+    if (typeof cb === 'function') cb(null, '', '');
+  };
+
+  // 4. Detener sesión en Windows
+  const resStopWin = claudeLauncher.stopClaudeRemoteSession({
+    execFileFn: mockExecFile,
+    platform: 'win32'
+  });
+
+  assert.strictEqual(resStopWin.success, true, 'stopClaudeRemoteSession debe ser exitoso');
+  assert.strictEqual(resStopWin.pid, process.pid, 'Debe retornar el pid detenido');
+  assert.strictEqual(resStopWin.sessionName, 'Mobile-to-stop', 'Debe retornar el sessionName');
+
+  assert.strictEqual(execCalls.length, 1, 'Debe haber invocado taskkill una vez');
+  assert.strictEqual(execCalls[0].file, 'taskkill', 'El comando debe ser taskkill');
+  assert.deepStrictEqual(
+    execCalls[0].args,
+    ['/pid', String(process.pid), '/T', '/F'],
+    'Debe invocar taskkill con /pid <PID> /T /F'
+  );
+
+  // Verificar que el estado se limpió
+  assert.strictEqual(state.getActiveClaudeSession(), null, 'El estado debe quedar limpio tras detener');
+
+  // 5. Probar rama POSIX (señales SIGTERM y SIGKILL)
+  const posixSignals = [];
+  const mockKill = (targetPid, signal) => {
+    posixSignals.push({ targetPid, signal });
+  };
+
+  state.setActiveClaudeSession({
+    pid: process.pid,
+    projectPath: dirTmp,
+    sessionName: 'Mobile-posix-test'
+  });
+
+  const resStopPosix = claudeLauncher.stopClaudeRemoteSession({
+    platform: 'linux',
+    killFn: mockKill
+  });
+
+  assert.strictEqual(resStopPosix.success, true, 'stopClaudeRemoteSession en POSIX debe ser exitoso');
+  assert.strictEqual(resStopPosix.pid, process.pid);
+  assert.strictEqual(resStopPosix.sessionName, 'Mobile-posix-test');
+  assert(posixSignals.some((s) => s.signal === 'SIGTERM'), 'Debe enviar SIGTERM');
+  assert(posixSignals.some((s) => s.signal === 'SIGKILL'), 'Debe enviar SIGKILL');
+  assert.strictEqual(state.getActiveClaudeSession(), null, 'El estado debe quedar limpio en POSIX');
+
+  fs.rmSync(dirTmp, { recursive: true, force: true });
+}
+console.log('✔ Test 43 [FEAT-003 / BE-009]: stopClaudeRemoteSession termina el árbol de procesos y limpia el estado');
+
 // Limpieza: solo el directorio temporal de test
 try {
   fs.rmSync(path.dirname(TEST_STATE_FILE), { recursive: true, force: true });
 } catch {}
 
 console.log('--- ✅ Todos los tests pasaron exitosamente ---');
+
