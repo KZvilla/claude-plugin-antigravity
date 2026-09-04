@@ -586,7 +586,7 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
         `• *PID:* \`${launch.pid}\`\n` +
         `• *Modo:* \`${launch.spawnMode || 'same-dir'}\`\n\n` +
         (envUrl ? `🔗 [Abrir en Claude App o Web](${envUrl})\n\n` : '') +
-        `📲 *Abre la app de Claude en tu teléfono* (o pulsa el botón de abajo) para interactuar.\n\n` +
+        `📲 *Abre la app de Claude* (o pulsa el botón de abajo) y toca en **\`+\` (Nueva sesión)** para comenzar.\n\n` +
         `_Para detenerla más tarde, escribe_ \`/claude stop\` _o pulsa el botón de abajo._`;
 
       return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
@@ -886,7 +886,7 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
         `• *PID:* \`${launch.pid}\`\n` +
         `• *Modo:* \`${launch.spawnMode || 'same-dir'}\`\n\n` +
         (envUrl ? `🔗 [Abrir en Claude App o Web](${envUrl})\n\n` : '') +
-        `📲 *Abre la app de Claude en tu teléfono* (o pulsa el botón de abajo) para interactuar.\n\n` +
+        `📲 *Abre la app de Claude* (o pulsa el botón de abajo) y toca en **\`+\` (Nueva sesión)** para comenzar.\n\n` +
         `_Para detenerla más tarde, escribe_ \`/claude stop\` _o pulsa el botón de abajo._`;
 
       return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
