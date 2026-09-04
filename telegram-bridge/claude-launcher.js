@@ -618,7 +618,7 @@ export function stopClaudeRemoteSession({
     };
   }
 
-  const { pid, sessionName } = active;
+  const { pid, sessionName, projectPath } = active;
 
   if (platform === 'win32') {
     // F-04: Ejecución síncrona para asegurar que el árbol de procesos muera antes de limpiar el estado
@@ -647,7 +647,206 @@ export function stopClaudeRemoteSession({
   return {
     success: true,
     pid,
-    sessionName
+    sessionName,
+    projectPath
+  };
+}
+
+/**
+ * Inspecciona los worktrees de Git creados por Claude Code en el proyecto.
+ * Clasifica cada worktree en limpio o con cambios según dos criterios estrictos:
+ * 1. Working tree sin cambios locales (git status --porcelain está vacío).
+ * 2. Rama sin commits por delante de la rama base (git log base..branch está vacío).
+ *
+ * @param {string} projectPath Ruta física al proyecto
+ * @param {Function} [execFileSyncFn] Función inyectable para testing
+ * @returns {{ cleanWorktrees: Array<{ path: string, branch: string, sessionId: string }>, dirtyWorktrees: Array<{ path: string, branch: string, sessionId: string, reason: string }> }}
+ */
+export function inspectClaudeWorktrees(projectPath, execFileSyncFn = execFileSync) {
+  const result = { cleanWorktrees: [], dirtyWorktrees: [] };
+  if (!projectPath || typeof projectPath !== 'string' || !fs.existsSync(projectPath)) {
+    return result;
+  }
+
+  // Verificar si es un repositorio Git
+  try {
+    const isGit = execFileSyncFn('git', ['-C', projectPath, 'rev-parse', '--is-inside-work-tree'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim();
+    if (isGit !== 'true') return result;
+  } catch {
+    return result;
+  }
+
+  // Obtener la rama base del repositorio principal (ej. master o main)
+  let baseBranch = 'master';
+  try {
+    const headRef = execFileSyncFn('git', ['-C', projectPath, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim();
+    if (headRef && headRef !== 'HEAD') {
+      baseBranch = headRef;
+    }
+  } catch {}
+
+  // Listar todos los worktrees con git worktree list --porcelain
+  let rawList = '';
+  try {
+    rawList = execFileSyncFn('git', ['-C', projectPath, 'worktree', 'list', '--porcelain'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
+  } catch {
+    return result;
+  }
+
+  // Parsear bloques por worktree
+  const blocks = rawList.split(/\r?\n\r?\n/).map((b) => b.trim()).filter(Boolean);
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    let wtPath = '';
+    let wtBranch = '';
+
+    for (const line of lines) {
+      if (line.startsWith('worktree ')) {
+        wtPath = line.slice(9).trim();
+      } else if (line.startsWith('branch refs/heads/')) {
+        wtBranch = line.slice(18).trim();
+      }
+    }
+
+    if (!wtPath) continue;
+
+    // Solo inspeccionar worktrees creados por Claude Code (en .claude/worktrees/bridge- o con rama worktree-bridge-)
+    const isClaudeWorktree = wtPath.includes('.claude/worktrees/bridge-') ||
+      wtPath.includes('.claude\\worktrees\\bridge-') ||
+      wtBranch.startsWith('worktree-bridge-');
+
+    if (!isClaudeWorktree) continue;
+
+    // Extraer identificador de sesión si está presente
+    const idMatch = wtBranch.match(/worktree-bridge-([a-zA-Z0-9_-]+)/) ||
+      wtPath.match(/bridge-([a-zA-Z0-9_-]+)/);
+    const sessionId = idMatch ? idMatch[1] : '';
+
+    // Si la carpeta del worktree ya no existe en disco, se considera huérfano en metadata
+    if (!fs.existsSync(wtPath)) {
+      result.cleanWorktrees.push({ path: wtPath, branch: wtBranch, sessionId });
+      continue;
+    }
+
+    // Criterio 1: Comprobar cambios sin commitear
+    let statusOutput = '';
+    try {
+      statusOutput = execFileSyncFn('git', ['-C', wtPath, 'status', '--porcelain'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      }).trim();
+    } catch {
+      statusOutput = 'error';
+    }
+
+    if (statusOutput.length > 0) {
+      result.dirtyWorktrees.push({
+        path: wtPath,
+        branch: wtBranch,
+        sessionId,
+        reason: 'Archivos modificados sin commitear'
+      });
+      continue;
+    }
+
+    // Criterio 2: Comprobar commits por delante de la rama base
+    let commitsAhead = 0;
+    if (wtBranch && baseBranch && wtBranch !== baseBranch) {
+      try {
+        const logOutput = execFileSyncFn('git', ['-C', projectPath, 'log', `${baseBranch}..${wtBranch}`, '--oneline'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore']
+        }).trim();
+        if (logOutput.length > 0) {
+          commitsAhead = logOutput.split(/\r?\n/).filter(Boolean).length;
+        }
+      } catch {}
+    }
+
+    if (commitsAhead > 0) {
+      result.dirtyWorktrees.push({
+        path: wtPath,
+        branch: wtBranch,
+        sessionId,
+        reason: `${commitsAhead} commit(s) sin mergear hacia ${baseBranch}`
+      });
+      continue;
+    }
+
+    // Está 100% limpio y seguro para eliminar
+    result.cleanWorktrees.push({ path: wtPath, branch: wtBranch, sessionId });
+  }
+
+  return result;
+}
+
+/**
+ * Elimina de forma segura ÚNICAMENTE los worktrees de Claude Code que estén 100% limpios
+ * (sin archivos modificados y sin commits propios por delante).
+ *
+ * @param {string} projectPath Ruta física al proyecto
+ * @param {Function} [execFileSyncFn] Función inyectable para testing
+ * @returns {{ removedCount: number, removedWorktrees: Array<{ path: string, branch: string }>, preservedCount: number, preservedWorktrees: Array<{ path: string, branch: string, reason: string }> }}
+ */
+export function pruneCleanClaudeWorktrees(projectPath, execFileSyncFn = execFileSync) {
+  const { cleanWorktrees, dirtyWorktrees } = inspectClaudeWorktrees(projectPath, execFileSyncFn);
+  const removedWorktrees = [];
+
+  for (const wt of cleanWorktrees) {
+    // 1. Desbloquear worktree
+    try {
+      execFileSyncFn('git', ['-C', projectPath, 'worktree', 'unlock', wt.path], {
+        stdio: ['ignore', 'ignore', 'ignore']
+      });
+    } catch {}
+
+    // 2. Remover directorio del worktree
+    try {
+      execFileSyncFn('git', ['-C', projectPath, 'worktree', 'remove', wt.path, '--force'], {
+        stdio: ['ignore', 'ignore', 'ignore']
+      });
+    } catch {}
+
+    // Si la carpeta sigue existiendo en disco, intentar removerla
+    try {
+      if (fs.existsSync(wt.path)) {
+        fs.rmSync(wt.path, { recursive: true, force: true });
+      }
+    } catch {}
+
+    // 3. Eliminar la rama temporal asociada
+    if (wt.branch) {
+      try {
+        execFileSyncFn('git', ['-C', projectPath, 'branch', '-D', wt.branch], {
+          stdio: ['ignore', 'ignore', 'ignore']
+        });
+      } catch {}
+    }
+
+    removedWorktrees.push(wt);
+  }
+
+  // 4. Limpiar metadatos huérfanos de git worktree
+  try {
+    execFileSyncFn('git', ['-C', projectPath, 'worktree', 'prune'], {
+      stdio: ['ignore', 'ignore', 'ignore']
+    });
+  } catch {}
+
+  return {
+    removedCount: removedWorktrees.length,
+    removedWorktrees,
+    preservedCount: dirtyWorktrees.length,
+    preservedWorktrees: dirtyWorktrees
   };
 }
 

@@ -558,7 +558,7 @@ console.log('✔ Test 27 [SEC-003]: resolvePendingAsk es atómico y no se resuel
 // módulo, importarlo tomaba el lockfile, validaba el token y abría el long
 // polling, así que ningún handler suyo podía probarse.
 process.env.TELEGRAM_BOT_TOKEN = FAKE_TOKEN;
-const { createBot, resetRuntimeState, avisoDeDespacho, buildWorkspacesKeyboard } = await import('./bot.js');
+const { createBot, resetRuntimeState, avisoDeDespacho, buildWorkspacesKeyboard, buildStopMessageAndKeyboard } = await import('./bot.js');
 
 // Test 28 [BE-003]: el aviso anuncia la posición real en la fila, no el índice
 // de la cola. Con una tarea corriendo, el primero en cola es el segundo en fila.
@@ -1691,6 +1691,223 @@ console.log('✔ Test 47 [FEAT-001 / BE-008]: Cambio de proyecto (F-03) reemplaz
   fs.rmSync(dirBase, { recursive: true, force: true });
 }
 console.log('✔ Test 48 [SEC-006 / BE-010]: Separación estricta de Allowlists e Idempotencia del spawn (una sesión por proyecto)');
+
+// Test 49 [FEAT-004 / BE-011]: Detección y purga segura de worktrees huérfanos de Claude Code (Opción B)
+{
+  state.clearActiveClaudeSession();
+
+  // --- Parte 1: inspectClaudeWorktrees ---
+  // 1.1 Si el proyecto no es válido o no existe
+  const resInvalid = claudeLauncher.inspectClaudeWorktrees('C:\\ruta\\inexistente\\12345');
+  assert.deepStrictEqual(resInvalid, { cleanWorktrees: [], dirtyWorktrees: [] });
+
+  // 1.2 Repositorio Git con simulación de execFileSyncFn
+  const fakeRepo = path.join(os.tmpdir(), 'fake-repo-worktrees');
+  const wtClean = path.join(fakeRepo, '.claude', 'worktrees', 'bridge-clean-123');
+  const wtDirtyUncommitted = path.join(fakeRepo, '.claude', 'worktrees', 'bridge-dirty-uncommitted');
+  const wtDirtyCommits = path.join(fakeRepo, '.claude', 'worktrees', 'bridge-dirty-commits');
+  const wtOther = path.join(fakeRepo, 'other-worktree');
+
+  // Creamos carpetas para simular existencia física en disco
+  fs.mkdirSync(wtClean, { recursive: true });
+  fs.mkdirSync(wtDirtyUncommitted, { recursive: true });
+  fs.mkdirSync(wtDirtyCommits, { recursive: true });
+  fs.mkdirSync(wtOther, { recursive: true });
+
+  const mockExec = (bin, args) => {
+    // rev-parse --is-inside-work-tree
+    if (args.includes('--is-inside-work-tree')) return 'true\n';
+    // rev-parse --abbrev-ref HEAD
+    if (args.includes('--abbrev-ref')) return 'main\n';
+
+    // worktree list --porcelain
+    if (args.includes('list') && args.includes('--porcelain')) {
+      return [
+        `worktree ${fakeRepo}`,
+        `HEAD 1111111111111111111111111111111111111111`,
+        `branch refs/heads/main`,
+        ``,
+        `worktree ${wtClean}`,
+        `HEAD 2222222222222222222222222222222222222222`,
+        `branch refs/heads/worktree-bridge-clean-123`,
+        ``,
+        `worktree ${wtDirtyUncommitted}`,
+        `HEAD 3333333333333333333333333333333333333333`,
+        `branch refs/heads/worktree-bridge-dirty-uncommitted`,
+        ``,
+        `worktree ${wtDirtyCommits}`,
+        `HEAD 4444444444444444444444444444444444444444`,
+        `branch refs/heads/worktree-bridge-dirty-commits`,
+        ``,
+        `worktree ${wtOther}`,
+        `HEAD 5555555555555555555555555555555555555555`,
+        `branch refs/heads/feature-random`,
+        ``
+      ].join('\n');
+    }
+
+    // status --porcelain
+    if (args.includes('status') && args.includes('--porcelain')) {
+      const targetCwd = args[args.indexOf('-C') + 1];
+      if (targetCwd === wtDirtyUncommitted) {
+        return ' M modified-file.txt\n?? untracked.js\n';
+      }
+      return '';
+    }
+
+    // log base..branch --oneline
+    if (args.includes('log') && args.includes('--oneline')) {
+      const range = args[args.indexOf('--oneline') - 1];
+      if (range === 'main..worktree-bridge-dirty-commits') {
+        return 'abc1234 feat: mobile commit 1\ndef5678 fix: mobile commit 2\n';
+      }
+      return '';
+    }
+
+    return '';
+  };
+
+  const inspectResult = claudeLauncher.inspectClaudeWorktrees(fakeRepo, mockExec);
+  assert.strictEqual(inspectResult.cleanWorktrees.length, 1, 'Debe haber exactamente 1 worktree limpio');
+  assert.strictEqual(inspectResult.cleanWorktrees[0].branch, 'worktree-bridge-clean-123');
+  assert.strictEqual(inspectResult.cleanWorktrees[0].sessionId, 'clean-123');
+
+  assert.strictEqual(inspectResult.dirtyWorktrees.length, 2, 'Debe haber 2 worktrees con cambios (dirty)');
+  const dirtyUncommitted = inspectResult.dirtyWorktrees.find((w) => w.branch === 'worktree-bridge-dirty-uncommitted');
+  assert(dirtyUncommitted !== undefined);
+  assert.strictEqual(dirtyUncommitted.reason, 'Archivos modificados sin commitear');
+
+  const dirtyCommits = inspectResult.dirtyWorktrees.find((w) => w.branch === 'worktree-bridge-dirty-commits');
+  assert(dirtyCommits !== undefined);
+  assert.strictEqual(dirtyCommits.reason, '2 commit(s) sin mergear hacia main');
+
+  // --- Parte 2: pruneCleanClaudeWorktrees ---
+  // Invariante: solo remueve worktrees limpios, NUNCA los dirty
+  const executedCommands = [];
+  const mockExecPrune = (bin, args) => {
+    executedCommands.push({ bin, args });
+    return mockExec(bin, args);
+  };
+
+  const pruneResult = claudeLauncher.pruneCleanClaudeWorktrees(fakeRepo, mockExecPrune);
+  assert.strictEqual(pruneResult.removedCount, 1, 'Debe remover 1 worktree limpio');
+  assert.strictEqual(pruneResult.removedWorktrees[0].branch, 'worktree-bridge-clean-123');
+  assert.strictEqual(pruneResult.preservedCount, 2, 'Debe preservar los 2 dirty worktrees');
+
+  // Comprobar que git worktree unlock, remove y branch -D se llamaron SOLO para wtClean
+  const unlocked = executedCommands.filter((c) => c.args.includes('unlock'));
+  assert.strictEqual(unlocked.length, 1);
+  assert.strictEqual(unlocked[0].args[unlocked[0].args.indexOf('unlock') + 1], wtClean);
+
+  const removed = executedCommands.filter((c) => c.args.includes('remove'));
+  assert.strictEqual(removed.length, 1);
+  assert.strictEqual(removed[0].args[removed[0].args.indexOf('remove') + 1], wtClean);
+
+  const branchD = executedCommands.filter((c) => c.args.includes('-D'));
+  assert.strictEqual(branchD.length, 1);
+  assert.strictEqual(branchD[0].args[branchD[0].args.indexOf('-D') + 1], 'worktree-bridge-clean-123');
+
+  const pruned = executedCommands.filter((c) => c.args.includes('prune'));
+  assert.strictEqual(pruned.length, 1);
+
+  // --- Parte 3: buildStopMessageAndKeyboard (UI de Telegram) ---
+  const mockWorkspaces = [
+    { id: '11223344', numericId: 1, path: fakeRepo, name: 'fake-repo', displayName: 'fake-repo' }
+  ];
+
+  // Caso 3.1: Sesión detenida con worktrees limpios y dirty
+  const stopResWithWorktrees = {
+    success: true,
+    pid: 12345,
+    projectPath: fakeRepo
+  };
+
+  const uiWithWorktrees = buildStopMessageAndKeyboard(
+    stopResWithWorktrees,
+    mockWorkspaces,
+    () => inspectResult
+  );
+
+  assert(uiWithWorktrees.text.includes('Sesión de Claude Code finalizada'), 'Debe reportar sesión finalizada');
+  assert(uiWithWorktrees.text.includes('*1* worktree(s) temporales de Claude sin cambios'), 'Debe alertar de 1 limpio');
+  assert(uiWithWorktrees.text.includes('Worktrees con cambios detectados (conservados intactos)'), 'Debe listar los dirty');
+  assert(uiWithWorktrees.text.includes('worktree-bridge-dirty-commits'), 'Muestra rama con commits');
+  assert(uiWithWorktrees.keyboard !== null, 'Debe ofrecer teclado interactivo');
+
+  const buttons = uiWithWorktrees.keyboard.inline_keyboard.flat();
+  const cleanBtn = buttons.find((b) => b.callback_data === 'rc_clean:11223344');
+  assert(cleanBtn !== undefined, 'Debe existir botón para purgar');
+  assert(cleanBtn.text.includes('Purgar 1 worktree(s) limpios'));
+  const keepBtn = buttons.find((b) => b.callback_data === 'rc_keep');
+  assert(keepBtn !== undefined, 'Debe existir botón para conservar');
+
+  // Verificar límite de 64 bytes de Telegram
+  assert(Buffer.byteLength(cleanBtn.callback_data, 'utf8') <= 64);
+  assert(Buffer.byteLength(keepBtn.callback_data, 'utf8') <= 64);
+
+  // Caso 3.2: Sesión detenida sin worktrees limpios
+  const uiNoClean = buildStopMessageAndKeyboard(
+    stopResWithWorktrees,
+    mockWorkspaces,
+    () => ({ cleanWorktrees: [], dirtyWorktrees: [] })
+  );
+  assert.strictEqual(uiNoClean.keyboard, null, 'No debe ofrecer botones si no hay worktrees limpios que purgar');
+
+  // --- Parte 4: Handlers de Telegram del Bot (Callbacks rc_clean y rc_keep, y /claude clean) ---
+  const { bot, llamadas } = botDePrueba();
+  resetRuntimeState();
+
+  const callbackEvt = (data, updateId) => ({
+    update_id: updateId,
+    callback_query: {
+      id: String(updateId),
+      from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+      chat_instance: 'ci',
+      data,
+      message: {
+        message_id: 600 + updateId,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: Number(USUARIO_OK), type: 'private' },
+        from: { id: 1, is_bot: true, first_name: 'bot' },
+        text: 'aviso'
+      }
+    }
+  });
+
+  // Callback rc_keep
+  llamadas.length = 0;
+  await bot.handleUpdate(callbackEvt('rc_keep', 300));
+  const ansKeep = llamadas.find((c) => c.method === 'answerCallbackQuery' && c.payload.text.includes('conservados'));
+  assert(ansKeep !== undefined, 'rc_keep debe responder con acuse');
+  const msgKeep = llamadas.find((c) => c.method === 'sendMessage' && c.payload.text.includes('conservados'));
+  assert(msgKeep !== undefined, 'rc_keep debe confirmar conservación de worktrees');
+
+  // Callback rc_clean con id desconocido
+  llamadas.length = 0;
+  await bot.handleUpdate(callbackEvt('rc_clean:unknown-id', 301));
+  const msgUnknown = llamadas.find((c) => c.method === 'sendMessage' && c.payload.text.includes('No se encontró el proyecto'));
+  assert(msgUnknown !== undefined, 'rc_clean rechaza id desconocido');
+
+  // Comando /claude clean con argumento no reconocido
+  llamadas.length = 0;
+  await bot.handleUpdate({
+    update_id: 302,
+    message: {
+      message_id: 902,
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: Number(USUARIO_OK), type: 'private' },
+      from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+      text: '/claude clean non-existent-workspace',
+      entities: [{ type: 'bot_command', offset: 0, length: 7 }]
+    }
+  });
+  const msgCleanNotFound = llamadas.find((c) => c.method === 'sendMessage' && c.payload.text.includes('Workspace no encontrado'));
+  assert(msgCleanNotFound !== undefined, '/claude clean rechaza workspace inexistente');
+
+  // Limpieza
+  fs.rmSync(fakeRepo, { recursive: true, force: true });
+}
+console.log('✔ Test 49 [FEAT-004 / BE-011]: Detección y purga segura de worktrees huérfanos de Claude Code (Opción B)');
 
 // Limpieza: solo el directorio temporal de test
 try {

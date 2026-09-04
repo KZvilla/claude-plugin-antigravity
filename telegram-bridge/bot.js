@@ -23,7 +23,9 @@ import {
   launchClaudeRemoteSession,
   stopClaudeRemoteSession,
   getActiveClaudeSession,
-  isPidAlive
+  isPidAlive,
+  inspectClaudeWorktrees,
+  pruneCleanClaudeWorktrees
 } from './claude-launcher.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -411,6 +413,61 @@ export function buildWorkspacesKeyboard(workspaces) {
 }
 
 /**
+ * Construye el mensaje y el teclado de confirmación para el cierre de sesión de Claude,
+ * integrando la inspección de worktrees (Opción B).
+ *
+ * Invariantes de seguridad:
+ * - Solo se ofrecen para purgar worktrees 100% limpios (status --porcelain limpio Y 0 commits ahead).
+ * - Los worktrees con cambios o commits NUNCA se eliminan; se preservan y se alertan al usuario.
+ *
+ * @param {{ success: boolean, pid?: number, projectPath?: string, error?: string }} stopRes
+ * @param {Array<Object>} [workspaces] Lista opcional de workspaces para testing
+ * @param {Function} [inspectFn] Función opcional de inspección para testing
+ * @returns {{ text: string, keyboard: InlineKeyboard | null }}
+ */
+export function buildStopMessageAndKeyboard(
+  stopRes,
+  workspaces = getKnownWorkspaces(),
+  inspectFn = inspectClaudeWorktrees
+) {
+  if (!stopRes || !stopRes.success) {
+    return {
+      text: `⚠️ ${stopRes?.error || 'No se pudo detener la sesión.'}`,
+      keyboard: null
+    };
+  }
+
+  let text = `🛑 *Sesión de Claude Code finalizada* (PID: ${stopRes.pid}).\nEl túnel de Remote Control ha sido cerrado.`;
+  let keyboard = null;
+
+  if (stopRes.projectPath) {
+    try {
+      const { cleanWorktrees, dirtyWorktrees } = inspectFn(stopRes.projectPath);
+      const ws = workspaces.find(
+        (w) => path.resolve(w.path).toLowerCase() === path.resolve(stopRes.projectPath).toLowerCase()
+      );
+      const wsId = ws ? ws.id : null;
+
+      if (dirtyWorktrees && dirtyWorktrees.length > 0) {
+        text += `\n\n⚠️ *Worktrees con cambios detectados (conservados intactos):*\n` +
+          dirtyWorktrees.map((w) => `• Rama: \`${w.branch}\` (${w.reason})`).join('\n');
+      }
+
+      if (cleanWorktrees && cleanWorktrees.length > 0 && wsId) {
+        text += `\n\n🧹 Se detectaron *${cleanWorktrees.length}* worktree(s) temporales de Claude sin cambios.\n¿Deseas purgarlos para liberar espacio en disco?`;
+        keyboard = new InlineKeyboard()
+          .text(`🧹 Purgar ${cleanWorktrees.length} worktree(s) limpios`, `rc_clean:${wsId}`)
+          .text('📁 Conservar', 'rc_keep');
+      }
+    } catch (err) {
+      console.warn(`[claude-stop] Error inspeccionando worktrees: ${err.message}`);
+    }
+  }
+
+  return { text, keyboard };
+}
+
+/**
  * Construye el bot con todos sus handlers registrados. No abre conexiones ni
  * toca el lockfile: eso es cosa de `main()`.
  */
@@ -468,7 +525,7 @@ Puente móvil autónomo conectado a tu entorno local.
 • `/plan <instrucción>` — Genera un plan de acción de solo lectura con botón para aprobarlo.
 • `/run <instrucción>` — Abre una sesión nueva y ejecuta, permitiendo edición de código y tests.
 • `/resume <instrucción>` — Continúa la sesión de trabajo actual.
-• `/claude` — Inicia o gestiona una sesión de Claude Code con Remote Control en tus workspaces.
+• `/claude` — Inicia o gestiona sesiones de Claude Code (\`/claude stop\`, \`/claude clean\`, \`/claude status\`).
 • `/status` — Consulta estado del binario, versión, sesión activa y política de permisos.
 • `/queue` — Muestra la tarea en curso y las encoladas.
 • `/cancel` — Aborta la tarea en curso y vacía la cola.
@@ -482,14 +539,55 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
   });
 
   bot.command('claude', async (ctx) => {
-    const sub = ctx.match?.trim().toLowerCase();
+    const rawMatch = ctx.match?.trim() || '';
+    const parts = rawMatch.split(/\s+/).filter(Boolean);
+    const sub = parts[0]?.toLowerCase();
+    const targetArg = parts.slice(1).join(' ').trim();
 
     if (sub === 'stop') {
       const res = stopClaudeRemoteSession();
-      if (!res.success) {
-        return sendSafeChunk(ctx, `⚠️ ${res.error}`);
+      const { text, keyboard } = buildStopMessageAndKeyboard(res);
+      return sendSafeChunk(ctx, text, keyboard ? { reply_markup: keyboard } : undefined);
+    }
+
+    if (sub === 'clean') {
+      const workspaces = getKnownWorkspaces();
+      let ws = null;
+      if (targetArg) {
+        const lowerArg = targetArg.toLowerCase();
+        ws = workspaces.find((w) => String(w.id) === lowerArg || String(w.numericId) === lowerArg || w.name.toLowerCase() === lowerArg);
+        if (!ws) {
+          return sendSafeChunk(
+            ctx,
+            `⚠️ *Workspace no encontrado o no autorizado*\n\n` +
+            `El identificador \`${targetArg}\` no coincide con ningún proyecto autorizado.\n` +
+            `Usa \`/claude\` para ver tus proyectos permitidos.`
+          );
+        }
+      } else {
+        const active = getActiveClaudeSession();
+        if (active) {
+          ws = workspaces.find((w) => path.resolve(w.path).toLowerCase() === path.resolve(active.projectPath).toLowerCase());
+        }
+        if (!ws) {
+          return sendSafeChunk(
+            ctx,
+            'ℹ️ Especifica qué proyecto deseas limpiar. Ejemplo:\n' +
+            '`/claude clean <nombre_o_id>`\n' +
+            'O escribe `/claude` para ver tus proyectos autorizados.'
+          );
+        }
       }
-      return sendSafeChunk(ctx, `🛑 *Sesión de Claude Code finalizada* (PID: ${res.pid}).\nEl túnel de Remote Control ha sido cerrado.`);
+
+      const pruneRes = pruneCleanClaudeWorktrees(ws.path);
+      let msg = `🧹 *Limpieza de worktrees en ${ws.name}*\n` +
+        `• Worktrees limpios purgados: *${pruneRes.removedCount}*\n` +
+        `• Worktrees con cambios preservados: *${pruneRes.preservedCount}*`;
+      if (pruneRes.preservedCount > 0) {
+        msg += `\n\n⚠️ *Worktrees conservados intactos:*\n` +
+          pruneRes.preservedWorktrees.map((w) => `• Rama: \`${w.branch}\` (${w.reason})`).join('\n');
+      }
+      return sendSafeChunk(ctx, msg);
     }
 
     if (sub === 'status') {
@@ -510,10 +608,10 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
       return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
     }
 
-    // Si se pasa un argumento que no es status ni stop, validar contra Project Allowlist (sin interpolar input crudo)
+    // Si se pasa un argumento que no es status, stop ni clean, validar contra Project Allowlist (sin interpolar input crudo)
     if (sub) {
       const workspaces = getKnownWorkspaces();
-      const ws = workspaces.find((w) => String(w.id) === sub || w.name.toLowerCase() === sub);
+      const ws = workspaces.find((w) => String(w.id) === sub || String(w.numericId) === sub || w.name.toLowerCase() === sub);
       if (!ws) {
         return sendSafeChunk(
           ctx,
@@ -897,10 +995,35 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
       try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
 
       const res = stopClaudeRemoteSession();
-      if (!res.success) {
-        return sendSafeChunk(ctx, `⚠️ ${res.error}`);
+      const { text, keyboard } = buildStopMessageAndKeyboard(res);
+      return sendSafeChunk(ctx, text, keyboard ? { reply_markup: keyboard } : undefined);
+    }
+
+    if (data.startsWith('rc_clean:')) {
+      const wsId = data.slice('rc_clean:'.length).trim();
+      await ctx.answerCallbackQuery({ text: 'Purgando worktrees limpios...' });
+      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+
+      const workspaces = getKnownWorkspaces();
+      const ws = workspaces.find((w) => String(w.id) === wsId || String(w.numericId) === wsId);
+      if (!ws) {
+        return sendSafeChunk(ctx, '⚠️ No se encontró el proyecto asociado a la limpieza.');
       }
-      return sendSafeChunk(ctx, `🛑 *Sesión de Claude Code finalizada* (PID: ${res.pid}).\nEl túnel de Remote Control ha sido cerrado.`);
+
+      const pruneRes = pruneCleanClaudeWorktrees(ws.path);
+      let msg = `🧹 *Limpieza de worktrees completada en ${ws.name}*\n` +
+        `• Se eliminaron *${pruneRes.removedCount}* worktree(s) limpios.`;
+      if (pruneRes.preservedCount > 0) {
+        msg += `\n\n⚠️ *Worktrees conservados por tener cambios o commits:*\n` +
+          pruneRes.preservedWorktrees.map((w) => `• Rama: \`${w.branch}\` (${w.reason})`).join('\n');
+      }
+      return sendSafeChunk(ctx, msg);
+    }
+
+    if (data === 'rc_keep') {
+      await ctx.answerCallbackQuery({ text: 'Worktrees conservados.' });
+      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+      return sendSafeChunk(ctx, '📁 *Worktrees temporales conservados sin cambios.*');
     }
 
     if (data === 'rc_list') {
