@@ -8,7 +8,7 @@ import { runAgyTask, getAgyStatus, resolveWorkspace, resolveExtraDirs } from './
 import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk, formatElapsed, finalProgressLabel } from './formatter.js';
 import { redactSecrets } from './policy.js';
 import { startLogRotation } from './logrotate.js';
-import { resolveDataFile, legacyDataFile, loadBridgeEnv, describeEnvSearch } from './paths.js';
+import { resolveDataFile, legacyDataFile, loadBridgeEnv, describeEnvSearch, bridgeDataDirPath } from './paths.js';
 import {
   getConversationId,
   setConversationId,
@@ -22,7 +22,8 @@ import {
   getKnownWorkspaces,
   launchClaudeRemoteSession,
   stopClaudeRemoteSession,
-  getActiveClaudeSession
+  getActiveClaudeSession,
+  isPidAlive
 } from './claude-launcher.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -531,11 +532,10 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
         return sendSafeChunk(ctx, `❌ *No se pudo iniciar Claude Code:*\n${launch.error}`);
       }
 
-      const keyboard = new InlineKeyboard()
-        .text('🛑 Detener sesión', 'rc_stop')
-        .text('🔄 Ver workspaces', 'rc_list');
-
       if (launch.alreadyRunning) {
+        const keyboard = new InlineKeyboard()
+          .text('🛑 Detener sesión', 'rc_stop')
+          .text('🔄 Ver workspaces', 'rc_list');
         const msg = `ℹ️ *Sesión de Claude Code ya activa*\n\n` +
           `Ya existe un proceso de Remote Control en ejecución para este workspace${launch.source === 'tmux' ? ' (en sesión de tmux)' : ''}:\n` +
           `• *Proyecto:* \`${launch.projectPath}\`\n` +
@@ -546,12 +546,47 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
         return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
       }
 
+      // Verificación de estabilidad inicial: esperar 800ms para confirmar que el proceso no muera por trust/auth
+      await new Promise((r) => setTimeout(r, 800));
+      if (!isPidAlive(launch.pid)) {
+        let errorDetail = '';
+        try {
+          const logContent = fs.readFileSync(path.join(bridgeDataDirPath(), 'claude-session.log'), 'utf8');
+          const lines = logContent.trim().split(/\r?\n/).slice(-6);
+          errorDetail = lines.join('\n');
+        } catch {}
+
+        return sendSafeChunk(
+          ctx,
+          `❌ *El proceso de Claude Code se cerró al arrancar*\n\n` +
+          `El proceso (PID \`${launch.pid}\`) terminó de forma prematura.\n\n` +
+          (errorDetail ? `*Salida de error detectada:*\n\`\`\`\n${errorDetail}\n\`\`\`\n\n` : '') +
+          `💡 Abre una terminal en \`${launch.projectPath}\` y ejecuta \`claude\` para aceptar los permisos o diálogo de confianza.`
+        );
+      }
+
+      let envUrl = null;
+      try {
+        const logContent = fs.readFileSync(path.join(bridgeDataDirPath(), 'claude-session.log'), 'utf8');
+        const match = logContent.match(/https:\/\/claude\.ai\/code\?environment=(env_[a-zA-Z0-9_-]+)/g);
+        if (match && match.length > 0) {
+          envUrl = match[match.length - 1];
+        }
+      } catch {}
+
+      const keyboard = new InlineKeyboard();
+      if (envUrl) {
+        keyboard.url('📲 Abrir en Claude', envUrl).row();
+      }
+      keyboard.text('🛑 Detener sesión', 'rc_stop').text('🔄 Ver workspaces', 'rc_list');
+
       const msg = `🚀 *Sesión de Claude Code iniciada con éxito*\n\n` +
         `• *Proyecto:* \`${launch.projectPath}\`\n` +
         `• *Nombre:* \`${launch.sessionName}\`\n` +
         `• *PID:* \`${launch.pid}\`\n` +
         `• *Modo:* \`${launch.spawnMode || 'same-dir'}\`\n\n` +
-        `📲 *Abre la app de Claude en tu teléfono* (o claude.ai/code) en la sección **Remote Control** para interactuar.\n\n` +
+        (envUrl ? `🔗 [Abrir en Claude App o Web](${envUrl})\n\n` : '') +
+        `📲 *Abre la app de Claude en tu teléfono* (o pulsa el botón de abajo) para interactuar.\n\n` +
         `_Para detenerla más tarde, escribe_ \`/claude stop\` _o pulsa el botón de abajo._`;
 
       return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
@@ -799,9 +834,8 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
         return sendSafeChunk(ctx, `❌ *No se pudo iniciar Claude Code:*\n${launch.error}`);
       }
 
-      const keyboard = new InlineKeyboard().text('🛑 Detener sesión', 'rc_stop');
-
       if (launch.alreadyRunning) {
+        const keyboard = new InlineKeyboard().text('🛑 Detener sesión', 'rc_stop');
         const msg = `ℹ️ *Sesión de Claude Code ya activa*\n\n` +
           `Ya existe un proceso de Remote Control en ejecución para este workspace${launch.source === 'tmux' ? ' (en sesión de tmux)' : ''}:\n` +
           `• *Proyecto:* \`${launch.projectPath}\`\n` +
@@ -812,12 +846,47 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
         return sendSafeChunk(ctx, msg, { reply_markup: keyboard });
       }
 
+      // Verificación de estabilidad inicial: esperar 800ms para confirmar que el proceso no muera por trust/auth
+      await new Promise((r) => setTimeout(r, 800));
+      if (!isPidAlive(launch.pid)) {
+        let errorDetail = '';
+        try {
+          const logContent = fs.readFileSync(path.join(bridgeDataDirPath(), 'claude-session.log'), 'utf8');
+          const lines = logContent.trim().split(/\r?\n/).slice(-6);
+          errorDetail = lines.join('\n');
+        } catch {}
+
+        return sendSafeChunk(
+          ctx,
+          `❌ *El proceso de Claude Code se cerró al arrancar*\n\n` +
+          `El proceso (PID \`${launch.pid}\`) terminó de forma prematura.\n\n` +
+          (errorDetail ? `*Salida de error detectada:*\n\`\`\`\n${errorDetail}\n\`\`\`\n\n` : '') +
+          `💡 Abre una terminal en \`${launch.projectPath}\` y ejecuta \`claude\` para aceptar los permisos o diálogo de confianza.`
+        );
+      }
+
+      let envUrl = null;
+      try {
+        const logContent = fs.readFileSync(path.join(bridgeDataDirPath(), 'claude-session.log'), 'utf8');
+        const match = logContent.match(/https:\/\/claude\.ai\/code\?environment=(env_[a-zA-Z0-9_-]+)/g);
+        if (match && match.length > 0) {
+          envUrl = match[match.length - 1];
+        }
+      } catch {}
+
+      const keyboard = new InlineKeyboard();
+      if (envUrl) {
+        keyboard.url('📲 Abrir en Claude', envUrl).row();
+      }
+      keyboard.text('🛑 Detener sesión', 'rc_stop');
+
       const msg = `🚀 *Sesión de Claude Code iniciada con éxito*\n\n` +
         `• *Proyecto:* \`${launch.projectPath}\`\n` +
         `• *Nombre:* \`${launch.sessionName}\`\n` +
         `• *PID:* \`${launch.pid}\`\n` +
         `• *Modo:* \`${launch.spawnMode || 'same-dir'}\`\n\n` +
-        `📲 *Abre la app de Claude en tu teléfono* (o claude.ai/code) en la sección **Remote Control** para interactuar.\n\n` +
+        (envUrl ? `🔗 [Abrir en Claude App o Web](${envUrl})\n\n` : '') +
+        `📲 *Abre la app de Claude en tu teléfono* (o pulsa el botón de abajo) para interactuar.\n\n` +
         `_Para detenerla más tarde, escribe_ \`/claude stop\` _o pulsa el botón de abajo._`;
 
       return sendSafeChunk(ctx, msg, { reply_markup: keyboard });

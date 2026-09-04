@@ -1156,8 +1156,10 @@ console.log('✔ Test 41 [FEAT-003 / BE-009]: Persistencia y liveliness check de
     'Argumentos deben ser [remote-control, --name, sessionName, --spawn=same-dir]'
   );
   assert.strictEqual(call.opts.cwd, dirTmp, 'cwd debe ser workspacePath');
-  assert.strictEqual(call.opts.detached, true, 'detached debe ser true');
-  assert.strictEqual(call.opts.stdio, 'ignore', 'stdio debe ser ignore');
+  assert(
+    call.opts.stdio === 'ignore' || (Array.isArray(call.opts.stdio) && call.opts.stdio[0] === 'ignore'),
+    'stdio debe ser ignore o descriptor desacoplado [ignore, fd, fd]'
+  );
 
   // Invariante de seguridad [SEC-005]: el entorno pasado NO debe contener secretos de Telegram
   assert.strictEqual(call.opts.env.TELEGRAM_BOT_TOKEN, undefined, 'TELEGRAM_BOT_TOKEN no debe heredarse');
@@ -1563,6 +1565,31 @@ console.log('✔ Test 47 [FEAT-001 / BE-008]: Cambio de proyecto (F-03) reemplaz
   assert.strictEqual(resDenied.success, false, 'Debe fallar ante proyecto no autorizado');
   assert(resDenied.error.includes('Project Allowlist'), 'Debe reportar que no pertenece a la Project Allowlist');
   assert.strictEqual(unauthorizedSpawnInvoked, false, 'No debe invocar spawnFn bajo ninguna circunstancia');
+
+  // 1.4 F-06 / F-07: Comprobar fusión de trust status y rechazo si hasTrustDialogAccepted es false
+  const dirUntrusted = path.join(dirBase, 'proj-untrusted');
+  fs.mkdirSync(dirUntrusted, { recursive: true });
+  const mockClaudeTrustJson = path.join(dirBase, 'claude-trust.json');
+  fs.writeFileSync(mockClaudeTrustJson, JSON.stringify({
+    projects: {
+      [dirUntrusted]: { hasTrustDialogAccepted: false },
+      [dirProjA.toLowerCase()]: { hasTrustDialogAccepted: false },
+      [dirProjA]: { hasTrustDialogAccepted: true, remoteControlSpawnMode: 'worktree' }
+    }
+  }, null, 2));
+
+  const allowlistMerged = claudeLauncher.getProjectAllowlist({ claudeJsonPath: mockClaudeTrustJson });
+  const mergedA = allowlistMerged.find((w) => w.path.toLowerCase() === dirProjA.toLowerCase());
+  assert(mergedA !== undefined, 'dirProjA debe estar en la lista');
+  assert.strictEqual(mergedA.hasTrustDialogAccepted, true, 'Debe fusionar a true si alguna entrada aceptó trust');
+  assert.strictEqual(mergedA.spawnMode, 'worktree', 'Debe adoptar el spawnMode explícito');
+
+  const resUntrusted = claudeLauncher.launchClaudeRemoteSession({
+    workspacePath: dirUntrusted,
+    allowlistOptions: { claudeJsonPath: mockClaudeTrustJson }
+  });
+  assert.strictEqual(resUntrusted.success, false);
+  assert(resUntrusted.error.includes('Workspace no confiable'), 'Debe reportar workspace no confiable');
 
   // --- Parte 2: Idempotencia del Spawn (Una sesión por proyecto) ---
   // 2.1 Idempotencia por Bridge State

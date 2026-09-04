@@ -4,6 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { sanitizeEnv, isPathDenied } from './policy.js';
+import { bridgeDataDirPath } from './paths.js';
 import {
   getActiveClaudeSession,
   setActiveClaudeSession,
@@ -265,8 +266,7 @@ export function getProjectAllowlist({
   }
 
   const isWin = process.platform === 'win32';
-  const seenPaths = new Set();
-  const validWorkspaces = [];
+  const workspacesByDedup = new Map();
 
   for (const rawPath of Object.keys(rawProjects)) {
     if (!rawPath || typeof rawPath !== 'string') continue;
@@ -279,13 +279,16 @@ export function getProjectAllowlist({
       continue;
     }
 
-    // Normalizar a ruta completa canónica
-    const normalized = path.resolve(path.normalize(trimmed));
-
-    // Deduplicación insensible a mayúsculas en Windows
-    const dedupKey = isWin ? normalized.toLowerCase() : normalized;
-    if (seenPaths.has(dedupKey)) {
-      continue;
+    // Normalizar a ruta completa canónica con el casing oficial del sistema de archivos
+    let normalized = path.resolve(path.normalize(trimmed));
+    if (isWin) {
+      try {
+        normalized = fs.realpathSync.native(normalized);
+      } catch {
+        if (/^[a-z]:/i.test(normalized)) {
+          normalized = normalized[0].toUpperCase() + normalized.slice(1);
+        }
+      }
     }
 
     // Comprobar existencia física en disco
@@ -316,21 +319,38 @@ export function getProjectAllowlist({
       }
     }
 
-    seenPaths.add(dedupKey);
-
+    const dedupKey = isWin ? normalized.toLowerCase() : normalized;
     const projectConfig = (rawProjects[rawPath] && typeof rawProjects[rawPath] === 'object')
       ? rawProjects[rawPath]
       : {};
-    const spawnMode = projectConfig.remoteControlSpawnMode || 'same-dir';
 
-    const base = path.basename(normalized) || normalized;
-    validWorkspaces.push({
-      path: normalized,
-      name: base,
-      parent: path.basename(path.dirname(normalized)) || '',
-      spawnMode
-    });
+    const existing = workspacesByDedup.get(dedupKey);
+    if (existing) {
+      // F-07: Si hay múltiples entradas en .claude.json para la misma ruta física
+      // (ej. c:/ vs C:\), fusionar preferencias dando prioridad a hasTrustDialogAccepted: true
+      // y configuraciones explícitas de remoteControlSpawnMode.
+      if (projectConfig.hasTrustDialogAccepted === true) {
+        existing.hasTrustDialogAccepted = true;
+      }
+      if (projectConfig.remoteControlSpawnMode) {
+        existing.spawnMode = projectConfig.remoteControlSpawnMode;
+      }
+      if (isWin && /^[A-Z]:/.test(normalized)) {
+        existing.path = normalized;
+      }
+    } else {
+      const base = path.basename(normalized) || normalized;
+      workspacesByDedup.set(dedupKey, {
+        path: normalized,
+        name: base,
+        parent: path.basename(path.dirname(normalized)) || '',
+        spawnMode: projectConfig.remoteControlSpawnMode || 'same-dir',
+        hasTrustDialogAccepted: projectConfig.hasTrustDialogAccepted ?? true
+      });
+    }
   }
+
+  const validWorkspaces = Array.from(workspacesByDedup.values());
 
   // Contar frecuencias del nombre base para desambiguar displayName si hay colisiones
   const nameCounts = new Map();
@@ -353,7 +373,8 @@ export function getProjectAllowlist({
       path: ws.path,
       name: ws.name,
       displayName,
-      spawnMode: ws.spawnMode
+      spawnMode: ws.spawnMode,
+      hasTrustDialogAccepted: ws.hasTrustDialogAccepted
     };
   });
 }
@@ -412,7 +433,8 @@ export function launchClaudeRemoteSession({
   stopOptions = {},
   allowlistOptions = {},
   skipAllowlistCheck = false,
-  findExistingFn = findExistingClaudeSession
+  findExistingFn = findExistingClaudeSession,
+  stdio = null
 } = {}) {
   if (!workspacePath || typeof workspacePath !== 'string' || !fs.existsSync(workspacePath)) {
     return {
@@ -429,20 +451,35 @@ export function launchClaudeRemoteSession({
     };
   }
 
+  // Obtener metadatos consolidados del workspace desde la Project Allowlist
+  const isWin = process.platform === 'win32';
+  const allowlist = getProjectAllowlist(allowlistOptions);
+  const targetKey = isWin ? path.resolve(workspacePath).toLowerCase() : path.resolve(workspacePath);
+  const targetWs = allowlist.find((w) => (isWin ? w.path.toLowerCase() : w.path) === targetKey);
+  const canonicalPath = (targetWs && targetWs.path) || workspacePath;
+
+  // F-06: Validar si el workspace tiene aceptado el diálogo de confianza en Claude Code
+  if (targetWs && targetWs.hasTrustDialogAccepted === false) {
+    return {
+      success: false,
+      error: `Workspace no confiable en Claude Code: Abre una terminal en '${canonicalPath}' y ejecuta 'claude' para aceptar el diálogo de confianza antes de usar Remote Control.`
+    };
+  }
+
   const effectiveSessionName = (typeof sessionName === 'string' && sessionName.trim().length > 0)
     ? sessionName.trim()
-    : `Mobile-${path.basename(workspacePath)}`;
+    : `Mobile-${path.basename(canonicalPath)}`;
 
   const effectiveSpawnMode = (typeof spawnMode === 'string' && spawnMode.trim().length > 0)
     ? spawnMode.trim()
-    : 'same-dir';
+    : ((targetWs && targetWs.spawnMode) || 'same-dir');
 
   // 2. Idempotencia: Verificar si ya hay una sesión viva para este proyecto (en bridge, Claude pointer o tmux)
-  const existing = findExistingFn(workspacePath);
+  const existing = findExistingFn(canonicalPath);
   if (existing) {
     setActiveClaudeSession({
       pid: existing.pid,
-      projectPath: workspacePath,
+      projectPath: canonicalPath,
       sessionName: existing.sessionName || effectiveSessionName,
       spawnMode: existing.spawnMode || effectiveSpawnMode
     });
@@ -452,7 +489,7 @@ export function launchClaudeRemoteSession({
       alreadyRunning: true,
       pid: existing.pid,
       sessionName: existing.sessionName || effectiveSessionName,
-      projectPath: workspacePath,
+      projectPath: canonicalPath,
       source: existing.source,
       environmentId: existing.environmentId,
       spawnMode: existing.spawnMode || effectiveSpawnMode
@@ -474,7 +511,6 @@ export function launchClaudeRemoteSession({
   }
 
   // F-02: En Windows Node 20+, invocar .cmd/.bat con shell: false lanza EINVAL (CVE-2024-27980)
-  const isWin = process.platform === 'win32';
   const isCmdWrapper = isWin && /\.(cmd|bat)$/i.test(claudeBin);
 
   const spawnBin = isCmdWrapper ? (process.env.ComSpec || 'cmd.exe') : claudeBin;
@@ -482,23 +518,39 @@ export function launchClaudeRemoteSession({
     ? ['/d', '/s', '/c', claudeBin, 'remote-control', '--name', effectiveSessionName, `--spawn=${effectiveSpawnMode}`]
     : ['remote-control', '--name', effectiveSessionName, `--spawn=${effectiveSpawnMode}`];
 
+  // Redirigir stdout y stderr a un log para trazabilidad, captura de URL y diagnóstico
+  let logFd = null;
+  if (!stdio) {
+    try {
+      const logDir = bridgeDataDirPath();
+      fs.mkdirSync(logDir, { recursive: true });
+      logFd = fs.openSync(path.join(logDir, 'claude-session.log'), 'a');
+    } catch {}
+  }
+  const effectiveStdio = stdio || (logFd !== null ? ['ignore', logFd, logFd] : 'ignore');
+
   let child;
   try {
     child = spawnFn(
       spawnBin,
       spawnArgs,
       {
-        cwd: workspacePath,
+        cwd: canonicalPath,
         detached: true,
-        stdio: 'ignore',
+        stdio: effectiveStdio,
         env: sanitizeEnv()
       }
     );
   } catch (err) {
+    if (logFd !== null) { try { fs.closeSync(logFd); } catch {} }
     return {
       success: false,
       error: `Error al invocar spawn sobre Claude: ${err.message}`
     };
+  }
+
+  if (logFd !== null) {
+    try { fs.closeSync(logFd); } catch {}
   }
 
   // F-01: Proteger el daemon contra eventos de error no capturados en el proceso hijo
@@ -507,11 +559,22 @@ export function launchClaudeRemoteSession({
     clearActiveClaudeSession();
   });
 
+  // Limpiar sesión activa si el proceso hijo finaliza de forma anticipada
+  child.on?.('exit', (code, signal) => {
+    if (code !== 0 && code !== null) {
+      console.warn(`[claude-launcher] Proceso de Claude (PID ${child.pid}) finalizó (código: ${code}, señal: ${signal})`);
+    }
+    const current = getActiveClaudeSession();
+    if (current && current.pid === child.pid) {
+      clearActiveClaudeSession();
+    }
+  });
+
   child.unref?.();
 
   setActiveClaudeSession({
     pid: child.pid,
-    projectPath: workspacePath,
+    projectPath: canonicalPath,
     sessionName: effectiveSessionName,
     spawnMode: effectiveSpawnMode
   });
@@ -520,7 +583,7 @@ export function launchClaudeRemoteSession({
     success: true,
     pid: child.pid,
     sessionName: effectiveSessionName,
-    projectPath: workspacePath,
+    projectPath: canonicalPath,
     spawnMode: effectiveSpawnMode
   };
 }
