@@ -107,6 +107,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 |---------|-------------|
 | `/lagrange:run <prompt>` | Delegate any task to Antigravity (read + write) |
 | `/lagrange:plan <task>` | Generate an architectural plan (read-only, no file changes) |
+| `/lagrange:fanout [plan]` | Run atomic tasks in parallel, one Antigravity subagent per isolated git worktree |
 | `/lagrange:review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
 | `/lagrange:audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
 | `/lagrange:summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
@@ -123,11 +124,12 @@ at startup - a restart is what makes `agy_run` and friends appear.
 
 ## 🔧 MCP Tools Reference
 
-Seventeen tools exposed via the MCP server — thirteen `agy_*` tools plus four `telegram_*` bridge tools:
+Eighteen tools exposed via the MCP server — fourteen `agy_*` tools plus four `telegram_*` bridge tools:
 
 | Tool | Mode | Default Timeout | Description |
 |------|------|-----------------|-------------|
 | `agy_run` | read + write | 15m | Execute a full subagent session with optional permission guardrails |
+| `agy_fanout` | read + write | 15m/subagent | Concurrent fan-out: validates the tasks are disjoint in files, one worktree + branch each, batched with a concurrency cap and quota backoff |
 | `agy_plan` | read-only | 15m | Step-by-step architectural / implementation plan without modifying files |
 | `agy_review` | read-only | 20m | Adversarial code review on git diffs or specific files |
 | `agy_audit` | read-only | 25m | Rigorous adversarial audit with severity rubric (BLOCKER, MAJOR, MINOR) |
@@ -177,6 +179,11 @@ Seventeen tools exposed via the MCP server — thirteen `agy_*` tools plus four 
 Denying `"network"` blocks web search and URL fetching, and makes `agy_research` fail with an explicit error instead of answering from memory.
 
 **Scope:** the policy applies to every delegating tool — `agy_run` plus the read-only ones (`agy_plan`, `agy_review`, `agy_audit`, `agy_research`, `agy_session_summary`). The read-only tools are locked to `--mode plan`, so `edit` is denied there regardless of policy, but `commands`, `network`, `deny_paths`, `deny_commands` and `sandbox` are enforced — which matters, because plan mode by itself does *not* stop a subagent from reading `.env` or running `git push`. Each tool's output footer prints the policy it actually ran under.
+
+> [!IMPORTANT]
+> **How these are enforced, and how far that goes.** Only three things reach the CLI as real flags: `--mode plan`, `--sandbox` and `--dangerously-skip-permissions`. Everything else — `allow`, `deny`, `deny_paths`, `deny_commands` — is injected as natural-language guardrails at the top of the subagent's prompt. They shape behavior reliably in practice, but they are instructions to a model, not a sandbox: treat them as hygiene and blast-radius reduction, **not** as a security boundary against a determined or malfunctioning agent. The only read-only with structural enforcement is `mode: "plan"`.
+>
+> **`sandbox: true` is narrower than it sounds, and on Windows it is actively harmful.** Its own help text says *"terminal restrictions"*, and that is exactly what it is: measured on `agy` v1.1.26, it blocks shell reads, shell writes and `curl`, while the native tools walk straight past it — the subagent still writes files, still reads absolute paths outside its workspace, and still fetches URLs. Worse, it mounts a jail over the working directory, so a `cwd` you passed is ignored and writes land in the main repository instead; it triggers a UAC elevation prompt, which rules out headless or concurrent use; and it leaves a mount that outlives the process. Full evidence in `docs/future-implementations/subagentes-concurrentes-agy.md`. If you want to confine a subagent's writes, give it a git worktree via `cwd` — that is what `agy_fanout` does, and it does not expose `sandbox` at all.
 
 ### Per-Call Example
 

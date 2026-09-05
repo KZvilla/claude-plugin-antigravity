@@ -104,8 +104,12 @@ function main() {
     // de `/` de todos los usuarios del plugin y compite por su atencion. Que
     // este numero falle al anadir uno obliga a justificar el alta en vez de
     // dejar que la superficie crezca sola.
-    check('eleven commands present', commands.length === 11, `found ${commands.length}: ${commands.join(', ')}`);
-    check('four skills present', skills.length === 4, `found ${skills.length}: ${skills.join(', ')}`);
+    // 2026-09-04: sube a 12 y 5 con el alta de `fanout`, que gana su sitio en el
+    // menu porque orquesta un ciclo completo (validar reparto, worktrees,
+    // concurrencia con backoff, auditoria, tests, merge) que no se puede pedir
+    // con una llamada suelta a agy_run.
+    check('twelve commands present', commands.length === 12, `found ${commands.length}: ${commands.join(', ')}`);
+    check('five skills present', skills.length === 5, `found ${skills.length}: ${skills.join(', ')}`);
     check('no command carries the redundant agy- prefix',
       commands.every(c => !c.startsWith('agy-')), commands.filter(c => c.startsWith('agy-')).join(', '));
     check('no skill is named after the plugin',

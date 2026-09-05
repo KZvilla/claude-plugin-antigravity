@@ -22,6 +22,7 @@ const { preprocessSessionLog, renderFacts, renderFinalState } = require('./sessi
 const { getSummaryPrompt, recuperarDocumentoEnlazado, validarDocumento, separarDigest, MARCA_DIGEST } = require('./summary-doc.js');
 const { executeAgyStdin } = require('./agy-stream.js');
 const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
+const { lanzarFanout } = require('./fanout.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -163,6 +164,89 @@ function getUsageFilePath() {
   return path.join(homeDir, '.claude', 'antigravity-usage.json');
 }
 
+function getUsageLockFilePath() {
+  return `${getUsageFilePath()}.lock`;
+}
+
+// ==============================================================================
+// Exclusión mutua entre procesos sobre el fichero de uso
+// ==============================================================================
+//
+// Dentro de un mismo proceso no hay carrera: `recordUsage` es enteramente
+// síncrona, así que el event loop no puede interleavear dos ciclos
+// leer-modificar-escribir. El riesgo es ENTRE procesos: cada sesión de Claude
+// Code levanta su propio servidor MCP y todas escriben el mismo
+// ~/.claude/antigravity-usage.json. Con fan-out de subagentes concurrentes eso
+// pasa de improbable a rutinario.
+//
+// Aparte de la carrera, `writeFileSync` directo sobre el destino no es atómico:
+// un corte a mitad deja JSON truncado, y el `catch` de `loadUsage` lo trataba
+// como fichero ausente y devolvía contadores a cero. Se perdía el histórico sin
+// una sola señal. Por eso ahora se escribe a temporal y se renombra.
+//
+// Mismo patrón que telegram-bridge/state.js, que ya resolvió esto para
+// state.json.
+
+const USAGE_LOCK_STALE_MS = 5000;
+const USAGE_LOCK_WAIT_MS = 2000;
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireUsageLock() {
+  const deadline = Date.now() + USAGE_LOCK_WAIT_MS;
+
+  for (;;) {
+    try {
+      return fs.openSync(getUsageLockFilePath(), 'wx');
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        process.stderr.write(`[antigravity-mcp] No se pudo tomar el lock de uso: ${err.message}. Se escribe sin exclusión.\n`);
+        return null;
+      }
+      try {
+        if (Date.now() - fs.statSync(getUsageLockFilePath()).mtimeMs > USAGE_LOCK_STALE_MS) {
+          fs.unlinkSync(getUsageLockFilePath());
+          continue;
+        }
+      } catch {
+        continue; // el lock desapareció entre el stat y ahora: reintentar
+      }
+      if (Date.now() >= deadline) {
+        process.stderr.write('[antigravity-mcp] Lock de uso ocupado más de lo razonable. Se escribe sin exclusión.\n');
+        return null;
+      }
+      sleepSync(20);
+    }
+  }
+}
+
+function releaseUsageLock(fd) {
+  if (fd === null) return;
+  try { fs.closeSync(fd); } catch {}
+  try { fs.unlinkSync(getUsageLockFilePath()); } catch {}
+}
+
+/**
+ * Escritura atómica: temporal + rename. El rename sí es atómico dentro del mismo
+ * volumen, así que ningún lector ve jamás un JSON a medio escribir.
+ * `usageFile` se descarta al persistir: `loadUsage` lo reinyecta en cada lectura
+ * y no tiene por qué acabar guardado dentro del propio fichero.
+ */
+function writeUsageAtomic(data) {
+  const usageFile = getUsageFilePath();
+  const { usageFile: _rutaDescartada, ...persistible } = data;
+  const tmp = `${usageFile}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(persistible, null, 2), 'utf8');
+    fs.renameSync(tmp, usageFile);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw err;
+  }
+}
+
 function loadUsage() {
   const usageFile = getUsageFilePath();
   const today = new Date().toISOString().slice(0, 10);
@@ -196,19 +280,28 @@ function loadUsage() {
         data.today = { date: today, total_calls: 0, total_tokens: 0, total_duration_seconds: 0 };
       }
       return { ...defaultUsage, ...data, usageFile };
-    } catch {}
+    } catch (err) {
+      // Hasta ahora este catch era mudo: un JSON corrupto devolvía los
+      // contadores a cero sin dejar rastro de que se había perdido el histórico.
+      process.stderr.write(`[antigravity-mcp] ${usageFile} ilegible (${err.message}); se parte de contadores en cero.\n`);
+    }
   }
 
   return { ...defaultUsage, usageFile };
 }
 
 function recordUsage(tool, model, effort, conversationId, durationSeconds, usage, isError = false, errorMsg = '') {
+  let fd = null;
   try {
-    const usageFile = getUsageFilePath();
-    const claudeDir = path.dirname(usageFile);
+    const claudeDir = path.dirname(getUsageFilePath());
     if (!fs.existsSync(claudeDir)) {
       fs.mkdirSync(claudeDir, { recursive: true });
     }
+
+    // El lock se toma antes de leer: el ciclo entero leer-modificar-escribir va
+    // dentro, no solo la escritura. Leer fuera y escribir dentro seguiría
+    // perdiendo la actualización de otro proceso.
+    fd = acquireUsageLock();
 
     const data = loadUsage();
     const dur = typeof durationSeconds === 'number' ? durationSeconds : 0;
@@ -254,14 +347,15 @@ function recordUsage(tool, model, effort, conversationId, durationSeconds, usage
       }
     };
 
-    fs.writeFileSync(usageFile, JSON.stringify(data, null, 2), 'utf8');
+    writeUsageAtomic(data);
   } catch (err) {
     process.stderr.write(`[antigravity-mcp] Failed to record usage: ${err.message}\n`);
+  } finally {
+    releaseUsageLock(fd);
   }
 }
 
 function resetUsage() {
-  const usageFile = getUsageFilePath();
   const today = new Date().toISOString().slice(0, 10);
   const fresh = {
     session_started_at: new Date().toISOString(),
@@ -285,9 +379,19 @@ function resetUsage() {
     quota_status: 'HEALTHY'
   };
 
+  let fd = null;
   try {
-    fs.writeFileSync(usageFile, JSON.stringify(fresh, null, 2), 'utf8');
-  } catch {}
+    const claudeDir = path.dirname(getUsageFilePath());
+    if (!fs.existsSync(claudeDir)) {
+      fs.mkdirSync(claudeDir, { recursive: true });
+    }
+    fd = acquireUsageLock();
+    writeUsageAtomic(fresh);
+  } catch (err) {
+    process.stderr.write(`[antigravity-mcp] Failed to reset usage: ${err.message}\n`);
+  } finally {
+    releaseUsageLock(fd);
+  }
   return fresh;
 }
 
@@ -507,6 +611,48 @@ const TOOLS = [
         }
       },
       required: ['prompt']
+    }
+  },
+  {
+    name: 'agy_fanout',
+    description: 'Run several Antigravity subagents CONCURRENTLY, one per isolated git worktree, for a plan already broken into atomic tasks. Validates that the tasks are disjoint in files BEFORE spending any quota, resolves a safe base branch (never main/master), creates one worktree and branch per task, and executes them in batches with a concurrency cap and quota backoff. Subagents implement only: they are instructed not to write or run tests, not to merge, and not to spawn subagents. Auditing the diffs, running the tests and merging stay with the caller.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        slug: {
+          type: 'string',
+          description: 'Short name for the batch. Names the base branch (if one must be created), the worktrees and their branches.'
+        },
+        tareas: {
+          type: 'array',
+          description: 'The atomic tasks. They must be disjoint in files: worktrees isolate execution, not integration, so overlapping tasks just move the conflict to merge time. The batch is rejected if any two overlap.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Unique identifier for the task.' },
+              prompt: { type: 'string', description: 'What this subagent must implement.' },
+              archivos: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Repo-relative paths this task is allowed to touch. A trailing "/" marks a whole subtree. Absolute paths and ".." are rejected.'
+              },
+              modelo: { type: 'string', description: 'Per-task model override.' },
+              effort: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Per-task effort override.' },
+              soloLectura: { type: 'boolean', description: 'Run this task in plan mode (the only read-only with real enforcement).' }
+            },
+            required: ['id', 'prompt', 'archivos']
+          }
+        },
+        concurrencia: {
+          type: 'number',
+          description: 'Maximum subagents running at once. Defaults to 3. The cap exists for quota, not CPU.'
+        },
+        modelo: { type: 'string', description: 'Default model for the batch. Defaults to the configured one.' },
+        effort: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Default effort for the batch. Defaults to "high".' },
+        cwd: { type: 'string', description: 'Repository root. Defaults to Claude\'s current working directory.' },
+        timeout_minutes: { type: 'number', description: 'Per-subagent timeout. Defaults to 15.' }
+      },
+      required: ['slug', 'tareas']
     }
   },
   {
@@ -2383,6 +2529,83 @@ async function handleToolCall(name, args) {
       };
     }
 
+    case 'agy_fanout': {
+      const repoPath = args.cwd || process.cwd();
+
+      // El ejecutor que se le inyecta al orquestador arma los mismos argumentos
+      // que agy_run. `--sandbox` no se ofrece a propósito: rompe el aislamiento
+      // por worktree en vez de reforzarlo, y exige UAC (H1 a H3 del documento de
+      // diseño). El confinamiento acá es el worktree.
+      const ejecutar = async (peticion) => {
+        const cliArgs = ['--output-format', 'json', '--dangerously-skip-permissions'];
+        cliArgs.push('--mode', peticion.mode || 'accept-edits');
+        cliArgs.push('--effort', peticion.effort || config.defaultEffort || 'high');
+        const modelo = peticion.model || config.defaultModel;
+        if (modelo) cliArgs.push('--model', modelo);
+        cliArgs.push('-p', peticion.prompt);
+
+        const res = await executeAgy(cliArgs, {
+          cwd: peticion.cwd,
+          timeoutMinutes: peticion.timeout_minutes || config.defaultTimeoutMinutes || 15
+        });
+
+        const datos = res.data || {};
+        recordUsage('run', modelo, peticion.effort, datos.conversation_id || '',
+          datos.duration_seconds || 0, datos.usage, !res.success, res.error || '');
+
+        return { ...res, conversation_id: datos.conversation_id };
+      };
+
+      let salida;
+      try {
+        salida = await lanzarFanout({
+          repoPath,
+          slug: args.slug,
+          tareas: args.tareas,
+          concurrencia: args.concurrencia,
+          modelo: args.modelo,
+          effort: args.effort,
+          timeoutMinutes: args.timeout_minutes
+        }, { ejecutar });
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `No se pudo lanzar el fan-out: ${err.message}` }]
+        };
+      }
+
+      if (!salida.lanzado) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: salida.detalle }]
+        };
+      }
+
+      let texto = `### Fan-out lanzado — ${salida.resumen.total} subagente(s)\n\n`;
+      texto += `- Rama base: \`${salida.ramaBase}\`${salida.ramaBaseCreada ? ' (creada ahora)' : ''}\n`;
+      texto += `- Concurrencia: ${salida.concurrencia} · ${salida.lotes} lote(s)\n`;
+      texto += `- Resultado: ${salida.resumen.exitosas} ok, ${salida.resumen.fallidas} fallidas`;
+      texto += salida.resumen.fallidasPorCuota ? ` (${salida.resumen.fallidasPorCuota} por cuota)\n\n` : '\n\n';
+
+      texto += `| Tarea | Rama | Estado | Intentos | Conversation ID |\n|---|---|---|---|---|\n`;
+      for (const r of salida.resultados) {
+        const estado = r.exito ? 'ok' : (r.porCuota ? 'falló (cuota)' : 'falló');
+        texto += `| \`${r.id}\` | \`${r.rama}\` | ${estado} | ${r.intentos} | ${r.conversation_id || '—'} |\n`;
+      }
+
+      const fallidas = salida.resultados.filter(r => !r.exito);
+      if (fallidas.length) {
+        texto += `\n**Errores:**\n`;
+        for (const r of fallidas) texto += `- \`${r.id}\`: ${r.error}\n`;
+      }
+
+      texto += `\n**Siguiente paso (tuyo, no de los subagentes):** ${salida.siguientePaso}\n`;
+      texto += `\nLos worktrees siguen en \`.claude/worktrees/\`. Cuando termines de integrar, `;
+      texto += `limpiá los que queden sin trabajo pendiente.\n`;
+
+      return { content: [{ type: 'text', text: texto }] };
+    }
+
     case 'agy_run': {
       const effectivePerms = resolvePermissions(args.permissions, config);
       const canEdit = permits(effectivePerms, 'edit');
@@ -2456,7 +2679,13 @@ async function handleToolCall(name, args) {
       formatted += `**Antigravity Execution Details:**\n`;
       if (effectiveModel) formatted += `- Model: \`${effectiveModel}\`\n`;
       formatted += `- Effort: \`${effectiveEffort}\`\n`;
-      formatted += `- Mode: \`${effectiveMode}\` (${canEdit ? 'read/write' : 'read-only'})\n`;
+      // La etiqueta se derivaba solo de los permisos, así que una sesión en
+      // `--mode plan` se anunciaba como (read/write) pese a tener las escrituras
+      // bloqueadas por el propio CLI. Plan mode manda: es el único read-only con
+      // enforcement real, frente a los guardarraíles de permisos, que viajan
+      // como texto en el prompt.
+      const soloLectura = effectiveMode === 'plan' || !canEdit;
+      formatted += `- Mode: \`${effectiveMode}\` (${soloLectura ? 'read-only' : 'read/write'})\n`;
       formatted += `- Permissions Enforced: ${formatPermissionSummary(effectivePerms)}\n`;
       if (conversationId) {
         formatted += `- Conversation ID: \`${conversationId}\` (pass as \`conversation_id\` to continue this thread)\n`;
