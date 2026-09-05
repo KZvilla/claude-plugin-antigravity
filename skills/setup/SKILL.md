@@ -1,6 +1,6 @@
 ---
 name: setup
-description: '[skill, loads itself] Guided setup and troubleshooting for the optional parts of this plugin: the Antigravity CLI itself, local Voicebox TTS, outbound Telegram notifications, and the bidirectional Telegram daemon. /lagrange:setup is the explicit trigger. Use this skill when the user wants to configure, install, connect or fix any of those — or mentions "configurar telegram", "instalar voicebox", "set up the bridge", "no me llegan las notificaciones", "el bot no responde", "how do I get the voice narration working", or asks why a Telegram/voice tool is failing.'
+description: '[skill, loads itself] Guided setup and troubleshooting for the optional parts of this plugin: the Antigravity CLI itself, local Voicebox TTS, outbound Telegram notifications, the bidirectional Telegram daemon, and live agy_fanout progress in the statusline. /lagrange:setup is the explicit trigger. Use this skill when the user wants to configure, install, connect or fix any of those — or mentions "configurar telegram", "instalar voicebox", "set up the bridge", "no me llegan las notificaciones", "el bot no responde", "how do I get the voice narration working", "quiero ver el progreso del fanout", "trackear subagentes en la statusline", or asks why a Telegram/voice tool is failing.'
 license: MIT
 ---
 
@@ -32,7 +32,9 @@ carry on with the steps.
 ## Step 1 — Diagnose before proposing anything
 
 Call these three read-only tools and read the actual state. Never guess, and
-never walk someone through a step they have already completed:
+never walk someone through a step they have already completed. Track E has no
+dedicated status tool — diagnose it by reading `statusLine.command` directly
+(see Track E below).
 
 | Tool | Tells you |
 |---|---|
@@ -40,9 +42,9 @@ never walk someone through a step they have already completed:
 | `mcp__lagrange__agy_narrate_voices` | whether Voicebox is reachable, which voice profiles exist |
 | `mcp__lagrange__telegram_bridge_status` | daemon state, which copy of the code each half runs, the effective `.env` path, shared state |
 
-Report a short status of all four tracks, then work only on what is missing.
+Report a short status of all five tracks, then work only on what is missing.
 
-## Step 2 — The four tracks are independent
+## Step 2 — The five tracks are independent
 
 Present them as such. A linear installer would push someone who only wanted
 desktop notifications into registering a background daemon they do not need.
@@ -53,6 +55,7 @@ desktop notifications into registering a background daemon they do not need.
 | **B. Voicebox** | `agy_narrate`, `agy_say`, voice chat | Yes |
 | **C. Telegram outbound** | `telegram_notify`, `telegram_ask`, voice notes to phone | Yes |
 | **D. Telegram daemon** | messaging the bot *from* the phone, answering `telegram_ask` | Yes — and it needs C |
+| **E. Fanout statusline** | seeing `agy_fanout` progress live, without waiting for the whole batch | Yes — only useful if they use `agy_fanout` |
 
 Ask which ones they want before walking through anything. If they already said
 ("configurar telegram"), do C, mention D exists, and skip B.
@@ -169,6 +172,58 @@ Verify with `telegram_bridge_status`: the service should be `Running` (Windows)
 or `active` (Linux) with a live PID. Then have them send `/status` to the bot
 from their phone. `npm run bridge:daemon` gives the platform-native view, and on
 Linux additionally reports the linger state.
+
+### Track E — Fanout status in the statusline (optional)
+
+`agy_fanout` is a single MCP tool call that can block for 15+ minutes with no
+intermediate feedback. This track makes its progress visible in the
+statusline while it runs, without needing anything from the MCP client beyond
+what `statusLine.command` already supports.
+
+**Diagnose first, and never silently overwrite a customized statusline** —
+this is the one track where "just install it" would actively break something
+the user already has (most commonly `claude-hud`).
+
+1. Read `statusLine.command` from `~/.claude/settings.json`. Three cases:
+   - **Not set** — nothing to preserve; skip straight to step 3.
+   - **Already our own `fanout-statusline.js`** — track is already active;
+     report that and stop.
+   - **Anything else** (their own script, `claude-hud`, etc.) — this is the
+     one to preserve.
+
+2. If there's something to preserve, save it as the delegate **before**
+   touching `statusLine.command`, via:
+   ```
+   agy_set_config(scope: "global", fanout_statusline_delegate: "<the exact command string from step 1>")
+   ```
+   Do this before step 3, never after — if it fails, nothing has been
+   overwritten yet.
+
+3. Rewrite `statusLine.command` to resolve the installed plugin's *latest*
+   version at each invocation, the same way `claude-hud`'s own statusline
+   command already does in this environment (never hardcode today's version
+   string — the plugin's version directories are never deleted on update, so
+   a pinned path silently runs stale code forever, same failure mode already
+   called out for the Track D daemon):
+   ```
+   plugin_dir=$(ls -1d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/*/lagrange/*/ 2>/dev/null | sort -V | tail -1); exec "node" "${plugin_dir}mcp-server/fanout-statusline.js"
+   ```
+   If a delegate was saved in step 2, `fanout-statusline.js` runs it itself
+   and prepends its output — the statusline command in settings.json only
+   ever needs to point at our script.
+
+4. **Verify by effect**, not by assuming the edit worked: confirm the
+   statusline still renders whatever it rendered before (if there was a
+   delegate), then trigger a small `agy_fanout` (2 trivial disjoint-file
+   tasks are enough) and confirm a `🔀 fanout ...` line appears while it runs
+   and fades out a few minutes after it finishes.
+
+5. **Reverting**: restore `statusLine.command` to the value saved in
+   `fanout_statusline_delegate` (or unset it if there was none), then clear
+   `fanout_statusline_delegate` with `agy_set_config`. Disabling just the
+   status-file writes without touching the statusline goes through
+   `agy_set_config(fanout_statusline: false)` instead — `agy_fanout` still
+   runs, it just stops writing the progress file.
 
 ## Step 3 — Close honestly
 
