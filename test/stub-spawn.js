@@ -15,6 +15,15 @@ const fs = require('fs');
 const CAPTURE_FILE = process.env.CAPTURE_FILE;
 const realSpawn = cp.spawn;
 
+// El servidor solo llama a recordUsage cuando la respuesta de agy trae `usage`,
+// así que sin este bloque el camino de telemetría queda inalcanzable desde los
+// tests. Va detrás de una bandera de entorno a propósito: emitirlo siempre haría
+// que las demás suites, que no lo esperan, escribieran en el fichero de uso real
+// de quien corra los tests.
+const USAGE_STUB = process.env.STUB_USAGE === '1'
+  ? { input_tokens: 10, output_tokens: 5, thinking_tokens: 2, cache_read_tokens: 1, total_tokens: 15 }
+  : undefined;
+
 cp.spawn = function (cmd, args, opts) {
   if (!/agy/i.test(String(cmd))) {
     return realSpawn.apply(this, arguments);
@@ -32,7 +41,8 @@ cp.spawn = function (cmd, args, opts) {
     child.stdout.emit('data', Buffer.from(JSON.stringify({
       response: 'STUBBED RESPONSE',
       conversation_id: 'stub-conversation-id',
-      duration_seconds: 1
+      duration_seconds: 1,
+      usage: USAGE_STUB
     })));
     child.emit('close', 0);
   });
