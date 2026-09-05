@@ -88,7 +88,11 @@ function main() {
         stale.push(`${rel}:${i + 1}  ${m[0]}`);
       }
       // A bare `/agy` used as a command (the binary name on its own is fine).
-      for (const m of line.matchAll(/\/agy(?![\w\-/])/g)) {
+      // The lookbehind keeps this from firing on a file path that merely ends
+      // in `/agy` (`agents/agy.md`): a real command reference is never preceded
+      // by a word character or hyphen — it sits after whitespace, a backtick,
+      // a paren, a table pipe, or the start of the line.
+      for (const m of line.matchAll(/(?<![\w-])\/agy(?![\w\-/])/g)) {
         stale.push(`${rel}:${i + 1}  ${m[0]}`);
       }
 
