@@ -23,6 +23,7 @@ const { getSummaryPrompt, recuperarDocumentoEnlazado, validarDocumento, separarD
 const { executeAgyStdin } = require('./agy-stream.js');
 const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
 const { lanzarFanout } = require('./fanout.js');
+const { crearEscritorDeEstado } = require('./fanout-estado.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -79,6 +80,8 @@ function loadConfig(cwd = process.cwd()) {
     defaultTimeoutMinutes: parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     voiceboxUrl: process.env.VOICEBOX_URL || null,
     voiceboxPort: parseInt(process.env.VOICEBOX_PORT, 10) || null,
+    fanoutStatusline: true,
+    fanoutStatuslineDelegate: null,
     permissions: {
       allow: ['read', 'edit', 'commands', 'network'],
       deny: [],
@@ -101,6 +104,8 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.timeout_minutes) config.defaultTimeoutMinutes = parsed.timeout_minutes;
       if (parsed.voicebox_url) config.voiceboxUrl = parsed.voicebox_url;
       if (parsed.voicebox_port) config.voiceboxPort = parsed.voicebox_port;
+      if (parsed.fanout_statusline !== undefined) config.fanoutStatusline = !!parsed.fanout_statusline;
+      if (parsed.fanout_statusline_delegate !== undefined) config.fanoutStatuslineDelegate = parsed.fanout_statusline_delegate;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -116,6 +121,8 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.timeout_minutes) config.defaultTimeoutMinutes = parsed.timeout_minutes;
       if (parsed.voicebox_url) config.voiceboxUrl = parsed.voicebox_url;
       if (parsed.voicebox_port) config.voiceboxPort = parsed.voicebox_port;
+      if (parsed.fanout_statusline !== undefined) config.fanoutStatusline = !!parsed.fanout_statusline;
+      if (parsed.fanout_statusline_delegate !== undefined) config.fanoutStatuslineDelegate = parsed.fanout_statusline_delegate;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -147,6 +154,8 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
   if (updates.timeout_minutes !== undefined) existing.timeout_minutes = updates.timeout_minutes;
   if (updates.voicebox_url !== undefined) existing.voicebox_url = updates.voicebox_url;
   if (updates.voicebox_port !== undefined) existing.voicebox_port = updates.voicebox_port;
+  if (updates.fanout_statusline !== undefined) existing.fanout_statusline = updates.fanout_statusline;
+  if (updates.fanout_statusline_delegate !== undefined) existing.fanout_statusline_delegate = updates.fanout_statusline_delegate;
   if (updates.permissions !== undefined) {
     existing.permissions = {
       ...(existing.permissions || {}),
@@ -899,6 +908,14 @@ const TOOLS = [
           type: 'string',
           enum: ['global', 'project'],
           description: 'Configuration scope: "global" (~/.claude/antigravity.json) or "project" (./.claude/antigravity.json). Defaults to "global".'
+        },
+        fanout_statusline: {
+          type: 'boolean',
+          description: 'Whether agy_fanout writes a live progress file for the statusline script to read. Default true; set false to disable writing it without disabling fanout itself.'
+        },
+        fanout_statusline_delegate: {
+          type: 'string',
+          description: 'The previous statusLine.command to preserve when installing fanout-statusline.js, so it keeps rendering whatever the user had (e.g. claude-hud) alongside the fanout segment. Set by the setup skill, not meant for manual use.'
         }
       }
     }
@@ -2517,13 +2534,15 @@ async function handleToolCall(name, args) {
       if (args.effort !== undefined) updates.effort = args.effort;
       if (args.timeout_minutes !== undefined) updates.timeout_minutes = args.timeout_minutes;
       if (args.permissions !== undefined) updates.permissions = args.permissions;
+      if (args.fanout_statusline !== undefined) updates.fanout_statusline = args.fanout_statusline;
+      if (args.fanout_statusline_delegate !== undefined) updates.fanout_statusline_delegate = args.fanout_statusline_delegate;
 
       const result = saveConfig(updates, scope, args.cwd);
       return {
         content: [
           {
             type: 'text',
-            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || 'high'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
+            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || 'high'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Fanout statusline: ${result.config.fanout_statusline === false ? 'disabled' : 'enabled'}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
           }
         ]
       };
@@ -2556,6 +2575,12 @@ async function handleToolCall(name, args) {
         return { ...res, conversation_id: datos.conversation_id };
       };
 
+      // El escritor de estado es opcional (FEAT-005 V1): si está desactivado no
+      // se crea, y lanzarFanout cae de vuelta a su no-op interno.
+      const registrarEstado = config.fanoutStatusline !== false
+        ? crearEscritorDeEstado(repoPath, args.slug, args.tareas)
+        : undefined;
+
       let salida;
       try {
         salida = await lanzarFanout({
@@ -2566,7 +2591,7 @@ async function handleToolCall(name, args) {
           modelo: args.modelo,
           effort: args.effort,
           timeoutMinutes: args.timeout_minutes
-        }, { ejecutar });
+        }, { ejecutar, registrarEstado });
       } catch (err) {
         return {
           isError: true,

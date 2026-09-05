@@ -32,6 +32,18 @@ const borrar = d => { try { fs.rmSync(d, { recursive: true, force: true, maxRetr
 
 const tarea = (id, archivos, extra = {}) => ({ id, prompt: `hacer ${id}`, archivos, ...extra });
 
+/** Registrador de estado falso: junta la secuencia de marcas por tarea. */
+function registradorFalso() {
+  const llamadas = { iniciar: [], marcar: [], terminar: 0 };
+  return {
+    iniciar: (meta) => llamadas.iniciar.push(meta),
+    marcar: (id, cambios) => llamadas.marcar.push({ id, ...cambios }),
+    terminar: () => { llamadas.terminar++; },
+    llamadas,
+    estadosDe: (id) => llamadas.marcar.filter(m => m.id === id).map(m => m.estado)
+  };
+}
+
 /** Ejecutor que registra las llamadas y permite programar fallos por id. */
 function ejecutorFalso({ fallar = {}, registrarConcurrencia = false } = {}) {
   const llamadas = [];
@@ -211,6 +223,50 @@ async function main() {
 
       check('el resumen cuenta la fallida', r.resumen.fallidas === 1 && r.resumen.exitosas === 1);
       check('distingue las fallidas por cuota', r.resumen.fallidasPorCuota === 0);
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('engancha el estado de orquestación (FEAT-005 V1)', async () => {
+      const eje = ejecutorFalso({ fallar: { a: { error: 'HTTP 429 quota exceeded', veces: 1 } } });
+      const registrador = registradorFalso();
+
+      const r = await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-estado',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])],
+        concurrencia: 2,
+        esperaBaseMs: 1
+      }, { ejecutar: eje.ejecutar, alDormir: async () => {}, registrarEstado: registrador });
+
+      check('lanza igual que sin registrador', r.lanzado === true);
+      check('iniciar() se llama una vez con la ramaBase y concurrencia resueltas',
+        registrador.llamadas.iniciar.length === 1 &&
+        registrador.llamadas.iniciar[0].ramaBase === r.ramaBase &&
+        registrador.llamadas.iniciar[0].concurrencia === 2);
+
+      check('la tarea sin fricción va corriendo→ok',
+        registrador.estadosDe('b').join('>') === 'corriendo>ok');
+      check('la de cuota pasa por reintentando antes de cerrar en ok',
+        registrador.estadosDe('a').join('>') === 'corriendo>reintentando>ok',
+        registrador.estadosDe('a').join('>'));
+
+      check('terminar() se llama exactamente una vez', registrador.llamadas.terminar === 1);
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('sin registrador de estado no cambia nada (no-op por defecto)', async () => {
+      const eje = ejecutorFalso();
+      // Mismo camino feliz que arriba, pero sin deps.registrarEstado: no debe
+      // explotar ni cambiar el resultado — es exactamente el comportamiento
+      // previo a FEAT-005 V1.
+      const r = await lanzarFanout({
+        repoPath: repo, slug: 'sin-registrador', tareas: [tarea('a', ['src/a.js'])]
+      }, { ejecutar: eje.ejecutar });
+      check('funciona igual sin registrarEstado', r.lanzado === true && r.resumen.exitosas === 1);
     });
   } finally { borrar(repo); }
 

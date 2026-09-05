@@ -93,6 +93,12 @@ frontera es deliberada.
 9. **Limpiar** los worktrees. Solo se borran los que no tienen trabajo
    pendiente; los que conservan commits sin mergear se preservan y se informan.
 
+El paso 2 es una única llamada MCP bloqueante — puede tardar 15+ minutos sin
+ninguna señal intermedia. Con `/lagrange:setup` (track E) se puede activar una
+línea de progreso en la statusline (`🔀 fanout <slug>: 3/5 ok · 1
+reintentando(429) · 1 corriendo`) mientras corre, sin esperar a que termine el
+lote entero.
+
 ---
 
 ## Elegir la concurrencia

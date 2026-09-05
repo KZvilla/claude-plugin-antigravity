@@ -17,16 +17,19 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Quick Start](#-quick-start)
 - [Features](#-features)
 - [Prerequisites](#-prerequisites)
-- [Installation](#-installation--setup)
 - [Slash Commands](#-slash-commands)
 - [MCP Tools Reference](#-mcp-tools-reference)
-- [Voice Checkpoint Narration](#-voice-checkpoint-narration-lagrangenarrate)
-- [Real-Time Voice Mode (`voice-chat/`)](#-real-time-voice-mode-voice-chat)
-- [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-lagrangesummary)
 - [Permissions (ALLOW / DENY)](#-granular-permissions-system-allow--deny)
+- [Concurrent Subagent Fan-Out (`/lagrange:fanout`)](#-concurrent-subagent-fan-out-lagrangefanout)
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
 - [Telemetry (`/lagrange:usage`)](#-telemetry--usage-tracking-lagrangeusage)
+- [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-lagrangesummary)
+- [Voice Checkpoint Narration](#-voice-checkpoint-narration-lagrangenarrate)
+- [Real-Time Voice Mode (`voice-chat/`)](#-real-time-voice-mode-voice-chat)
+- [Deep Web Research (`/lagrange:research`)](#-deep-web-research-lagrangeresearch)
 - [Components](#-components)
+- [Installation & Setup](#-installation--setup)
+- [Telegram Bridge & Remote Control](#-telegram-bridge-setup-manual--never-automated)
 
 ---
 
@@ -76,11 +79,13 @@ at startup - a restart is what makes `agy_run` and friends appear.
 | | Feature | Description |
 |---|---------|-------------|
 | 🤖 | **Autonomous Subagent** | Claude spins up Antigravity to execute complex tasks, multi-step refactors, and test suites |
+| 🔀 | **Concurrent Fan-Out** | Runs parallel Antigravity subagents across isolated git worktrees with disjoint-file safety checks (`/lagrange:fanout`) |
 | 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (3.8 / 3.7 Flash, 3.1 Pro) with configurable reasoning effort |
 | 🎙️ | **Voice Checkpoint Narration** | Zero-Claude-token spoken status updates via Voicebox TTS with automatic profile fallback |
 | 🗣️ | **Real-Time Voice Mode** | Full-duplex spoken conversation with barge-in, mic capture, and Silero VAD (`voice-chat/`) — zero-cloud audio via a local Voicebox TTS/STT engine |
 | 📋 | **Anti-Compaction Session Summary** | Analyzes raw JSONL session logs with Gemini (1M-2M context) to generate persistent, structured Markdown docs before context degrades |
 | 🌐 | **Cited Web Research** | Leverages Antigravity's native web search and synthesis capabilities that Claude Code lacks out of the box |
+| 📱 | **Telegram Bridge & Remote Control** | Control tasks from your phone, approve plans, receive voice notes, and launch `claude --remote-control` sessions |
 | 🛡️ | **Granular Permissions** | ALLOW / DENY capabilities, forbidden paths, forbidden commands, and sandbox isolation |
 | ⏱️ | **Robust Timeouts** | Auto-injects `--print-timeout` (15m default, 20m for reviews, 25m for audits) to prevent premature drops |
 | 📊 | **Live Telemetry** | Token usage, thinking tokens, context caching savings, and context window saturation |
@@ -216,6 +221,68 @@ Denying `"network"` blocks web search and URL fetching, and makes `agy_research`
 ```
 
 > **Scope:** Place in `~/.claude/antigravity.json` for global defaults, or `.claude/antigravity.json` in a project root for per-project overrides.
+
+---
+
+## 🔀 Concurrent Subagent Fan-Out (`/lagrange:fanout`)
+
+Execute multiple Antigravity subagents **in parallel**, each completely isolated in its own dedicated `git worktree` and branch (`<slug>/<task-id>`), reserving auditing, testing, and integration for Claude.
+
+```text
+/lagrange:fanout
+```
+
+Or point directly to a planned task list or spec:
+```text
+/lagrange:fanout docs/future-implementations/my-plan.md
+```
+
+### The Atomic Task & Disjointness Contract
+
+Fan-out only pays off if tasks are **strictly disjoint in files**. Worktrees isolate execution, not integration: if two concurrent subagents modify the same file, the collision is not avoided, merely postponed to merge time.
+
+Before spending any model quota or spawning processes, `agy_fanout` validates the file allocation:
+- Each task declares `id`, `prompt`, and `archivos` (repo-relative paths; a trailing `/` denotes a whole subtree).
+- Absolute paths and path traversal (`..`) are strictly rejected.
+- If two tasks touch the same file or overlapping subtrees, the entire batch is **rejected upfront** with clear collision diagnostics.
+
+### Why Git Worktrees over `--sandbox`
+
+As measured on `agy` v1.1.26 (documented in `docs/future-implementations/subagentes-concurrentes-agy.md`), `--sandbox` only restricts terminal commands, mounts a jail that ignores `cwd`, triggers Windows UAC elevation prompts (blocking headless parallel runs), and still allows native file tools to write outside the workspace.
+
+Instead, `agy_fanout` isolates each subagent by creating a physical `git worktree` derived from a clean base branch:
+- Confines file writes strictly to that worktree directory.
+- Never touches or checks out `main` or `master` directly.
+- Avoids branch locking conflicts (git forbids two worktrees on the same branch).
+
+### Concurrency Capping & Quota Backoff
+
+- **Concurrency Cap (`concurrencia`)**: Defaults to `3` subagents running simultaneously. The cap protects API rate limits and token quotas, not CPU.
+- **Automatic Quota Backoff**: If any subagent encounters an HTTP 429 or quota limit error, `agy_fanout` pauses and retries with exponential backoff (`20s`, `40s`). Code execution errors are never retried unnecessarily.
+
+### Division of Responsibilities
+
+Subagents are strictly scoped to **implement**:
+- Prompt guardrails explicitly instruct them: do not write or run test suites, do not merge or switch branches, and do not spawn subagents.
+- **Claude stays in control:** You and Claude review the resulting diffs (using `/lagrange:review` in parallel if desired), execute local test suites, handle up to two correction rounds resuming by `conversation_id`, and perform the final branch merge and worktree cleanup.
+
+### `agy_fanout` — Parameter Reference
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `slug` | `string` | *required* | Short identifier for the batch (names base branch and worktrees) |
+| `tareas` | `object[]` | *required* | Array of atomic tasks (must be disjoint in `archivos`) |
+| `tareas[].id` | `string` | *required* | Unique identifier for the task |
+| `tareas[].prompt` | `string` | *required* | Implementation instructions for the subagent |
+| `tareas[].archivos` | `string[]` | *required* | Repo-relative files or directories (`dir/`) this task may touch |
+| `tareas[].modelo` | `string` | — | Per-task model override |
+| `tareas[].effort` | `string` | `"high"` | Per-task reasoning effort (`"low"`, `"medium"`, `"high"`) |
+| `tareas[].soloLectura` | `boolean` | `false` | Run task in read-only plan mode (`--mode plan`) |
+| `concurrencia` | `number` | `3` | Maximum concurrent subagents running at once |
+| `modelo` | `string` | configured | Default model for the batch |
+| `effort` | `string` | `"high"` | Default effort for the batch |
+| `cwd` | `string` | repo root | Repository root directory |
+| `timeout_minutes` | `number` | `15` | Per-subagent timeout limit in minutes |
 
 ---
 
@@ -442,18 +509,22 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (15 tools) |
+| **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (18 tools) |
+| | `mcp-server/fanout.js` | Orchestrator for concurrent subagent fan-out across git worktrees |
 | | `mcp-server/lib/sentence-chunker.js` | Groups streamed `text_delta` fragments into complete sentences for TTS |
-| **Subagent** | `agents/antigravity.md` | Autonomous subagent definition (`antigravity:Antigravity`) |
+| **Subagent** | `agents/agy.md` | Autonomous subagent definition (`lagrange:agy` / `agy`) |
 | **Skills** | `skills/agy-cli/SKILL.md` | Context-aware delegation guidelines |
 | | `skills/adversarial-review/SKILL.md` | Skeptical, evidence-based audit guidelines |
 | | `skills/session-summary/SKILL.md` | Session summary & anti-compaction skill |
 | | `skills/setup/SKILL.md` | Guided setup for Voicebox, Telegram and the daemon — never handles secrets |
+| | `skills/fanout/SKILL.md` | Concurrent subagents orchestration in isolated git worktrees |
 | **Daemon** | `telegram-bridge/daemon.mjs` | Platform dispatcher — same npm command everywhere |
 | | `telegram-bridge/daemon.ps1` | Windows: Task Scheduler, at logon |
 | | `telegram-bridge/daemon.sh` | Linux: `systemd --user`, journald logs |
+| | `telegram-bridge/claude-launcher.js` | Lifecycle engine & process manager for Claude Code Remote Control |
 | **Commands** | `commands/run.md` | `/lagrange:run <prompt>` |
 | | `commands/plan.md` | `/lagrange:plan <task>` |
+| | `commands/fanout.md` | `/lagrange:fanout [plan]` |
 | | `commands/review.md` | `/lagrange:review [target]` |
 | | `commands/audit.md` | `/lagrange:audit [target]` |
 | | `commands/summary.md` | `/lagrange:summary [focus]` |
@@ -461,6 +532,8 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 | | `commands/voices.md` | `/lagrange:voices [lang]` |
 | | `commands/research.md` | `/lagrange:research <topic>` |
 | | `commands/usage.md` | `/lagrange:usage` |
+| | `commands/bridge.md` | `/lagrange:bridge` |
+| | `commands/setup.md` | `/lagrange:setup [track]` |
 | **Tests** | `test/` | Dependency-free suites that drive the MCP server over real stdio with `agy` stubbed — `npm test`, or `npm run gates` for every gate at once |
 | **Voice Chat** | `voice-chat/text_loop.py` / `voice_loop.py` | Real-Time Voice Mode companion scripts (console / real mic + VAD) |
 | **Distribution** | `.claude-plugin/marketplace.json` | Marketplace manifest - the recommended install channel |
@@ -619,6 +692,29 @@ The installer **refuses to run** from a managed plugin directory (`.claude/plugi
 The scheduled task and the systemd unit each store an **absolute path**. Each plugin version installs into its own directory, and updating does not delete the old ones — so a daemon registered from `…/lagrange/0.9.1/` stays pinned to 0.9.1 forever. After the next update, the bot runs the old code while the MCP tools run the new one, and *nothing fails*: no error, no warning, just two halves of the same bridge on different code. If old versions were deleted the daemon would crash at startup and you would know; that they survive is exactly what makes this silent.
 
 Run `/lagrange:bridge` at any time to see which copy each half is running, along with daemon state, the effective `.env`, and the shared state paths. (`-Force` bypasses the check if you have a case we did not anticipate.)
+
+### 📱 Telegram Bot Commands & Claude Remote Control
+
+When running the bidirectional daemon (`bot.js`), your private Telegram chat becomes an autonomous mobile command center for both Antigravity and Claude Code:
+
+| Command | Action |
+|---------|--------|
+| `/claude` | List authorized workspaces from `~/.claude.json` and launch a detached `claude --remote-control` session with interactive inline buttons |
+| `/claude status` | Check if a Claude Code remote session is running, showing its active environment URL (`https://claude.ai/code?environment=env_...`) |
+| `/claude stop` | Terminate the active Claude Code process tree cleanly (`taskkill /T` on Windows / SIGTERM) |
+| `/claude clean [id]` | Interactive worktree cleanup to safely prune completed task worktrees |
+| `/plan <task>` | Generate an Antigravity plan (read-only) with an inline `[✅ Ejecutar cambios]` button to approve execution |
+| `/run <task>` | Start a new Antigravity subagent session with direct edit permissions |
+| `/resume <task>` | Continue the current active conversation thread (`conversation_id`) |
+| `/status` | Report active `agy` binary, version, current model/effort, and permission policies |
+| `/queue` / `/cancel` | Inspect or abort queued tasks |
+| `/reset` | Clear the current conversation context and start fresh |
+
+#### Claude Remote Control Security Guardrails
+
+- **Workspace Allowlist (`hasTrustDialogAccepted`)**: Only projects where you have already accepted the trust dialog on your PC are offered in the `/claude` selection menu. Unconfirmed paths are filtered out to prevent unauthorized terminal execution.
+- **Environment Sanitization**: The spawned Claude process inherits a sanitized environment that strips internal bot tokens (`TELEGRAM_BOT_TOKEN`).
+- **Mobile Control**: Once launched, simply open the official Claude mobile app (iOS/Android) or web interface to approve tool calls and review diffs in real time with the official UI.
 
 ---
 

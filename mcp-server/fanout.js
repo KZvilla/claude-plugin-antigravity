@@ -18,6 +18,11 @@
 const { validarReparto, explicarReparto } = require('./reparto.js');
 const { prepararRamaBase, crearWorktrees } = require('./worktrees.js');
 
+// No-op por defecto: si el llamador no inyecta deps.registrarEstado (como
+// hacen hoy todos los tests existentes), el orquestador se comporta
+// exactamente igual que antes de FEAT-005 V1.
+const ESTADO_NULO = { iniciar() {}, marcar() {}, terminar() {} };
+
 const CONCURRENCIA_POR_DEFECTO = 3;
 const REINTENTOS_POR_CUOTA = 2;
 const ESPERA_BASE_MS = 20000;
@@ -55,7 +60,7 @@ function reglasDelSubagente(tarea) {
  * Ejecuta una tarea, reintentando solo si el fallo es por cuota. Un error de
  * código no se reintenta: repetirlo cuesta lo mismo y da lo mismo.
  */
-async function ejecutarConReintento(ejecutar, peticion, { reintentos, esperaBaseMs, alDormir }) {
+async function ejecutarConReintento(ejecutar, peticion, { reintentos, esperaBaseMs, alDormir, taskId, registrarEstado }) {
   let ultimo = null;
   // Los intentos REALIZADOS, no los presupuestados: un error de código sale del
   // bucle a la primera, y reportar el máximo haría creer que se reintentó.
@@ -71,6 +76,7 @@ async function ejecutarConReintento(ejecutar, peticion, { reintentos, esperaBase
     if (!esErrorDeCuota(mensaje) || intento === reintentos) break;
 
     // Backoff exponencial: la cuota se recupera con el tiempo, no con insistencia.
+    registrarEstado.marcar(taskId, { estado: 'reintentando', intentos: realizados });
     await alDormir(esperaBaseMs * Math.pow(2, intento));
   }
 
@@ -105,6 +111,7 @@ async function lanzarFanout(opciones, deps) {
   const ejecutar = deps && deps.ejecutar;
   if (typeof ejecutar !== 'function') throw new Error('lanzarFanout requiere deps.ejecutar');
   const alDormir = (deps && deps.alDormir) || dormir;
+  const registrarEstado = (deps && deps.registrarEstado) || ESTADO_NULO;
 
   if (!Number.isInteger(concurrencia) || concurrencia < 1) {
     throw new Error(`concurrencia debe ser un entero >= 1, recibido: ${concurrencia}`);
@@ -133,6 +140,8 @@ async function lanzarFanout(opciones, deps) {
 
   const asignacion = tareas.map((t, i) => ({ tarea: t, worktree: worktrees[i] }));
 
+  registrarEstado.iniciar({ ramaBase: base.rama, concurrencia });
+
   // 4. Ejecución en lotes. El tope existe por cuota, no por CPU: lanzar las N de
   //    golpe es la forma más rápida de comerse un 429 y perder el lote entero.
   const resultados = [];
@@ -141,6 +150,8 @@ async function lanzarFanout(opciones, deps) {
 
     const delLote = await Promise.all(lote.map(async ({ tarea, worktree }) => {
       const inicioMs = Date.now();
+      registrarEstado.marcar(tarea.id, { estado: 'corriendo', intentos: 0, inicio: new Date(inicioMs).toISOString() });
+
       const respuesta = await ejecutarConReintento(ejecutar, {
         prompt: reglasDelSubagente(tarea),
         cwd: worktree.ruta,
@@ -148,16 +159,25 @@ async function lanzarFanout(opciones, deps) {
         effort: tarea.effort || effort,
         mode: tarea.soloLectura ? 'plan' : 'accept-edits',
         timeout_minutes: timeoutMinutes
-      }, { reintentos: reintentosPorCuota, esperaBaseMs, alDormir });
+      }, { reintentos: reintentosPorCuota, esperaBaseMs, alDormir, taskId: tarea.id, registrarEstado });
+
+      const exito = !!respuesta.success;
+      const porCuota = !exito && esErrorDeCuota(respuesta.error);
+      registrarEstado.marcar(tarea.id, {
+        estado: exito ? 'ok' : 'error',
+        intentos: respuesta.intentos,
+        porCuota,
+        fin: new Date().toISOString()
+      });
 
       return {
         id: tarea.id,
         rama: worktree.rama,
         ruta: worktree.ruta,
         archivos: tarea.archivos,
-        exito: !!respuesta.success,
-        error: respuesta.success ? null : (respuesta.error || 'error desconocido'),
-        porCuota: !respuesta.success && esErrorDeCuota(respuesta.error),
+        exito,
+        error: exito ? null : (respuesta.error || 'error desconocido'),
+        porCuota,
         intentos: respuesta.intentos,
         conversation_id: respuesta.conversation_id || (respuesta.data && respuesta.data.conversation_id) || null,
         duracionMs: Date.now() - inicioMs
@@ -168,6 +188,8 @@ async function lanzarFanout(opciones, deps) {
   }
 
   const fallidas = resultados.filter(r => !r.exito);
+
+  registrarEstado.terminar();
 
   return {
     lanzado: true,
