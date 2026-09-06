@@ -161,12 +161,15 @@ function leerDelegado(cwd) {
 function ejecutarDelegado(comando, stdinCrudo) {
   if (!comando) return '';
   try {
-    // execSync ya corre el comando bajo un shell (default '/bin/sh' en POSIX,
-    // ComSpec en Windows) — no hay que pasarle `shell: true`, eso es sintaxis
-    // de spawn(), no de exec(). Si el delegado guardado necesita un shell
-    // POSIX (p. ej. usa `case`/`$( )`) y el default de Windows es cmd.exe, la
-    // llamada falla y cae al catch: se pierde ese segmento, no se rompe nada.
-    return execSync(comando, { input: stdinCrudo || '', encoding: 'utf8', timeout: 5000 }).trimEnd();
+    // Verificado en vivo el 2026-09-05: el delegado que guarda el setup (p. ej.
+    // el propio comando de claude-hud) usa sintaxis POSIX (`case`, `${var:-x}`,
+    // `$( )`) porque así es como Claude Code invoca `statusLine.command` — pero
+    // el default de `execSync` en Windows es `cmd.exe` (ComSpec), que no
+    // entiende nada de eso y falla con "cols no se reconoce como...". Pedirle
+    // `bash` explícitamente reproduce el shell real que usa Claude Code, no el
+    // default de Node. Si `bash` no está en PATH, execSync tira y cae al
+    // catch: se pierde ese segmento, no se rompe nada.
+    return execSync(comando, { input: stdinCrudo || '', encoding: 'utf8', timeout: 5000, shell: 'bash' }).trimEnd();
   } catch {
     return '';
   }
