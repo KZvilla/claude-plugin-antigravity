@@ -138,6 +138,31 @@ function crearLectorDeControl(repoPath, slug) {
 }
 
 /**
+ * Log NDJSON por subagente (FEAT-009), un archivo por `taskId`.
+ *
+ * A propósito NO vive dentro del worktree del subagente (`<worktree>/.agy-
+ * progress.jsonl`, como decía la propuesta original en §7.1) — un archivo
+ * suelto ahí lo vería `git status --porcelain` como cambio sin commitear y
+ * `inspeccionarWorktrees` (FEAT-003) clasificaría el worktree como "sucio"
+ * aunque el subagente no haya tocado nada, bloqueando la limpieza automática.
+ * Mismo escarmiento que ya dejó FEAT-012 con el centinela de control: los
+ * archivos de orquestación van a nivel de repo, bajo `.claude/worktrees/`,
+ * nunca dentro de cada worktree.
+ */
+function rutaProgreso(repoPath, slug, taskId) {
+  return path.join(repoPath, DIR_WORKTREES, `.agy-progress-${slugificarArchivo(slug)}-${idParaArchivo(taskId)}.jsonl`);
+}
+
+/**
+ * Borra el log de una corrida anterior con el mismo slug/taskId, para que no
+ * se mezcle con el de esta — mismo motivo y mismo punto de enganche
+ * (`limpiarControlPrevio`, una sola vez antes del primer lote) que FEAT-012.
+ */
+function limpiarProgreso(repoPath, slug, taskId) {
+  try { fs.unlinkSync(rutaProgreso(repoPath, slug, taskId)); } catch {}
+}
+
+/**
  * @param {string} repoPath
  * @param {string} slug
  * @param {Array<{id:string}>} tareas
@@ -200,5 +225,6 @@ function crearEscritorDeEstado(repoPath, slug, tareas) {
 
 module.exports = {
   rutaEstado, crearEscritorDeEstado, DIR_WORKTREES,
-  rutaControl, marcarDetencion, crearLectorDeControl
+  rutaControl, marcarDetencion, crearLectorDeControl,
+  rutaProgreso, limpiarProgreso
 };

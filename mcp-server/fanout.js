@@ -129,6 +129,14 @@ async function lanzarFanout(opciones, deps) {
   // No-op por defecto, igual que registrarEstado: si no se inyecta, el
   // comportamiento es el de antes de FEAT-012.
   const limpiarControlPrevio = (deps && deps.limpiarControlPrevio) || (() => {});
+  // Ídem para FEAT-009: sin inyectar, el log NDJSON simplemente no se limpia
+  // (porque tampoco se escribe si el caller no lo activó).
+  const limpiarProgresoPrevio = (deps && deps.limpiarProgresoPrevio) || (() => {});
+  // FEAT-010: se llama UNA VEZ con el reparto completo (tarea+worktree), no
+  // por tarea — abrir la ventana de wt es una sola operación para todo el
+  // lote, no N operaciones sueltas. No-op por defecto (Windows only, y
+  // opt-in incluso ahí).
+  const alArrancar = (deps && deps.alArrancar) || (() => {});
 
   if (!Number.isInteger(concurrencia) || concurrencia < 1) {
     throw new Error(`concurrencia debe ser un entero >= 1, recibido: ${concurrencia}`);
@@ -167,7 +175,19 @@ async function lanzarFanout(opciones, deps) {
   // un reintento por cuota — justo los dos casos que la feature existe para
   // cubrir. Después de este punto, cualquier centinela que aparezca es de
   // esta corrida y nadie más lo toca hasta que `stopCheck` lo consuma.
-  for (const { tarea } of asignacion) limpiarControlPrevio(tarea.id);
+  //
+  // Mismo barrido, mismo motivo, para el log NDJSON de FEAT-009: si quedara
+  // el de una corrida anterior con el mismo slug/taskId, un `tail`/lector
+  // externo vería eventos viejos mezclados con los de esta corrida.
+  for (const { tarea } of asignacion) {
+    limpiarControlPrevio(tarea.id);
+    limpiarProgresoPrevio(tarea.id);
+  }
+
+  // FEAT-010: la ventana (si está activada) se abre acá, ANTES del primer
+  // lote — mirar un subagente mientras corre es todo el punto; abrirla
+  // después de que `lanzarFanout` ya resolvió sería demasiado tarde.
+  alArrancar(asignacion);
 
   // 4. Ejecución en lotes. El tope existe por cuota, no por CPU: lanzar las N de
   //    golpe es la forma más rápida de comerse un 429 y perder el lote entero.

@@ -20,10 +20,11 @@ const {
 const { extractLastCheckpoint } = require('./checkpoint.js');
 const { preprocessSessionLog, renderFacts, renderFinalState } = require('./session-log.js');
 const { getSummaryPrompt, recuperarDocumentoEnlazado, validarDocumento, separarDigest, MARCA_DIGEST } = require('./summary-doc.js');
-const { executeAgyStdin } = require('./agy-stream.js');
+const { executeAgyStdin, executeAgyStreaming } = require('./agy-stream.js');
 const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
 const { lanzarFanout } = require('./fanout.js');
-const { crearEscritorDeEstado, crearLectorDeControl } = require('./fanout-estado.js');
+const { crearEscritorDeEstado, crearLectorDeControl, rutaProgreso, limpiarProgreso } = require('./fanout-estado.js');
+const { abrirVentanaWt } = require('./fanout-window.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -84,6 +85,11 @@ function loadConfig(cwd = process.cwd()) {
     fanoutStatuslineDelegate: null,
     fanoutControl: true,
     fanoutStopCheckIntervalMs: parseInt(process.env.AGY_FANOUT_STOP_INTERVAL_MS, 10) || 2000,
+    fanoutProgressLog: true,
+    // Default false a propósito, a diferencia del resto de FEAT-009/012: una
+    // ventana nueva apareciendo en pantalla es mucho más intrusivo que un
+    // archivo escribiéndose en silencio. Opt-in explícito (/lagrange:setup).
+    fanoutWindow: false,
     permissions: {
       allow: ['read', 'edit', 'commands', 'network'],
       deny: [],
@@ -110,6 +116,8 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.fanout_statusline_delegate !== undefined) config.fanoutStatuslineDelegate = parsed.fanout_statusline_delegate;
       if (parsed.fanout_control !== undefined) config.fanoutControl = !!parsed.fanout_control;
       if (parsed.fanout_stop_check_interval_ms !== undefined) config.fanoutStopCheckIntervalMs = parsed.fanout_stop_check_interval_ms;
+      if (parsed.fanout_progress_log !== undefined) config.fanoutProgressLog = !!parsed.fanout_progress_log;
+      if (parsed.fanout_window !== undefined) config.fanoutWindow = !!parsed.fanout_window;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -129,6 +137,8 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.fanout_statusline_delegate !== undefined) config.fanoutStatuslineDelegate = parsed.fanout_statusline_delegate;
       if (parsed.fanout_control !== undefined) config.fanoutControl = !!parsed.fanout_control;
       if (parsed.fanout_stop_check_interval_ms !== undefined) config.fanoutStopCheckIntervalMs = parsed.fanout_stop_check_interval_ms;
+      if (parsed.fanout_progress_log !== undefined) config.fanoutProgressLog = !!parsed.fanout_progress_log;
+      if (parsed.fanout_window !== undefined) config.fanoutWindow = !!parsed.fanout_window;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -163,6 +173,8 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
   if (updates.fanout_statusline !== undefined) existing.fanout_statusline = updates.fanout_statusline;
   if (updates.fanout_statusline_delegate !== undefined) existing.fanout_statusline_delegate = updates.fanout_statusline_delegate;
   if (updates.fanout_control !== undefined) existing.fanout_control = updates.fanout_control;
+  if (updates.fanout_progress_log !== undefined) existing.fanout_progress_log = updates.fanout_progress_log;
+  if (updates.fanout_window !== undefined) existing.fanout_window = updates.fanout_window;
   if (updates.permissions !== undefined) {
     existing.permissions = {
       ...(existing.permissions || {}),
@@ -927,6 +939,14 @@ const TOOLS = [
         fanout_control: {
           type: 'boolean',
           description: 'Whether agy_fanout watches per-task stop sentinels (.claude/worktrees/.fanout-stop-<slug>-<taskId>.json) and kills a running subagent early when one appears. Default true; set false to disable the stop mechanism without disabling fanout itself.'
+        },
+        fanout_progress_log: {
+          type: 'boolean',
+          description: 'Whether agy_fanout writes a live per-subagent NDJSON progress log (.claude/worktrees/.agy-progress-<slug>-<taskId>.jsonl), one line per stream-json event as it arrives. Default true; set false to skip writing it (agy_fanout still runs in streaming mode either way).'
+        },
+        fanout_window: {
+          type: 'boolean',
+          description: 'Windows only. Whether agy_fanout opens a new Windows Terminal window (wt.exe), one pane per subagent, tailing its NDJSON progress log live. Default false (opt-in — a new window popping up is far more intrusive than a background file write). No-op on non-Windows platforms.'
         }
       }
     }
@@ -2609,20 +2629,43 @@ async function handleToolCall(name, args) {
       // que agy_run. `--sandbox` no se ofrece a propósito: rompe el aislamiento
       // por worktree en vez de reforzarlo, y exige UAC (H1 a H3 del documento de
       // diseño). El confinamiento acá es el worktree.
+      //
+      // `--output-format` no se pasa acá (FEAT-009): lo fija executeAgyStreaming
+      // en stream-json, para poder volcar cada evento al log NDJSON del
+      // subagente a medida que llega, en vez de bufferear hasta el cierre.
       const ejecutar = async (peticion) => {
-        const cliArgs = ['--output-format', 'json', '--dangerously-skip-permissions'];
+        const cliArgs = ['--dangerously-skip-permissions'];
         cliArgs.push('--mode', peticion.mode || 'accept-edits');
         cliArgs.push('--effort', peticion.effort || config.defaultEffort || 'high');
         const modelo = peticion.model || config.defaultModel;
         if (modelo) cliArgs.push('--model', modelo);
         cliArgs.push('-p', peticion.prompt);
 
-        const res = await executeAgy(cliArgs, {
-          cwd: peticion.cwd,
-          timeoutMinutes: peticion.timeout_minutes || config.defaultTimeoutMinutes || 15,
-          stopCheck: lectorControl ? () => lectorControl.consumirDetencion(peticion.taskId) : undefined,
-          stopCheckIntervalMs: config.fanoutStopCheckIntervalMs
-        });
+        // Log NDJSON por subagente (FEAT-009), opcional igual que el resto de
+        // esta feature: si está desactivado, `onLine` es un no-op y
+        // executeAgyStreaming corre exactamente igual (la diferencia es
+        // solo si se persiste a disco, no cómo se invoca a agy).
+        let fdLog = null;
+        if (config.fanoutProgressLog !== false) {
+          try { fdLog = fs.openSync(rutaProgreso(repoPath, args.slug, peticion.taskId), 'a'); } catch {}
+        }
+        const onLine = fdLog !== null
+          ? (linea) => { try { fs.writeSync(fdLog, linea + '\n'); } catch {} }
+          : undefined;
+
+        let res;
+        try {
+          res = await executeAgyStreaming(AGY_BIN, cliArgs, {
+            cwd: peticion.cwd,
+            timeoutMinutes: peticion.timeout_minutes || config.defaultTimeoutMinutes || 15,
+            stopCheck: lectorControl ? () => lectorControl.consumirDetencion(peticion.taskId) : undefined,
+            stopCheckIntervalMs: config.fanoutStopCheckIntervalMs,
+            terminate: terminateTree,
+            onLine
+          });
+        } finally {
+          if (fdLog !== null) { try { fs.closeSync(fdLog); } catch {} }
+        }
 
         const datos = res.data || {};
         recordUsage('run', modelo, peticion.effort, datos.conversation_id || '',
@@ -2647,6 +2690,36 @@ async function handleToolCall(name, args) {
         ? (taskId) => lectorControl.limpiar(taskId)
         : undefined;
 
+      // Mismo motivo, mismo punto de enganche, para el log NDJSON de FEAT-009:
+      // barrer el de una corrida anterior con el mismo slug/taskId antes de
+      // que arranque el primer lote, para no mezclar eventos de corridas
+      // distintas en el mismo archivo.
+      const limpiarProgresoPrevio = config.fanoutProgressLog !== false
+        ? (taskId) => limpiarProgreso(repoPath, args.slug, taskId)
+        : undefined;
+
+      // FEAT-010: ventana de wt, Windows only y opt-in (default false — ver
+      // loadConfig). Silenciosamente no-op en cualquier otra plataforma,
+      // aunque el usuario la haya activado: agy_fanout sigue funcionando
+      // igual, solo sin la ventana (queda el log de FEAT-009 y la
+      // statusline de FEAT-008).
+      const alArrancar = (config.fanoutWindow && process.platform === 'win32')
+        ? (asignacion) => {
+            try {
+              abrirVentanaWt(asignacion.map(({ tarea, worktree }) => ({
+                nombre: tarea.id,
+                cwd: worktree.ruta,
+                rutaLog: rutaProgreso(repoPath, args.slug, tarea.id)
+              })));
+            } catch (err) {
+              // Que falle abrir la ventana (p. ej. wt.exe no instalado) no
+              // debe tumbar el fan-out entero — es una comodidad, no el
+              // camino crítico.
+              process.stderr.write(`[antigravity-mcp] No se pudo abrir la ventana de wt: ${err.message}\n`);
+            }
+          }
+        : undefined;
+
       let salida;
       try {
         salida = await lanzarFanout({
@@ -2657,7 +2730,7 @@ async function handleToolCall(name, args) {
           modelo: args.modelo,
           effort: args.effort,
           timeoutMinutes: args.timeout_minutes
-        }, { ejecutar, registrarEstado, limpiarControlPrevio });
+        }, { ejecutar, registrarEstado, limpiarControlPrevio, limpiarProgresoPrevio, alArrancar });
       } catch (err) {
         return {
           isError: true,
@@ -2696,6 +2769,10 @@ async function handleToolCall(name, args) {
       texto += `\n**Siguiente paso (tuyo, no de los subagentes):** ${salida.siguientePaso}\n`;
       texto += `\nLos worktrees siguen en \`.claude/worktrees/\`. Cuando termines de integrar, `;
       texto += `limpiá los que queden sin trabajo pendiente.\n`;
+      if (config.fanoutProgressLog !== false) {
+        texto += `\nLog NDJSON por subagente en \`.claude/worktrees/.agy-progress-${args.slug}-<taskId>.jsonl\` `;
+        texto += `(un evento por línea, tal como lo emite \`agy\`).\n`;
+      }
 
       return { content: [{ type: 'text', text: texto }] };
     }

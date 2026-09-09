@@ -311,6 +311,89 @@ async function main() {
 
   repo = crearRepo();
   try {
+    await group('limpiarProgresoPrevio corre una sola vez por tarea, antes de cualquier ejecutar (FEAT-009)', async () => {
+      // Mismo patrón que limpiarControlPrevio (FEAT-012): un barrido único
+      // antes del primer lote, no por intento — evita mezclar el log de una
+      // corrida anterior con el mismo slug/taskId.
+      const eventos = [];
+      const limpiarProgresoPrevio = (taskId) => eventos.push(`limpiar:${taskId}`);
+      const eje = ejecutorFalso({ fallar: { a: { error: 'HTTP 429 quota exceeded', veces: 1 } } });
+      const ejecutarConLog = async (peticion) => {
+        const id = (peticion.prompt.match(/hacer ([a-z0-9-]+)/) || [])[1];
+        eventos.push(`ejecutar:${id}`);
+        return eje.ejecutar(peticion);
+      };
+
+      await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-orden-log',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])],
+        esperaBaseMs: 1
+      }, { ejecutar: ejecutarConLog, alDormir: async () => {}, limpiarProgresoPrevio });
+
+      const ultimaLimpieza = Math.max(eventos.indexOf('limpiar:a'), eventos.indexOf('limpiar:b'));
+      const primerEjecutar = Math.min(eventos.indexOf('ejecutar:a'), eventos.indexOf('ejecutar:b'));
+      check('ambas limpiezas ocurren antes de cualquier ejecutar', ultimaLimpieza < primerEjecutar, eventos.join(','));
+      check('a se reintenta 2 veces por cuota pero se limpia una sola vez',
+        eventos.filter(e => e === 'ejecutar:a').length === 2 &&
+        eventos.filter(e => e === 'limpiar:a').length === 1,
+        eventos.join(','));
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('sin limpiarProgresoPrevio no cambia nada (no-op por defecto)', async () => {
+      const eje = ejecutorFalso();
+      const r = await lanzarFanout({
+        repoPath: repo, slug: 'sin-limpieza-log', tareas: [tarea('a', ['src/a.js'])]
+      }, { ejecutar: eje.ejecutar });
+      check('funciona igual sin limpiarProgresoPrevio', r.lanzado === true && r.resumen.exitosas === 1);
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('alArrancar (FEAT-010) se llama una sola vez, con el reparto completo, antes del primer lote', async () => {
+      const llamadas = [];
+      const alArrancar = (asignacion) => llamadas.push({ momento: 'alArrancar', asignacion });
+      const eje = ejecutorFalso();
+      const ejecutarConLog = async (peticion) => {
+        llamadas.push({ momento: 'ejecutar' });
+        return eje.ejecutar(peticion);
+      };
+
+      await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-ventana',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])]
+      }, { ejecutar: ejecutarConLog, alArrancar });
+
+      check('se llamó exactamente una vez', llamadas.filter(l => l.momento === 'alArrancar').length === 1, JSON.stringify(llamadas.map(l => l.momento)));
+
+      const iAlArrancar = llamadas.findIndex(l => l.momento === 'alArrancar');
+      const iPrimerEjecutar = llamadas.findIndex(l => l.momento === 'ejecutar');
+      check('corre antes de cualquier ejecutar', iAlArrancar < iPrimerEjecutar, JSON.stringify(llamadas.map(l => l.momento)));
+
+      const asignacionRecibida = llamadas.find(l => l.momento === 'alArrancar').asignacion;
+      check('recibe las 2 tareas con su tarea y worktree', asignacionRecibida.length === 2 &&
+        asignacionRecibida.every(a => a.tarea && a.tarea.id && a.worktree && a.worktree.ruta));
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('sin alArrancar no cambia nada (no-op por defecto)', async () => {
+      const eje = ejecutorFalso();
+      const r = await lanzarFanout({
+        repoPath: repo, slug: 'sin-ventana', tareas: [tarea('a', ['src/a.js'])]
+      }, { ejecutar: eje.ejecutar });
+      check('funciona igual sin alArrancar', r.lanzado === true && r.resumen.exitosas === 1);
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
     await group('engancha el estado de orquestación (FEAT-005 V1)', async () => {
       const eje = ejecutorFalso({ fallar: { a: { error: 'HTTP 429 quota exceeded', veces: 1 } } });
       const registrador = registradorFalso();
@@ -512,6 +595,70 @@ async function main() {
       removeFixture(repoTmp);
       if (previoHold === undefined) delete process.env.STUB_HOLD_MS;
       else process.env.STUB_HOLD_MS = previoHold;
+    }
+  });
+
+  await group('agy_fanout escribe el log NDJSON por subagente (FEAT-009)', async () => {
+    const { startServer, removeFixture } = require('./lib/mcp-client');
+    const { rutaProgreso } = require('../mcp-server/fanout-estado.js');
+    const repoTmp = crearRepo();
+    const capturas = path.join(repoTmp, 'cap.jsonl');
+    fs.writeFileSync(capturas, '');
+    const s = startServer({ cwd: repoTmp, captureFile: capturas });
+
+    try {
+      await s.initialize();
+
+      const r = await s.callTool('agy_fanout', {
+        slug: 'con-log',
+        tareas: [{ id: 'solo', prompt: 'hacer algo', archivos: ['src/solo.js'] }],
+        concurrencia: 1
+      }, 15000);
+
+      check('no devuelve isError', r.result.isError !== true, JSON.stringify(r.result));
+
+      const ruta = rutaProgreso(repoTmp, 'con-log', 'solo');
+      check('el log quedó escrito en disco', fs.existsSync(ruta), ruta);
+
+      const lineas = fs.readFileSync(ruta, 'utf8').trim().split('\n').filter(Boolean);
+      const eventosLog = lineas.map(l => JSON.parse(l));
+      check('trae las 3 líneas que emite el stub, sin bufferear', eventosLog.length === 3, JSON.stringify(eventosLog));
+      check('en el mismo orden en que las emite agy', eventosLog.map(e => e.event).join(',') === 'init,step_update,result',
+        eventosLog.map(e => e.event).join(','));
+
+      check('el texto de respuesta menciona dónde está el log',
+        /\.agy-progress-con-log-<taskId>\.jsonl/.test(r.result.content[0].text), r.result.content[0].text);
+    } finally {
+      await s.stop();
+      removeFixture(repoTmp);
+    }
+  });
+
+  await group('agy_fanout respeta fanout_progress_log: false (FEAT-009)', async () => {
+    const { startServer, removeFixture } = require('./lib/mcp-client');
+    const { rutaProgreso } = require('../mcp-server/fanout-estado.js');
+    const repoTmp = crearRepo();
+    fs.mkdirSync(path.join(repoTmp, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(repoTmp, '.claude', 'antigravity.json'), JSON.stringify({ fanout_progress_log: false }));
+    const capturas = path.join(repoTmp, 'cap.jsonl');
+    fs.writeFileSync(capturas, '');
+    const s = startServer({ cwd: repoTmp, captureFile: capturas });
+
+    try {
+      await s.initialize();
+
+      const r = await s.callTool('agy_fanout', {
+        slug: 'sin-log',
+        tareas: [{ id: 'solo', prompt: 'hacer algo', archivos: ['src/solo.js'] }],
+        concurrencia: 1
+      }, 15000);
+
+      check('igual funciona sin el log', r.result.isError !== true, JSON.stringify(r.result));
+      check('no escribe el archivo', !fs.existsSync(rutaProgreso(repoTmp, 'sin-log', 'solo')));
+      check('no menciona el log en el resumen', !/agy-progress/.test(r.result.content[0].text));
+    } finally {
+      await s.stop();
+      removeFixture(repoTmp);
     }
   });
 

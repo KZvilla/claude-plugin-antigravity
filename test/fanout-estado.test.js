@@ -14,7 +14,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { check, group, report } = require('./lib/assert');
 
-const { rutaEstado, crearEscritorDeEstado, rutaControl, marcarDetencion, crearLectorDeControl } = require('../mcp-server/fanout-estado.js');
+const { rutaEstado, crearEscritorDeEstado, rutaControl, marcarDetencion, crearLectorDeControl, rutaProgreso, limpiarProgreso } = require('../mcp-server/fanout-estado.js');
 
 const borrar = d => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch {} };
 
@@ -189,6 +189,31 @@ async function main() {
       } finally {
         fs.renameSync = renameOriginal;
       }
+    });
+
+    await group('ruta y limpieza del log de progreso (FEAT-009)', () => {
+      const ruta = rutaProgreso(repo, 'mi-lote', 'a');
+      check('vive bajo .claude/worktrees, no dentro de un worktree',
+        ruta.includes(path.join('.claude', 'worktrees')) && !ruta.includes('agy-mi-lote-'));
+      check('termina en .jsonl', ruta.endsWith('.jsonl'));
+      check('no crea nada por sí sola', !fs.existsSync(ruta));
+
+      fs.mkdirSync(path.dirname(ruta), { recursive: true });
+      fs.writeFileSync(ruta, '{"event":"init"}\n');
+      check('el archivo quedó donde dice rutaProgreso', fs.existsSync(ruta));
+
+      let lanzo = false;
+      try { limpiarProgreso(repo, 'lote-vacio', 'nunca-existio'); } catch { lanzo = true; }
+      check('limpiarProgreso no revienta si no había nada', !lanzo);
+
+      limpiarProgreso(repo, 'mi-lote', 'a');
+      check('limpiarProgreso borra el log existente', !fs.existsSync(ruta));
+    });
+
+    await group('rutaProgreso no colisiona entre tareas largas que comparten prefijo', () => {
+      const idA = 'feature-subtask-implementation-step-001-parte-a';
+      const idB = 'feature-subtask-implementation-step-001-parte-b';
+      check('distintas rutas de log', rutaProgreso(repo, 'lote-log', idA) !== rutaProgreso(repo, 'lote-log', idB));
     });
   } finally {
     borrar(repo);
