@@ -20,10 +20,10 @@ const {
 const { extractLastCheckpoint } = require('./checkpoint.js');
 const { preprocessSessionLog, renderFacts, renderFinalState } = require('./session-log.js');
 const { getSummaryPrompt, recuperarDocumentoEnlazado, validarDocumento, separarDigest, MARCA_DIGEST } = require('./summary-doc.js');
-const { executeAgyStdin } = require('./agy-stream.js');
+const { executeAgyStdin, executeAgyStreaming } = require('./agy-stream.js');
 const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
 const { lanzarFanout } = require('./fanout.js');
-const { crearEscritorDeEstado } = require('./fanout-estado.js');
+const { crearEscritorDeEstado, crearLectorDeControl, rutaProgreso, limpiarProgreso } = require('./fanout-estado.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -82,6 +82,9 @@ function loadConfig(cwd = process.cwd()) {
     voiceboxPort: parseInt(process.env.VOICEBOX_PORT, 10) || null,
     fanoutStatusline: true,
     fanoutStatuslineDelegate: null,
+    fanoutControl: true,
+    fanoutStopCheckIntervalMs: parseInt(process.env.AGY_FANOUT_STOP_INTERVAL_MS, 10) || 2000,
+    fanoutProgressLog: true,
     permissions: {
       allow: ['read', 'edit', 'commands', 'network'],
       deny: [],
@@ -106,6 +109,9 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.voicebox_port) config.voiceboxPort = parsed.voicebox_port;
       if (parsed.fanout_statusline !== undefined) config.fanoutStatusline = !!parsed.fanout_statusline;
       if (parsed.fanout_statusline_delegate !== undefined) config.fanoutStatuslineDelegate = parsed.fanout_statusline_delegate;
+      if (parsed.fanout_control !== undefined) config.fanoutControl = !!parsed.fanout_control;
+      if (parsed.fanout_stop_check_interval_ms !== undefined) config.fanoutStopCheckIntervalMs = parsed.fanout_stop_check_interval_ms;
+      if (parsed.fanout_progress_log !== undefined) config.fanoutProgressLog = !!parsed.fanout_progress_log;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -123,6 +129,9 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.voicebox_port) config.voiceboxPort = parsed.voicebox_port;
       if (parsed.fanout_statusline !== undefined) config.fanoutStatusline = !!parsed.fanout_statusline;
       if (parsed.fanout_statusline_delegate !== undefined) config.fanoutStatuslineDelegate = parsed.fanout_statusline_delegate;
+      if (parsed.fanout_control !== undefined) config.fanoutControl = !!parsed.fanout_control;
+      if (parsed.fanout_stop_check_interval_ms !== undefined) config.fanoutStopCheckIntervalMs = parsed.fanout_stop_check_interval_ms;
+      if (parsed.fanout_progress_log !== undefined) config.fanoutProgressLog = !!parsed.fanout_progress_log;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -156,6 +165,8 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
   if (updates.voicebox_port !== undefined) existing.voicebox_port = updates.voicebox_port;
   if (updates.fanout_statusline !== undefined) existing.fanout_statusline = updates.fanout_statusline;
   if (updates.fanout_statusline_delegate !== undefined) existing.fanout_statusline_delegate = updates.fanout_statusline_delegate;
+  if (updates.fanout_control !== undefined) existing.fanout_control = updates.fanout_control;
+  if (updates.fanout_progress_log !== undefined) existing.fanout_progress_log = updates.fanout_progress_log;
   if (updates.permissions !== undefined) {
     existing.permissions = {
       ...(existing.permissions || {}),
@@ -916,6 +927,14 @@ const TOOLS = [
         fanout_statusline_delegate: {
           type: 'string',
           description: 'The previous statusLine.command to preserve when installing fanout-statusline.js, so it keeps rendering whatever the user had (e.g. claude-hud) alongside the fanout segment. Set by the setup skill, not meant for manual use.'
+        },
+        fanout_control: {
+          type: 'boolean',
+          description: 'Whether agy_fanout watches per-task stop sentinels (.claude/worktrees/.fanout-stop-<slug>-<taskId>.json) and kills a running subagent early when one appears. Default true; set false to disable the stop mechanism without disabling fanout itself.'
+        },
+        fanout_progress_log: {
+          type: 'boolean',
+          description: 'Whether agy_fanout writes a live per-subagent NDJSON progress log (.claude/worktrees/.agy-progress-<slug>-<taskId>.jsonl), one line per stream-json event as it arrives. Default true; set false to skip writing it (agy_fanout still runs in streaming mode either way). This log is what /lagrange:watch renders.'
         }
       }
     }
@@ -1971,7 +1990,7 @@ ${personaSection}
 // Por encima del limite el prompt se escribe en un fichero temporal y a agy se
 // le pasa un puntero. El umbral es conservador: deja sitio para el resto de
 // argumentos dentro del techo de Windows, que es el mas estrecho.
-const PROMPT_ARG_LIMIT = 24000;
+const { offloadLargePrompt, PROMPT_ARG_LIMIT } = require('./prompt-offload.js');
 
 /**
  * Termina el proceso hijo y, en Windows, todo su arbol de descendientes.
@@ -2005,54 +2024,6 @@ function terminateTree(child, graceMs = 5000) {
   }, graceMs);
   t.unref?.();
   return t;
-}
-
-function offloadLargePrompt(args) {
-  const i = args.indexOf('-p');
-  if (i === -1 || i + 1 >= args.length) return { args, cleanup: () => {} };
-
-  const prompt = args[i + 1];
-  if (typeof prompt !== 'string' || prompt.length <= PROMPT_ARG_LIMIT) {
-    return { args, cleanup: () => {} };
-  }
-
-  let dir;
-  try {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-prompt-'));
-    const file = path.join(dir, 'PROMPT.md');
-    fs.writeFileSync(file, prompt, 'utf8');
-
-    const puntero = [
-      'Your instructions for this task did not fit in a command-line argument,',
-      'so they were written to this file:',
-      '',
-      file,
-      '',
-      'Read that file COMPLETELY, from the first line to the last, before doing',
-      'anything else. Its contents are your prompt: follow them exactly as if',
-      'they had been typed here. Do not ask for confirmation and do not stop at',
-      'a partial read - produce the final answer the file asks for.'
-    ].join('\n');
-
-    const nuevos = [...args];
-    nuevos[i + 1] = puntero;
-    nuevos.push('--add-dir', dir);
-
-    process.stderr.write(
-      `[antigravity-mcp] Prompt de ${prompt.length} caracteres por encima del limite de argumento; volcado a ${file}\n`
-    );
-
-    return {
-      args: nuevos,
-      cleanup: () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
-    };
-  } catch (err) {
-    // Si el volcado falla, es mejor intentar el spawn y que el sistema
-    // operativo de su error que tragarse la tarea en silencio.
-    process.stderr.write(`[antigravity-mcp] No se pudo volcar el prompt a fichero: ${err.message}\n`);
-    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
-    return { args, cleanup: () => {} };
-  }
 }
 
 // Los modelos de agy no aceptan cualquier esfuerzo. `agy models` los lista con
@@ -2194,6 +2165,7 @@ function executeAgy(args, options = {}) {
 
     const timer = setTimeout(() => {
       killed = true;
+      clearInterval(stopTimer);
       terminateTree(child);
       limpiarPrompt();
       resolve({
@@ -2203,6 +2175,33 @@ function executeAgy(args, options = {}) {
         stderr
       });
     }, timeoutMs);
+
+    // Sondeo opcional de detención temprana (FEAT-012). Generaliza el mismo
+    // mecanismo del watchdog de arriba —terminateTree + resolve— pero
+    // disparado por un predicado externo en vez de por tiempo transcurrido.
+    // `stopCheck` no se pasa desde ningún otro caso hoy salvo agy_fanout, así
+    // que sin él el comportamiento es exactamente el de antes de FEAT-012.
+    let stopTimer = null;
+    if (typeof options.stopCheck === 'function') {
+      stopTimer = setInterval(() => {
+        const motivo = options.stopCheck();
+        if (!motivo) return;
+        killed = true;
+        clearTimeout(timer);
+        clearInterval(stopTimer);
+        terminateTree(child);
+        limpiarPrompt();
+        resolve({
+          success: false,
+          error: 'Detenido por el usuario',
+          stopped: true,
+          motivo: typeof motivo === 'string' ? motivo : (motivo.motivo || null),
+          stdout,
+          stderr
+        });
+      }, options.stopCheckIntervalMs || 2000);
+      stopTimer.unref?.();
+    }
 
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString('utf8');
@@ -2215,6 +2214,7 @@ function executeAgy(args, options = {}) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      clearInterval(stopTimer);
       limpiarPrompt();
       resolve({
         success: false,
@@ -2226,8 +2226,15 @@ function executeAgy(args, options = {}) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      clearInterval(stopTimer);
       limpiarPrompt();
       if (killed) return;
+
+      // El proceso terminó solo antes del próximo tick de stopCheck: un pedido
+      // de detención que hubiera llegado justo en ese margen ya no sirve para
+      // nada (nada que matar), pero igual hay que consumirlo para no dejar el
+      // centinela huérfano en disco hasta la próxima corrida de este slug.
+      if (typeof options.stopCheck === 'function') options.stopCheck();
 
       let parsed = null;
       try {
@@ -2551,22 +2558,54 @@ async function handleToolCall(name, args) {
     case 'agy_fanout': {
       const repoPath = args.cwd || process.cwd();
 
+      // Lector de centinelas de detención (FEAT-012), opcional igual que el
+      // escritor de estado de abajo: si está desactivado, `stopCheck` nunca se
+      // pasa y executeAgy se comporta exactamente igual que sin la feature.
+      const lectorControl = config.fanoutControl !== false
+        ? crearLectorDeControl(repoPath, args.slug)
+        : null;
+
       // El ejecutor que se le inyecta al orquestador arma los mismos argumentos
       // que agy_run. `--sandbox` no se ofrece a propósito: rompe el aislamiento
       // por worktree en vez de reforzarlo, y exige UAC (H1 a H3 del documento de
       // diseño). El confinamiento acá es el worktree.
+      //
+      // `--output-format` no se pasa acá (FEAT-009): lo fija executeAgyStreaming
+      // en stream-json, para poder volcar cada evento al log NDJSON del
+      // subagente a medida que llega, en vez de bufferear hasta el cierre.
       const ejecutar = async (peticion) => {
-        const cliArgs = ['--output-format', 'json', '--dangerously-skip-permissions'];
+        const cliArgs = ['--dangerously-skip-permissions'];
         cliArgs.push('--mode', peticion.mode || 'accept-edits');
         cliArgs.push('--effort', peticion.effort || config.defaultEffort || 'high');
         const modelo = peticion.model || config.defaultModel;
         if (modelo) cliArgs.push('--model', modelo);
         cliArgs.push('-p', peticion.prompt);
 
-        const res = await executeAgy(cliArgs, {
-          cwd: peticion.cwd,
-          timeoutMinutes: peticion.timeout_minutes || config.defaultTimeoutMinutes || 15
-        });
+        // Log NDJSON por subagente (FEAT-009), opcional igual que el resto de
+        // esta feature: si está desactivado, `onLine` es un no-op y
+        // executeAgyStreaming corre exactamente igual (la diferencia es
+        // solo si se persiste a disco, no cómo se invoca a agy).
+        let fdLog = null;
+        if (config.fanoutProgressLog !== false) {
+          try { fdLog = fs.openSync(rutaProgreso(repoPath, args.slug, peticion.taskId), 'a'); } catch {}
+        }
+        const onLine = fdLog !== null
+          ? (linea) => { try { fs.writeSync(fdLog, linea + '\n'); } catch {} }
+          : undefined;
+
+        let res;
+        try {
+          res = await executeAgyStreaming(AGY_BIN, cliArgs, {
+            cwd: peticion.cwd,
+            timeoutMinutes: peticion.timeout_minutes || config.defaultTimeoutMinutes || 15,
+            stopCheck: lectorControl ? () => lectorControl.consumirDetencion(peticion.taskId) : undefined,
+            stopCheckIntervalMs: config.fanoutStopCheckIntervalMs,
+            terminate: terminateTree,
+            onLine
+          });
+        } finally {
+          if (fdLog !== null) { try { fs.closeSync(fdLog); } catch {} }
+        }
 
         const datos = res.data || {};
         recordUsage('run', modelo, peticion.effort, datos.conversation_id || '',
@@ -2581,6 +2620,24 @@ async function handleToolCall(name, args) {
         ? crearEscritorDeEstado(repoPath, args.slug, args.tareas)
         : undefined;
 
+      // Barrido de centinelas viejos (FEAT-012): una sola vez por tarea, ANTES
+      // del primer lote — nunca en cada intento, para no arriesgarse a borrar
+      // un pedido de detención legítimo escrito mientras la tarea espera turno
+      // en un lote siguiente o durante el backoff de un reintento por cuota.
+      // Encontrado por auditoría adversarial (agy_audit, 2026-09-09): la
+      // primera versión limpiaba dentro de `ejecutar`, en cada intento.
+      const limpiarControlPrevio = lectorControl
+        ? (taskId) => lectorControl.limpiar(taskId)
+        : undefined;
+
+      // Mismo motivo, mismo punto de enganche, para el log NDJSON de FEAT-009:
+      // barrer el de una corrida anterior con el mismo slug/taskId antes de
+      // que arranque el primer lote, para no mezclar eventos de corridas
+      // distintas en el mismo archivo.
+      const limpiarProgresoPrevio = config.fanoutProgressLog !== false
+        ? (taskId) => limpiarProgreso(repoPath, args.slug, taskId)
+        : undefined;
+
       let salida;
       try {
         salida = await lanzarFanout({
@@ -2591,7 +2648,7 @@ async function handleToolCall(name, args) {
           modelo: args.modelo,
           effort: args.effort,
           timeoutMinutes: args.timeout_minutes
-        }, { ejecutar, registrarEstado });
+        }, { ejecutar, registrarEstado, limpiarControlPrevio, limpiarProgresoPrevio });
       } catch (err) {
         return {
           isError: true,
@@ -2610,11 +2667,14 @@ async function handleToolCall(name, args) {
       texto += `- Rama base: \`${salida.ramaBase}\`${salida.ramaBaseCreada ? ' (creada ahora)' : ''}\n`;
       texto += `- Concurrencia: ${salida.concurrencia} · ${salida.lotes} lote(s)\n`;
       texto += `- Resultado: ${salida.resumen.exitosas} ok, ${salida.resumen.fallidas} fallidas`;
-      texto += salida.resumen.fallidasPorCuota ? ` (${salida.resumen.fallidasPorCuota} por cuota)\n\n` : '\n\n';
+      const detalleFallas = [];
+      if (salida.resumen.fallidasPorCuota) detalleFallas.push(`${salida.resumen.fallidasPorCuota} por cuota`);
+      if (salida.resumen.fallidasDetenidas) detalleFallas.push(`${salida.resumen.fallidasDetenidas} detenidas`);
+      texto += detalleFallas.length ? ` (${detalleFallas.join(', ')})\n\n` : '\n\n';
 
       texto += `| Tarea | Rama | Estado | Intentos | Conversation ID |\n|---|---|---|---|---|\n`;
       for (const r of salida.resultados) {
-        const estado = r.exito ? 'ok' : (r.porCuota ? 'falló (cuota)' : 'falló');
+        const estado = r.exito ? 'ok' : (r.detenido ? 'detenida' : (r.porCuota ? 'falló (cuota)' : 'falló'));
         texto += `| \`${r.id}\` | \`${r.rama}\` | ${estado} | ${r.intentos} | ${r.conversation_id || '—'} |\n`;
       }
 
@@ -2627,6 +2687,10 @@ async function handleToolCall(name, args) {
       texto += `\n**Siguiente paso (tuyo, no de los subagentes):** ${salida.siguientePaso}\n`;
       texto += `\nLos worktrees siguen en \`.claude/worktrees/\`. Cuando termines de integrar, `;
       texto += `limpiá los que queden sin trabajo pendiente.\n`;
+      if (config.fanoutProgressLog !== false) {
+        texto += `\nLog NDJSON por subagente en \`.claude/worktrees/.agy-progress-${args.slug}-<taskId>.jsonl\` `;
+        texto += `(un evento por línea, tal como lo emite \`agy\`).\n`;
+      }
 
       return { content: [{ type: 'text', text: texto }] };
     }

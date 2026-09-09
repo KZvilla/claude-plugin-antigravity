@@ -61,6 +61,10 @@ function ejecutorFalso({ fallar = {}, registrarConcurrencia = false } = {}) {
     // El id de la tarea viaja dentro del prompt, bajo la sección [TAREA].
     const id = (peticion.prompt.match(/hacer ([a-z0-9-]+)/) || [])[1];
     const plan = fallar[id];
+    if (plan && plan.stopped) {
+      plan.usadas = (plan.usadas || 0) + 1;
+      return { success: false, error: 'Detenido por el usuario', stopped: true };
+    }
     if (plan) {
       const restantes = plan.veces === undefined ? Infinity : plan.veces;
       plan.usadas = (plan.usadas || 0) + 1;
@@ -228,6 +232,191 @@ async function main() {
 
   repo = crearRepo();
   try {
+    await group('detención pedida a mano (FEAT-012)', async () => {
+      const eje = ejecutorFalso({ fallar: { a: { stopped: true } } });
+      const registrador = registradorFalso();
+
+      const r = await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-stop',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])],
+        concurrencia: 2
+      }, { ejecutar: eje.ejecutar, registrarEstado: registrador });
+
+      check('la petición lleva su propio taskId',
+        eje.llamadas.every(l => typeof l.taskId === 'string' && l.taskId.length > 0));
+
+      const porId = Object.fromEntries(r.resultados.map(x => [x.id, x]));
+      check('no se reintenta (un solo intento)', porId.a.intentos === 1, `intentos = ${porId.a.intentos}`);
+      check('queda marcada como detenida, no como error genérico', porId.a.detenido === true);
+      check('no se confunde con una falla de cuota', porId.a.porCuota === false);
+      check('la otra tarea sigue su curso normal', porId.b.exito === true && porId.b.detenido === false);
+
+      check('el resumen distingue las detenidas', r.resumen.fallidasDetenidas === 1);
+      check('y las cuenta aparte de las de cuota', r.resumen.fallidasPorCuota === 0);
+      check('registrarEstado también ve `detenido`',
+        registrador.llamadas.marcar.some(m => m.id === 'a' && m.estado === 'error' && m.detenido === true));
+
+      // FEAT-015: sin esto el archivo de estado decía `error` y nada más, así
+      // que ningún visor podía explicar el fallo.
+      const cierre = registrador.llamadas.marcar.find(m => m.id === 'a' && m.estado === 'error');
+      check('persiste el texto del error', typeof cierre.error === 'string' && cierre.error.length > 0, JSON.stringify(cierre));
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('limpiarControlPrevio corre una sola vez por tarea, antes de cualquier ejecutar (FEAT-012)', async () => {
+      // Regresión de la auditoría adversarial (agy_audit, 2026-09-09): la
+      // primera versión limpiaba el centinela DENTRO de `ejecutar`, en cada
+      // intento — lo que borraba un pedido de detención legítimo escrito
+      // mientras una tarea esperaba turno, o durante el backoff de un
+      // reintento por cuota. Acá se prueba la garantía de orden que lo evita:
+      // el barrido pasa una sola vez, antes de que arranque el primer lote.
+      const eventos = [];
+      const limpiarControlPrevio = (taskId) => eventos.push(`limpiar:${taskId}`);
+      const eje = ejecutorFalso({ fallar: { a: { error: 'HTTP 429 quota exceeded', veces: 2 } } });
+      const ejecutarConLog = async (peticion) => {
+        const id = (peticion.prompt.match(/hacer ([a-z0-9-]+)/) || [])[1];
+        eventos.push(`ejecutar:${id}`);
+        return eje.ejecutar(peticion);
+      };
+
+      await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-orden',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])],
+        esperaBaseMs: 1
+      }, { ejecutar: ejecutarConLog, alDormir: async () => {}, limpiarControlPrevio });
+
+      const ultimaLimpieza = Math.max(eventos.indexOf('limpiar:a'), eventos.indexOf('limpiar:b'));
+      const primerEjecutar = Math.min(
+        eventos.indexOf('ejecutar:a'),
+        eventos.indexOf('ejecutar:b') === -1 ? Infinity : eventos.indexOf('ejecutar:b')
+      );
+      check('ambas limpiezas ocurren antes de cualquier ejecutar', ultimaLimpieza < primerEjecutar, eventos.join(','));
+
+      check('a se reintenta 3 veces por cuota pero se limpia una sola vez',
+        eventos.filter(e => e === 'ejecutar:a').length === 3 &&
+        eventos.filter(e => e === 'limpiar:a').length === 1,
+        eventos.join(','));
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('sin limpiarControlPrevio no cambia nada (no-op por defecto)', async () => {
+      const eje = ejecutorFalso();
+      const r = await lanzarFanout({
+        repoPath: repo, slug: 'sin-limpieza', tareas: [tarea('a', ['src/a.js'])]
+      }, { ejecutar: eje.ejecutar });
+      check('funciona igual sin limpiarControlPrevio', r.lanzado === true && r.resumen.exitosas === 1);
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('limpiarProgresoPrevio corre una sola vez por tarea, antes de cualquier ejecutar (FEAT-009)', async () => {
+      // Mismo patrón que limpiarControlPrevio (FEAT-012): un barrido único
+      // antes del primer lote, no por intento — evita mezclar el log de una
+      // corrida anterior con el mismo slug/taskId.
+      const eventos = [];
+      const limpiarProgresoPrevio = (taskId) => eventos.push(`limpiar:${taskId}`);
+      const eje = ejecutorFalso({ fallar: { a: { error: 'HTTP 429 quota exceeded', veces: 1 } } });
+      const ejecutarConLog = async (peticion) => {
+        const id = (peticion.prompt.match(/hacer ([a-z0-9-]+)/) || [])[1];
+        eventos.push(`ejecutar:${id}`);
+        return eje.ejecutar(peticion);
+      };
+
+      await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-orden-log',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])],
+        esperaBaseMs: 1
+      }, { ejecutar: ejecutarConLog, alDormir: async () => {}, limpiarProgresoPrevio });
+
+      const ultimaLimpieza = Math.max(eventos.indexOf('limpiar:a'), eventos.indexOf('limpiar:b'));
+      const primerEjecutar = Math.min(eventos.indexOf('ejecutar:a'), eventos.indexOf('ejecutar:b'));
+      check('ambas limpiezas ocurren antes de cualquier ejecutar', ultimaLimpieza < primerEjecutar, eventos.join(','));
+      check('a se reintenta 2 veces por cuota pero se limpia una sola vez',
+        eventos.filter(e => e === 'ejecutar:a').length === 2 &&
+        eventos.filter(e => e === 'limpiar:a').length === 1,
+        eventos.join(','));
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('sin limpiarProgresoPrevio no cambia nada (no-op por defecto)', async () => {
+      const eje = ejecutorFalso();
+      const r = await lanzarFanout({
+        repoPath: repo, slug: 'sin-limpieza-log', tareas: [tarea('a', ['src/a.js'])]
+      }, { ejecutar: eje.ejecutar });
+      check('funciona igual sin limpiarProgresoPrevio', r.lanzado === true && r.resumen.exitosas === 1);
+    });
+  } finally { borrar(repo); }
+
+
+  repo = crearRepo();
+  try {
+    await group('persiste el motivo y el error para que el visor pueda explicarlos (FEAT-015)', async () => {
+      const registrador = registradorFalso();
+      const eje = {
+        ejecutar: async (peticion) => {
+          const id = (peticion.prompt.match(/hacer ([a-z0-9-]+)/) || [])[1];
+          if (id === 'a') return { success: false, error: 'Antigravity MCP process watchdog timed out after 15 minutes' };
+          if (id === 'b') return { success: false, stopped: true, error: 'Detenido por el usuario', motivo: 'se fue por las ramas' };
+          return { success: true };
+        }
+      };
+
+      await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-motivos',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])],
+        concurrencia: 2
+      }, { ejecutar: eje.ejecutar, registrarEstado: registrador });
+
+      const deA = registrador.llamadas.marcar.find(m => m.id === 'a' && m.estado === 'error');
+      check('un timeout deja su texto en el estado (antes: solo "error")',
+        /watchdog timed out/.test(deA.error || ''), JSON.stringify(deA));
+      check('y no se confunde con cuota ni detención', deA.porCuota === false && deA.detenido === false);
+
+      const deB = registrador.llamadas.marcar.find(m => m.id === 'b' && m.estado === 'error');
+      check('una detención guarda el motivo de quien la pidió', deB.motivo === 'se fue por las ramas', JSON.stringify(deB));
+
+      const deOk = registrador.llamadas.marcar.find(m => m.id === 'a' && m.estado === 'ok');
+      check('una tarea que sale bien no guarda error', deOk === undefined || deOk.error === null);
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('metadatos por tarea al iniciar (FEAT-015)', async () => {
+      const registrador = registradorFalso();
+      const eje = ejecutorFalso();
+
+      await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-meta',
+        tareas: [tarea('a', ['src/a.js', 'src/b.js'], { modelo: 'gemini-3.1-pro' }), tarea('b', ['src/c.js'])],
+        modelo: 'gemini-3.8-flash'
+      }, { ejecutar: eje.ejecutar, registrarEstado: registrador });
+
+      const meta = registrador.llamadas.iniciar[0].meta;
+      check('iniciar() recibe metadatos por tarea', meta && meta.a && meta.b, JSON.stringify(meta));
+      check('los archivos declarados (el contrato de disjunción, §4.2)',
+        meta.a.archivos.join(',') === 'src/a.js,src/b.js', JSON.stringify(meta.a));
+      check('el modelo de la tarea pisa el del lote', meta.a.modelo === 'gemini-3.1-pro');
+      check('y el del lote se usa si la tarea no trae', meta.b.modelo === 'gemini-3.8-flash');
+      check('la rama del worktree', /^wt\/agy-con-meta-/.test(meta.a.rama), meta.a.rama);
+      check('NO se persiste la ruta del worktree (ruido en una tarjeta angosta)', !('ruta' in meta.a));
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
     await group('engancha el estado de orquestación (FEAT-005 V1)', async () => {
       const eje = ejecutorFalso({ fallar: { a: { error: 'HTTP 429 quota exceeded', veces: 1 } } });
       const registrador = registradorFalso();
@@ -355,6 +544,141 @@ async function main() {
       check('nunca lanzó agy', fs.readFileSync(capturas, 'utf8').trim() === '');
       check('no dejó el repo fuera de main',
         execFileSync('git', ['-C', repoTmp, 'branch', '--show-current'], { encoding: 'utf8' }).trim() === 'main');
+    } finally {
+      await s.stop();
+      removeFixture(repoTmp);
+    }
+  });
+
+  await group('agy_fanout mata un subagente en vuelo vía centinela (FEAT-012)', async () => {
+    const { startServer, removeFixture } = require('./lib/mcp-client');
+    const { marcarDetencion } = require('../mcp-server/fanout-estado.js');
+    const repoTmp = crearRepo();
+    const capturas = path.join(repoTmp, 'cap.jsonl');
+    fs.writeFileSync(capturas, '');
+
+    // Sondeo rápido para que el test no tenga que esperar los 2s de producción,
+    // y un stub que se queda "corriendo" 2.5s para poder demostrar que se lo
+    // mata ANTES de que termine solo, no que casualmente coincida con el cierre.
+    fs.mkdirSync(path.join(repoTmp, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(repoTmp, '.claude', 'antigravity.json'),
+      JSON.stringify({ fanout_stop_check_interval_ms: 50 }));
+
+    const previoHold = process.env.STUB_HOLD_MS;
+    process.env.STUB_HOLD_MS = '2500';
+    const s = startServer({ cwd: repoTmp, captureFile: capturas });
+
+    try {
+      await s.initialize();
+
+      const inicio = Date.now();
+      const promesa = s.callTool('agy_fanout', {
+        slug: 'con-stop',
+        tareas: [{ id: 'solo', prompt: 'hacer algo', archivos: ['src/solo.js'] }],
+        concurrencia: 1
+      }, 15000);
+
+      // Reescribe el centinela cada 25ms hasta que la tool call resuelva, en
+      // vez de un único write cronometrado a mano. La primera versión de este
+      // test escribía una sola vez tras un `setTimeout(200)`, apostando a que
+      // ya hubiera pasado el barrido de centinelas viejos del lado del
+      // servidor (preparar rama base + crear worktrees, variable e
+      // independiente de este proceso) — una auditoría adversarial
+      // (agy_audit, 2026-09-09) lo reprodujo como flaky en un entorno donde
+      // esa preparación tardó más que el margen elegido. Reescribir en loop
+      // hasta que la promesa resuelva es correcto para cualquier timing: el
+      // servidor solo barre centinelas ANTES del primer lote (fanout.js,
+      // `limpiarControlPrevio`) y nunca más durante la corrida, así que
+      // cualquier escritura nuestra posterior a ese barrido sobrevive hasta
+      // que `stopCheck` la consuma.
+      let sigueEscribiendo = true;
+      const reescribir = async () => {
+        while (sigueEscribiendo) {
+          marcarDetencion(repoTmp, 'con-stop', 'solo', 'se fue por las ramas');
+          await new Promise(r => setTimeout(r, 25));
+        }
+      };
+      const loopEscritura = reescribir();
+
+      const r = await promesa;
+      const elapsedMs = Date.now() - inicio;
+      sigueEscribiendo = false;
+      await loopEscritura;
+
+      check('resuelve bien antes de los 2.5s del hold', elapsedMs < 2000, `elapsed = ${elapsedMs}ms`);
+      check('no devuelve isError', r.result.isError !== true, JSON.stringify(r.result));
+      const texto = r.result.content[0].text;
+      check('la tabla marca la tarea como detenida', /\bdetenida\b/.test(texto), texto);
+      check('el resumen cuenta 1 detenida', /1 detenidas/.test(texto), texto);
+
+      const eventos = fs.readFileSync(capturas, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+      check('efectivamente se invocó kill() sobre el proceso', eventos.some(e => e.event === 'kill'), JSON.stringify(eventos));
+    } finally {
+      await s.stop();
+      removeFixture(repoTmp);
+      if (previoHold === undefined) delete process.env.STUB_HOLD_MS;
+      else process.env.STUB_HOLD_MS = previoHold;
+    }
+  });
+
+  await group('agy_fanout escribe el log NDJSON por subagente (FEAT-009)', async () => {
+    const { startServer, removeFixture } = require('./lib/mcp-client');
+    const { rutaProgreso } = require('../mcp-server/fanout-estado.js');
+    const repoTmp = crearRepo();
+    const capturas = path.join(repoTmp, 'cap.jsonl');
+    fs.writeFileSync(capturas, '');
+    const s = startServer({ cwd: repoTmp, captureFile: capturas });
+
+    try {
+      await s.initialize();
+
+      const r = await s.callTool('agy_fanout', {
+        slug: 'con-log',
+        tareas: [{ id: 'solo', prompt: 'hacer algo', archivos: ['src/solo.js'] }],
+        concurrencia: 1
+      }, 15000);
+
+      check('no devuelve isError', r.result.isError !== true, JSON.stringify(r.result));
+
+      const ruta = rutaProgreso(repoTmp, 'con-log', 'solo');
+      check('el log quedó escrito en disco', fs.existsSync(ruta), ruta);
+
+      const lineas = fs.readFileSync(ruta, 'utf8').trim().split('\n').filter(Boolean);
+      const eventosLog = lineas.map(l => JSON.parse(l));
+      check('trae las 3 líneas que emite el stub, sin bufferear', eventosLog.length === 3, JSON.stringify(eventosLog));
+      check('en el mismo orden en que las emite agy', eventosLog.map(e => e.event).join(',') === 'init,step_update,result',
+        eventosLog.map(e => e.event).join(','));
+
+      check('el texto de respuesta menciona dónde está el log',
+        /\.agy-progress-con-log-<taskId>\.jsonl/.test(r.result.content[0].text), r.result.content[0].text);
+    } finally {
+      await s.stop();
+      removeFixture(repoTmp);
+    }
+  });
+
+  await group('agy_fanout respeta fanout_progress_log: false (FEAT-009)', async () => {
+    const { startServer, removeFixture } = require('./lib/mcp-client');
+    const { rutaProgreso } = require('../mcp-server/fanout-estado.js');
+    const repoTmp = crearRepo();
+    fs.mkdirSync(path.join(repoTmp, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(repoTmp, '.claude', 'antigravity.json'), JSON.stringify({ fanout_progress_log: false }));
+    const capturas = path.join(repoTmp, 'cap.jsonl');
+    fs.writeFileSync(capturas, '');
+    const s = startServer({ cwd: repoTmp, captureFile: capturas });
+
+    try {
+      await s.initialize();
+
+      const r = await s.callTool('agy_fanout', {
+        slug: 'sin-log',
+        tareas: [{ id: 'solo', prompt: 'hacer algo', archivos: ['src/solo.js'] }],
+        concurrencia: 1
+      }, 15000);
+
+      check('igual funciona sin el log', r.result.isError !== true, JSON.stringify(r.result));
+      check('no escribe el archivo', !fs.existsSync(rutaProgreso(repoTmp, 'sin-log', 'solo')));
+      check('no menciona el log en el resumen', !/agy-progress/.test(r.result.content[0].text));
     } finally {
       await s.stop();
       removeFixture(repoTmp);

@@ -21,6 +21,7 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const DIR_WORKTREES = path.join('.claude', 'worktrees');
 
@@ -35,6 +36,130 @@ function slugificarArchivo(slug) {
 
 function rutaEstado(repoPath, slug) {
   return path.join(repoPath, DIR_WORKTREES, `.fanout-status-${slugificarArchivo(slug)}.json`);
+}
+
+/**
+ * Igual que slugificarArchivo, pero pensado para un `taskId` que va a
+ * formar parte de un NOMBRE DE ARCHIVO junto al de otras tareas del mismo
+ * lote — no alcanza con truncar a 40 chars y listo: dos ids que solo
+ * difieren después del carácter 40 producirían el mismo archivo y
+ * terminarían compartiendo el mismo centinela (encontrado por auditoría
+ * adversarial, agy_audit, 2026-09-09). El sufijo hash hace la colisión
+ * computacionalmente despreciable sin perder la parte legible para debug.
+ */
+function idParaArchivo(taskId) {
+  const legible = slugificarArchivo(taskId).slice(0, 24);
+  const hash = crypto.createHash('sha1').update(String(taskId)).digest('hex').slice(0, 10);
+  return `${legible}-${hash}`;
+}
+
+/**
+ * Centinela de detención por tarea (FEAT-012).
+ *
+ * A propósito NO es un único archivo compartido con un array de ids: eso
+ * reintroduce entre procesos (varios panes, o un pane y la CLI) exactamente
+ * la carrera que BE-010 tuvo que resolver con un lock para
+ * antigravity-usage.json. Con un archivo por `taskId`, cada uno tiene como
+ * máximo un escritor posible por construcción — nada más que quien apunta a
+ * ese taskId va a crear ese path exacto — así que no hace falta lock.
+ */
+function rutaControl(repoPath, slug, taskId) {
+  return path.join(repoPath, DIR_WORKTREES, `.fanout-stop-${slugificarArchivo(slug)}-${idParaArchivo(taskId)}.json`);
+}
+
+const RENAME_REINTENTOS = 5;
+const RENAME_ESPERA_MS = 15;
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * No hay un escritor rival del que protegerse (rutaControl es un archivo por
+ * taskId), pero SÍ hay un lector-y-borrador rival: `consumirDetencion` del
+ * lado del orquestador hace su propio `readFileSync`/`unlinkSync` sobre este
+ * mismo path, en otro proceso. En Windows eso puede dejar el destino
+ * brevemente tomado y `renameSync` tira `EPERM`/`EBUSY` — no hipotético:
+ * reproducido escribiendo en loop rápido mientras el otro lado sondea
+ * (auditoría adversarial, agy_audit, 2026-09-09). No hace falta un lock como
+ * el de antigravity-usage.json (BE-010): el conflicto es transitorio, no una
+ * carrera de datos — `consumirDetencion` ya tolera un archivo ausente o a
+ * medio escribir. Alcanza con reintentar el rename unos milisegundos.
+ */
+function renombrarConReintento(origen, destino) {
+  for (let intento = 0; ; intento++) {
+    try {
+      fs.renameSync(origen, destino);
+      return;
+    } catch (err) {
+      const transitorio = err && (err.code === 'EPERM' || err.code === 'EBUSY');
+      if (!transitorio || intento >= RENAME_REINTENTOS) throw err;
+      sleepSync(RENAME_ESPERA_MS);
+    }
+  }
+}
+
+/**
+ * Pide que se detenga una tarea en vuelo. La escritura es atómica
+ * (temporal + rename), con reintento ante contención transitoria — ver
+ * renombrarConReintento.
+ */
+function marcarDetencion(repoPath, slug, taskId, motivo) {
+  const ruta = rutaControl(repoPath, slug, taskId);
+  fs.mkdirSync(path.dirname(ruta), { recursive: true });
+  const tmp = `${ruta}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ detenidoEn: new Date().toISOString(), motivo: motivo || null }, null, 2), 'utf8');
+  renombrarConReintento(tmp, ruta);
+}
+
+/**
+ * Lector del lado del orquestador. `consumirDetencion` no solo chequea: borra
+ * el centinela al leerlo, para que un pedido de esta corrida no sobreviva y
+ * mate en silencio a un subagente de una corrida futura que reuse el mismo
+ * slug/taskId (p. ej. reintentar un lote fallido).
+ */
+function crearLectorDeControl(repoPath, slug) {
+  return {
+    consumirDetencion(taskId) {
+      const ruta = rutaControl(repoPath, slug, taskId);
+      let datos;
+      try {
+        datos = JSON.parse(fs.readFileSync(ruta, 'utf8'));
+      } catch {
+        return null; // no existe (el caso normal) o quedó a medio escribir: no hay pedido válido.
+      }
+      try { fs.unlinkSync(ruta); } catch {}
+      return datos;
+    },
+    limpiar(taskId) {
+      try { fs.unlinkSync(rutaControl(repoPath, slug, taskId)); } catch {}
+    }
+  };
+}
+
+/**
+ * Log NDJSON por subagente (FEAT-009), un archivo por `taskId`.
+ *
+ * A propósito NO vive dentro del worktree del subagente (`<worktree>/.agy-
+ * progress.jsonl`, como decía la propuesta original en §7.1) — un archivo
+ * suelto ahí lo vería `git status --porcelain` como cambio sin commitear y
+ * `inspeccionarWorktrees` (FEAT-003) clasificaría el worktree como "sucio"
+ * aunque el subagente no haya tocado nada, bloqueando la limpieza automática.
+ * Mismo escarmiento que ya dejó FEAT-012 con el centinela de control: los
+ * archivos de orquestación van a nivel de repo, bajo `.claude/worktrees/`,
+ * nunca dentro de cada worktree.
+ */
+function rutaProgreso(repoPath, slug, taskId) {
+  return path.join(repoPath, DIR_WORKTREES, `.agy-progress-${slugificarArchivo(slug)}-${idParaArchivo(taskId)}.jsonl`);
+}
+
+/**
+ * Borra el log de una corrida anterior con el mismo slug/taskId, para que no
+ * se mezcle con el de esta — mismo motivo y mismo punto de enganche
+ * (`limpiarControlPrevio`, una sola vez antes del primer lote) que FEAT-012.
+ */
+function limpiarProgreso(repoPath, slug, taskId) {
+  try { fs.unlinkSync(rutaProgreso(repoPath, slug, taskId)); } catch {}
 }
 
 /**
@@ -74,7 +199,15 @@ function crearEscritorDeEstado(repoPath, slug, tareas) {
       iniciado: ahora,
       actualizado: ahora,
       terminado: null,
-      tareas: Object.fromEntries(tareas.map(t => [t.id, { estado: 'pendiente', intentos: 0 }]))
+      // `meta.meta[id]` trae lo que se sabe de la tarea al arrancar (archivos,
+      // rama, modelo — FEAT-015). Es opcional: sin él, el arranque es el de
+      // siempre. Los consumidores existentes ignoran propiedades que no
+      // conocen, así que agrandar cada tarea no rompe la statusline.
+      tareas: Object.fromEntries(tareas.map(t => [t.id, {
+        estado: 'pendiente',
+        intentos: 0,
+        ...((meta.meta && meta.meta[t.id]) || {})
+      }]))
     };
     escribir(datos);
   }
@@ -98,4 +231,8 @@ function crearEscritorDeEstado(repoPath, slug, tareas) {
   return { iniciar, marcar, terminar, rutaArchivo };
 }
 
-module.exports = { rutaEstado, crearEscritorDeEstado, DIR_WORKTREES };
+module.exports = {
+  rutaEstado, crearEscritorDeEstado, DIR_WORKTREES,
+  rutaControl, marcarDetencion, crearLectorDeControl,
+  rutaProgreso, limpiarProgreso
+};

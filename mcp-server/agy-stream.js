@@ -20,6 +20,7 @@
  */
 const { spawn } = require('child_process');
 const readline = require('readline');
+const { offloadLargePrompt } = require('./prompt-offload.js');
 
 /**
  * Acumulador puro de la salida NDJSON de agy.
@@ -220,4 +221,143 @@ function executeAgyStdin(binario, prompt, args, options = {}) {
   });
 }
 
-module.exports = { crearAcumuladorStream, executeAgyStdin };
+/**
+ * Igual contrato de retorno que executeAgy (index.js), pero para el modo
+ * fan-out (FEAT-009): un solo turno vía `-p`/argumentos normales — NO stdin,
+ * a diferencia de executeAgyStdin de arriba, que es para el modo charla
+ * bidireccional — con la salida parseada A MEDIDA QUE LLEGA en vez de
+ * buffereada hasta el cierre. `options.onLine(linea)` se invoca por cada
+ * línea NDJSON cruda tal como la emite `agy`, antes de que el proceso
+ * termine, para que quien llama pueda ir volcándola a un log en disco sin
+ * esperar el resultado final.
+ *
+ * Verificado en vivo el 2026-09-09 contra agy v1.1.28: `--output-format
+ * stream-json` funciona con `-p` normal, sin necesitar `--input-format
+ * stream-json` (que es exclusivo del modo charla bidireccional) — el
+ * esquema de eventos (`init`/`step_update`/`result`) es el mismo que ya
+ * usa executeAgyStdin, así que se reutiliza crearAcumuladorStream tal cual.
+ *
+ * `options.stopCheck`/`options.stopCheckIntervalMs` (FEAT-012): mismo
+ * mecanismo que executeAgy — un predicado sondeado por setInterval que, si
+ * dispara, mata el proceso (vía `options.terminate`, inyectado para no
+ * acoplar este módulo a terminateTree de index.js) y resuelve con
+ * `stopped: true`. Mismo cuidado de limpiar ambos timers en los 4 caminos
+ * de salida que la auditoría adversarial de FEAT-012 exigió para executeAgy.
+ */
+function executeAgyStreaming(binario, args, options = {}) {
+  const timeoutMinutes = options.timeoutMinutes || 15;
+  const timeoutMs = (timeoutMinutes + 1) * 60 * 1000;
+  const cwd = options.cwd || process.cwd();
+  const onLine = options.onLine || (() => {});
+  const terminate = options.terminate || ((child) => { try { child.kill('SIGKILL'); } catch {} });
+
+  // Mismo volcado a fichero para prompts grandes que ya usa executeAgy
+  // (index.js) — extraído a prompt-offload.js justamente para que esta
+  // función lo comparta en vez de duplicarlo u olvidarlo (encontrado por
+  // auditoría adversarial, agy_audit, 2026-09-09: la primera versión pasaba
+  // `args` directo a `spawn`, sin volcar prompts por encima del límite).
+  const { args: descargados, cleanup: limpiarPrompt } = offloadLargePrompt(args);
+  const finalArgs = descargados.includes('--output-format') ? [...descargados] : [...descargados, '--output-format', 'stream-json'];
+
+  return new Promise((resolve) => {
+    const acumulador = crearAcumuladorStream();
+    let stderr = '';
+    let killed = false;
+    const inicio = Date.now();
+
+    let child;
+    try {
+      child = spawn(binario, finalArgs, { cwd, shell: false, env: { ...process.env } });
+    } catch (err) {
+      limpiarPrompt();
+      return resolve({ success: false, error: `Failed to spawn ${binario}: ${err.message}`, stdout: '', stderr: '' });
+    }
+
+    const timer = setTimeout(() => {
+      killed = true;
+      clearInterval(stopTimer);
+      terminate(child);
+      limpiarPrompt();
+      resolve({
+        success: false,
+        error: `Antigravity MCP process watchdog timed out after ${timeoutMinutes} minutes`,
+        stdout: acumulador.resultado().response,
+        stderr
+      });
+    }, timeoutMs);
+
+    let stopTimer = null;
+    if (typeof options.stopCheck === 'function') {
+      stopTimer = setInterval(() => {
+        const motivo = options.stopCheck();
+        if (!motivo) return;
+        killed = true;
+        clearTimeout(timer);
+        clearInterval(stopTimer);
+        terminate(child);
+        limpiarPrompt();
+        resolve({
+          success: false,
+          error: 'Detenido por el usuario',
+          stopped: true,
+          motivo: typeof motivo === 'string' ? motivo : (motivo.motivo || null),
+          stdout: acumulador.resultado().response,
+          stderr
+        });
+      }, options.stopCheckIntervalMs || 2000);
+      stopTimer.unref?.();
+    }
+
+    const rl = readline.createInterface({ input: child.stdout, terminal: false });
+    rl.on('line', (linea) => {
+      acumulador.onLine(linea);
+      onLine(linea);
+    });
+
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      clearInterval(stopTimer);
+      limpiarPrompt();
+      resolve({ success: false, error: `Failed to spawn ${binario}: ${err.message}`, stdout: '', stderr });
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      clearInterval(stopTimer);
+      limpiarPrompt();
+      if (killed) return;
+
+      // Mismo motivo que executeAgy: consumir un centinela que haya llegado
+      // justo antes del cierre natural, aunque ya no sirva para matar nada —
+      // para no dejarlo huérfano en disco hasta la próxima corrida.
+      if (typeof options.stopCheck === 'function') options.stopCheck();
+
+      const r = acumulador.resultado();
+      const data = {
+        response: r.response,
+        conversation_id: r.conversationId,
+        duration_seconds: r.durationSeconds != null ? r.durationSeconds : (Date.now() - inicio) / 1000,
+        usage: r.usage
+      };
+
+      if (code === 0 && !r.error) {
+        resolve({ success: true, data, rawOutput: r.response });
+        return;
+      }
+
+      let errorMsg = r.error
+        ? `Antigravity error: "${r.error}".`
+        : `Antigravity CLI exited with code ${code}.`;
+      if (!r.eventos) {
+        errorMsg += ' No se recibio ningun evento por stdout.';
+      }
+      if (stderr.trim()) errorMsg += ` Stderr: ${stderr.trim().slice(0, 500)}`;
+
+      resolve({ success: false, data, error: errorMsg, stdout: r.response, stderr });
+    });
+  });
+}
+
+module.exports = { crearAcumuladorStream, executeAgyStdin, executeAgyStreaming };

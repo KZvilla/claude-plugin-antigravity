@@ -112,7 +112,7 @@ function main() {
     // menu porque orquesta un ciclo completo (validar reparto, worktrees,
     // concurrencia con backoff, auditoria, tests, merge) que no se puede pedir
     // con una llamada suelta a agy_run.
-    check('twelve commands present', commands.length === 12, `found ${commands.length}: ${commands.join(', ')}`);
+    check('thirteen commands present', commands.length === 13, `found ${commands.length}: ${commands.join(', ')}`);
     check('five skills present', skills.length === 5, `found ${skills.length}: ${skills.join(', ')}`);
     check('no command carries the redundant agy- prefix',
       commands.every(c => !c.startsWith('agy-')), commands.filter(c => c.startsWith('agy-')).join(', '));
