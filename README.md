@@ -21,6 +21,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [MCP Tools Reference](#-mcp-tools-reference)
 - [Permissions (ALLOW / DENY)](#-granular-permissions-system-allow--deny)
 - [Concurrent Subagent Fan-Out (`/lagrange:fanout`)](#-concurrent-subagent-fan-out-lagrangefanout)
+- [Watching a Fan-Out Live (`/lagrange:watch`)](#-watching-a-fan-out-live-lagrangewatch)
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
 - [Telemetry (`/lagrange:usage`)](#-telemetry--usage-tracking-lagrangeusage)
 - [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-lagrangesummary)
@@ -80,6 +81,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 |---|---------|-------------|
 | 🤖 | **Autonomous Subagent** | Claude spins up Antigravity to execute complex tasks, multi-step refactors, and test suites |
 | 🔀 | **Concurrent Fan-Out** | Runs parallel Antigravity subagents across isolated git worktrees with disjoint-file safety checks (`/lagrange:fanout`) |
+| 👁️ | **Live Fan-Out Viewer** | Watch every subagent in your browser — streamed prose, tool calls, elapsed time, failure reasons, and a stop button (`/lagrange:watch`) |
 | 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (3.8 / 3.7 Flash, 3.1 Pro) with configurable reasoning effort |
 | 🎙️ | **Voice Checkpoint Narration** | Zero-Claude-token spoken status updates via Voicebox TTS with automatic profile fallback |
 | 🗣️ | **Real-Time Voice Mode** | Full-duplex spoken conversation with barge-in, mic capture, and Silero VAD (`voice-chat/`) — zero-cloud audio via a local Voicebox TTS/STT engine |
@@ -113,6 +115,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 | `/lagrange:run <prompt>` | Delegate any task to Antigravity (read + write) |
 | `/lagrange:plan <task>` | Generate an architectural plan (read-only, no file changes) |
 | `/lagrange:fanout [plan]` | Run atomic tasks in parallel, one Antigravity subagent per isolated git worktree |
+| `/lagrange:watch [slug]` | Watch a running fan-out in your browser: live per-subagent progress, elapsed time, and a stop button |
 | `/lagrange:review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
 | `/lagrange:audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
 | `/lagrange:summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
@@ -216,7 +219,10 @@ Denying `"network"` blocks web search and URL fetching, and makes `agy_research`
     "deny_paths": [".env*", "**/*.key", "**/*.pem"],
     "deny_commands": ["git push*", "npm publish*", "rm -rf*"],
     "sandbox": false
-  }
+  },
+  "fanout_statusline": true,
+  "fanout_progress_log": true,
+  "fanout_control": true
 }
 ```
 
@@ -283,6 +289,64 @@ Subagents are strictly scoped to **implement**:
 | `effort` | `string` | `"high"` | Default effort for the batch |
 | `cwd` | `string` | repo root | Repository root directory |
 | `timeout_minutes` | `number` | `15` | Per-subagent timeout limit in minutes |
+
+---
+
+## 👁️ Watching a Fan-Out Live (`/lagrange:watch`)
+
+`agy_fanout` is a single blocking MCP call that can run for 15+ minutes. While it does, the viewer shows you what every subagent is actually doing — in your browser, since it's already open.
+
+```bash
+node <plugin>/mcp-server/fanout-watch.js            # newest batch in this repo
+node <plugin>/mcp-server/fanout-watch.js --slug X   # a specific batch
+node <plugin>/mcp-server/fanout-watch.js --port 4600
+```
+
+It prints a `http://127.0.0.1:4517` URL and holds the terminal until `Ctrl+C`. **You run it; nothing auto-spawns it.**
+
+Each subagent gets a card showing:
+
+- **Live prose**, joined into readable paragraphs. `agy` streams `text_delta` in chunks split *mid-word*, so the raw events have to be reassembled — the viewer does it by `step_index` as they arrive, without buffering, so a subagent killed mid-sentence still shows everything it emitted.
+- **Tool calls**, visually distinct from prose (`🔧 run_command → npm test`). This is usually the most informative line on the card: it says which file is being touched, which command is running.
+- **Elapsed time** (live while running, frozen when finished), **attempt count** when a task retried, and **why it failed** — the actual error text, quota exhaustion, or the operator's stop reason.
+- **Model, branch and the files the task declared**, which makes the disjointness contract visible at a glance.
+- A **Detener** button that stops that subagent.
+
+The header reports the batch total, and distinguishes a finished batch (`terminado en 4m00s`) from one that has simply gone quiet (`sin novedad hace 12m`) — useful because a crashed or cancelled fan-out otherwise looks identical to a running one forever.
+
+### Stopping a subagent
+
+The stop button writes a small sentinel file that the orchestrator picks up on its next poll (a couple of seconds), then kills that subagent's process tree. The same thing is available from any terminal:
+
+```bash
+node <plugin>/mcp-server/fanout-stop.js <repoPath> <slug> <taskId> ["motivo"]
+```
+
+Stopping is about **cost and queue time**, not safety — the worktree already contains any damage. A stuck subagent holds a slot in its batch and keeps burning quota. A worktree with half-committed work is preserved, never deleted, by the normal cleanup.
+
+### What it reads (and where)
+
+Everything lives under `.claude/worktrees/` in your repo — the viewer only reads what the fan-out already writes:
+
+| File | Purpose |
+|------|---------|
+| `.fanout-status-<slug>.json` | Orchestration state per task (also drives the statusline) |
+| `.agy-progress-<slug>-<taskId>.jsonl` | Raw NDJSON stream from that subagent, one event per line |
+| `.fanout-stop-<slug>-<taskId>.json` | Stop request sentinel, consumed by the orchestrator |
+
+> **Security:** the server binds to `127.0.0.1` only and there is no option to expose it. These logs contain your prompts and generated code. There is no authentication beyond loopback — a deliberate choice, not an oversight.
+
+Prefer a single subagent in a plain terminal? `node <plugin>/mcp-server/fanout-tail.js <rutaLog> <nombre>` tails one log with the same formatting.
+
+### Fan-out configuration flags
+
+Set in `.claude/antigravity.json` (or via `agy_set_config`):
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `fanout_statusline` | `true` | Write the live progress file the statusline script renders |
+| `fanout_progress_log` | `true` | Write the per-subagent NDJSON log that `/lagrange:watch` renders |
+| `fanout_control` | `true` | Watch for stop sentinels and kill a subagent early when one appears |
 
 ---
 
@@ -511,6 +575,11 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 |-----------|------|-------------|
 | **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (18 tools) |
 | | `mcp-server/fanout.js` | Orchestrator for concurrent subagent fan-out across git worktrees |
+| | `mcp-server/fanout-watch.js` | Local viewer for a running fan-out (`/lagrange:watch`) — HTTP + SSE on loopback, zero dependencies |
+| | `mcp-server/fanout-estado.js` | Per-batch state, per-subagent progress log paths, and stop sentinels |
+| | `mcp-server/fanout-tail.js` | Formats one subagent's NDJSON log; also `tail -f` for a single subagent |
+| | `mcp-server/fanout-stop.js` | CLI to request a running subagent be stopped |
+| | `mcp-server/fanout-statusline.js` | Renders fan-out progress into the Claude Code statusline |
 | | `mcp-server/lib/sentence-chunker.js` | Groups streamed `text_delta` fragments into complete sentences for TTS |
 | **Subagent** | `agents/agy.md` | Autonomous subagent definition (`lagrange:agy` / `agy`) |
 | **Skills** | `skills/agy-cli/SKILL.md` | Context-aware delegation guidelines |
@@ -525,6 +594,7 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 | **Commands** | `commands/run.md` | `/lagrange:run <prompt>` |
 | | `commands/plan.md` | `/lagrange:plan <task>` |
 | | `commands/fanout.md` | `/lagrange:fanout [plan]` |
+| | `commands/watch.md` | `/lagrange:watch [slug]` |
 | | `commands/review.md` | `/lagrange:review [target]` |
 | | `commands/audit.md` | `/lagrange:audit [target]` |
 | | `commands/summary.md` | `/lagrange:summary [focus]` |
