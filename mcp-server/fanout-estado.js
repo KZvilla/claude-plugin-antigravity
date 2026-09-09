@@ -199,7 +199,15 @@ function crearEscritorDeEstado(repoPath, slug, tareas) {
       iniciado: ahora,
       actualizado: ahora,
       terminado: null,
-      tareas: Object.fromEntries(tareas.map(t => [t.id, { estado: 'pendiente', intentos: 0 }]))
+      // `meta.meta[id]` trae lo que se sabe de la tarea al arrancar (archivos,
+      // rama, modelo — FEAT-015). Es opcional: sin él, el arranque es el de
+      // siempre. Los consumidores existentes ignoran propiedades que no
+      // conocen, así que agrandar cada tarea no rompe la statusline.
+      tareas: Object.fromEntries(tareas.map(t => [t.id, {
+        estado: 'pendiente',
+        intentos: 0,
+        ...((meta.meta && meta.meta[t.id]) || {})
+      }]))
     };
     escribir(datos);
   }

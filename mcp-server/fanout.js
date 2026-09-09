@@ -38,6 +38,10 @@ const { prepararRamaBase, crearWorktrees } = require('./worktrees.js');
 const ESTADO_NULO = { iniciar() {}, marcar() {}, terminar() {} };
 
 const CONCURRENCIA_POR_DEFECTO = 3;
+// Tope de lo que se persiste de un mensaje de error en el archivo de estado:
+// alcanza para entender qué pasó sin engordar un JSON que se reescribe entero
+// en cada `marcar`.
+const MAX_LARGO_ERROR = 200;
 const REINTENTOS_POR_CUOTA = 2;
 const ESPERA_BASE_MS = 20000;
 
@@ -160,7 +164,26 @@ async function lanzarFanout(opciones, deps) {
 
   const asignacion = tareas.map((t, i) => ({ tarea: t, worktree: worktrees[i] }));
 
-  registrarEstado.iniciar({ ramaBase: base.rama, concurrencia });
+  // Metadatos por tarea para quien mire la corrida (FEAT-015). Acá está todo
+  // junto y sin plomería: `asignacion` ya tiene la tarea y su worktree.
+  // `ruta` del worktree se omite a propósito: es una ruta absoluta larga que
+  // en una tarjeta angosta es puro ruido, y nadie navega al worktree mientras
+  // mira correr el fan-out.
+  //
+  // `modelo` puede quedar sin valor: acá se conoce `tarea.modelo || modelo`,
+  // pero el último fallback (`config.defaultModel`) recién se aplica en
+  // index.js. Se persiste lo que se sabe y quien lo muestre decide cómo
+  // representar "el que venga por defecto" — mentir con un nombre concreto
+  // sería peor que no decir nada.
+  registrarEstado.iniciar({
+    ramaBase: base.rama,
+    concurrencia,
+    meta: Object.fromEntries(asignacion.map(({ tarea, worktree }) => [tarea.id, {
+      archivos: tarea.archivos,
+      rama: worktree.rama,
+      modelo: tarea.modelo || modelo || null
+    }]))
+  });
 
   // Barrido de centinelas viejos de una corrida ANTERIOR con el mismo
   // slug/taskId (FEAT-012) — una sola vez acá, antes de que arranque el
@@ -209,6 +232,14 @@ async function lanzarFanout(opciones, deps) {
         intentos: respuesta.intentos,
         porCuota,
         detenido,
+        // Sin esto, un timeout del watchdog, un fallo de spawn o un exit != 0
+        // se persistían como `{estado:'error', porCuota:false, detenido:false}`
+        // — o sea, sin una sola pista de qué pasó. El texto estaba acá al lado
+        // (se devuelve en el resultado) pero nunca llegaba al archivo de
+        // estado, así que ningún visor podía explicar el fallo (FEAT-015).
+        error: exito ? null : String(respuesta.error || 'error desconocido').slice(0, MAX_LARGO_ERROR),
+        // El motivo que escribió quien pidió la detención (FEAT-012).
+        motivo: detenido && respuesta.motivo ? String(respuesta.motivo).slice(0, MAX_LARGO_ERROR) : null,
         fin: new Date().toISOString()
       });
 

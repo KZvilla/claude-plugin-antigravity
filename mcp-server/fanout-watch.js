@@ -153,6 +153,15 @@ function paginaHtml(slug) {
   .pendiente { color: #7d8596; } .corriendo { color: #58a6ff; }
   .reintentando { color: #d29922; } .ok { color: #3fb950; }
   .error { color: #f85149; } .detenida { color: #db6d28; }
+  .tiempo { font-size: 11px; color: #7d8596; font-variant-numeric: tabular-nums; }
+  .tiempo.vivo { color: #58a6ff; }
+  /* Scopeado a .tarea: la cabecera de la página ya usa .meta para su resumen
+     y sin esto heredaba padding y borde de la fila de la tarjeta. */
+  .tarea .meta { padding: 4px 10px; font-size: 11px; color: #6b7385; border-bottom: 1px solid #2a2f3a;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tarea .meta:empty { display: none; }
+  .porque { padding: 5px 10px; font-size: 12px; color: #f0a58a; background: #241a1a;
+            border-bottom: 1px solid #2a2f3a; white-space: pre-wrap; word-break: break-word; }
   .stop { margin-left: auto; background: none; border: 1px solid #3d4350; color: #d7dae0;
           border-radius: 4px; padding: 2px 9px; cursor: pointer; font: inherit; font-size: 11px; }
   .stop:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
@@ -189,8 +198,9 @@ function tarjeta(taskId) {
   const el = document.createElement('div');
   el.className = 'tarea';
   el.innerHTML = '<div class="cab"><span class="nombre"></span>' +
-    '<span class="estado"></span>' +
-    '<button class="stop">Detener</button></div><div class="log"></div>';
+    '<span class="estado"></span><span class="tiempo"></span>' +
+    '<button class="stop">Detener</button></div>' +
+    '<div class="meta"></div><div class="porque"></div><div class="log"></div>';
   el.querySelector('.nombre').textContent = taskId;
   el.querySelector('.stop').addEventListener('click', async (ev) => {
     const boton = ev.currentTarget;
@@ -214,6 +224,41 @@ function tarjeta(taskId) {
   return el;
 }
 
+// Último estado conocido por tarea. Lo necesita el reloj: el servidor manda
+// el evento estado SOLO cuando el JSON cambia, así que una tarea que corre diez
+// minutos no genera un solo evento — si el tiempo dependiera de eso, quedaría
+// congelado. El ticking es del cliente y se calcula contra inicio.
+const ultimoEstado = new Map();
+
+function duracion(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000)); // clamp: el inicio lo escribe
+  const m = Math.floor(s / 60);                 // otro proceso, con su reloj.
+  return m > 0 ? m + 'm' + String(s % 60).padStart(2, '0') + 's' : s + 's';
+}
+
+function refrescarTiempos() {
+  for (const [id, t] of ultimoEstado) {
+    const el = tarjetas.get(id);
+    if (!el) continue;
+    const campo = el.querySelector('.tiempo');
+    if (!t.inicio) { campo.textContent = ''; continue; }
+    const desde = new Date(t.inicio).getTime();
+    const hasta = t.fin ? new Date(t.fin).getTime() : Date.now();
+    campo.textContent = duracion(hasta - desde);
+    campo.className = 'tiempo' + (t.fin ? '' : ' vivo');
+  }
+}
+// Un solo interval global para toda la página, no uno por tarjeta: attachear
+// timers en cada pintarEstado los iria acumulando.
+setInterval(refrescarTiempos, 1000);
+
+function explicarFallo(t) {
+  if (t.detenido) return t.motivo ? 'detenida: ' + t.motivo : 'detenida a pedido';
+  if (t.porCuota) return 'sin cuota' + (t.error ? ': ' + t.error : '');
+  if (t.estado === 'error') return t.error || 'error sin detalle';
+  return '';
+}
+
 function pintarEstado(datos) {
   const tareas = datos.tareas || {};
   const ids = Object.keys(tareas);
@@ -222,17 +267,37 @@ function pintarEstado(datos) {
   let ok = 0, err = 0, corriendo = 0;
   for (const id of ids) {
     const t = tareas[id];
+    ultimoEstado.set(id, t);
     const el = tarjeta(id);
     const estado = t.detenido ? 'detenida' : (t.estado || 'pendiente');
     const badge = el.querySelector('.estado');
-    badge.textContent = estado;
+    badge.textContent = estado + (t.intentos > 1 ? ' ×' + t.intentos : '');
     badge.className = 'estado ' + estado;
     // Detener solo tiene sentido mientras siga en vuelo.
     el.querySelector('.stop').disabled = !(estado === 'corriendo' || estado === 'reintentando');
+
+    const meta = [];
+    if (t.modelo) meta.push(t.modelo);
+    else if ('modelo' in t) meta.push('modelo por defecto');
+    if (t.rama) meta.push(t.rama);
+    if (Array.isArray(t.archivos) && t.archivos.length) meta.push(t.archivos.join(' '));
+    const elMeta = el.querySelector('.meta');
+    elMeta.textContent = meta.join('  ·  ');
+    // La fila se recorta con ellipsis para no comerse la tarjeta; el title
+    // deja leer la lista de archivos entera al pasar el mouse, que si no
+    // quedaría truncada sin manera de verla.
+    elMeta.title = meta.join('\n');
+
+    const porque = explicarFallo(t);
+    const elPorque = el.querySelector('.porque');
+    elPorque.textContent = porque;
+    elPorque.hidden = !porque;
+
     if (t.estado === 'ok') ok++;
     else if (t.estado === 'error') err++;
     else if (t.estado === 'corriendo' || t.estado === 'reintentando') corriendo++;
   }
+  refrescarTiempos();
   resumen.textContent = ids.length + ' tareas · ' + ok + ' ok · ' + err + ' error · ' +
     corriendo + ' en vuelo' + (datos.terminado ? ' · terminado' : '');
 }

@@ -256,6 +256,11 @@ async function main() {
       check('y las cuenta aparte de las de cuota', r.resumen.fallidasPorCuota === 0);
       check('registrarEstado también ve `detenido`',
         registrador.llamadas.marcar.some(m => m.id === 'a' && m.estado === 'error' && m.detenido === true));
+
+      // FEAT-015: sin esto el archivo de estado decía `error` y nada más, así
+      // que ningún visor podía explicar el fallo.
+      const cierre = registrador.llamadas.marcar.find(m => m.id === 'a' && m.estado === 'error');
+      check('persiste el texto del error', typeof cierre.error === 'string' && cierre.error.length > 0, JSON.stringify(cierre));
     });
   } finally { borrar(repo); }
 
@@ -352,6 +357,63 @@ async function main() {
     });
   } finally { borrar(repo); }
 
+
+  repo = crearRepo();
+  try {
+    await group('persiste el motivo y el error para que el visor pueda explicarlos (FEAT-015)', async () => {
+      const registrador = registradorFalso();
+      const eje = {
+        ejecutar: async (peticion) => {
+          const id = (peticion.prompt.match(/hacer ([a-z0-9-]+)/) || [])[1];
+          if (id === 'a') return { success: false, error: 'Antigravity MCP process watchdog timed out after 15 minutes' };
+          if (id === 'b') return { success: false, stopped: true, error: 'Detenido por el usuario', motivo: 'se fue por las ramas' };
+          return { success: true };
+        }
+      };
+
+      await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-motivos',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])],
+        concurrencia: 2
+      }, { ejecutar: eje.ejecutar, registrarEstado: registrador });
+
+      const deA = registrador.llamadas.marcar.find(m => m.id === 'a' && m.estado === 'error');
+      check('un timeout deja su texto en el estado (antes: solo "error")',
+        /watchdog timed out/.test(deA.error || ''), JSON.stringify(deA));
+      check('y no se confunde con cuota ni detención', deA.porCuota === false && deA.detenido === false);
+
+      const deB = registrador.llamadas.marcar.find(m => m.id === 'b' && m.estado === 'error');
+      check('una detención guarda el motivo de quien la pidió', deB.motivo === 'se fue por las ramas', JSON.stringify(deB));
+
+      const deOk = registrador.llamadas.marcar.find(m => m.id === 'a' && m.estado === 'ok');
+      check('una tarea que sale bien no guarda error', deOk === undefined || deOk.error === null);
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('metadatos por tarea al iniciar (FEAT-015)', async () => {
+      const registrador = registradorFalso();
+      const eje = ejecutorFalso();
+
+      await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-meta',
+        tareas: [tarea('a', ['src/a.js', 'src/b.js'], { modelo: 'gemini-3.1-pro' }), tarea('b', ['src/c.js'])],
+        modelo: 'gemini-3.8-flash'
+      }, { ejecutar: eje.ejecutar, registrarEstado: registrador });
+
+      const meta = registrador.llamadas.iniciar[0].meta;
+      check('iniciar() recibe metadatos por tarea', meta && meta.a && meta.b, JSON.stringify(meta));
+      check('los archivos declarados (el contrato de disjunción, §4.2)',
+        meta.a.archivos.join(',') === 'src/a.js,src/b.js', JSON.stringify(meta.a));
+      check('el modelo de la tarea pisa el del lote', meta.a.modelo === 'gemini-3.1-pro');
+      check('y el del lote se usa si la tarea no trae', meta.b.modelo === 'gemini-3.8-flash');
+      check('la rama del worktree', /^wt\/agy-con-meta-/.test(meta.a.rama), meta.a.rama);
+      check('NO se persiste la ruta del worktree (ruido en una tarjeta angosta)', !('ruta' in meta.a));
+    });
+  } finally { borrar(repo); }
 
   repo = crearRepo();
   try {
