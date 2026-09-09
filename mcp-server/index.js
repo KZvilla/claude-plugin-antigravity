@@ -23,7 +23,7 @@ const { getSummaryPrompt, recuperarDocumentoEnlazado, validarDocumento, separarD
 const { executeAgyStdin } = require('./agy-stream.js');
 const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
 const { lanzarFanout } = require('./fanout.js');
-const { crearEscritorDeEstado } = require('./fanout-estado.js');
+const { crearEscritorDeEstado, crearLectorDeControl } = require('./fanout-estado.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -82,6 +82,8 @@ function loadConfig(cwd = process.cwd()) {
     voiceboxPort: parseInt(process.env.VOICEBOX_PORT, 10) || null,
     fanoutStatusline: true,
     fanoutStatuslineDelegate: null,
+    fanoutControl: true,
+    fanoutStopCheckIntervalMs: parseInt(process.env.AGY_FANOUT_STOP_INTERVAL_MS, 10) || 2000,
     permissions: {
       allow: ['read', 'edit', 'commands', 'network'],
       deny: [],
@@ -106,6 +108,8 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.voicebox_port) config.voiceboxPort = parsed.voicebox_port;
       if (parsed.fanout_statusline !== undefined) config.fanoutStatusline = !!parsed.fanout_statusline;
       if (parsed.fanout_statusline_delegate !== undefined) config.fanoutStatuslineDelegate = parsed.fanout_statusline_delegate;
+      if (parsed.fanout_control !== undefined) config.fanoutControl = !!parsed.fanout_control;
+      if (parsed.fanout_stop_check_interval_ms !== undefined) config.fanoutStopCheckIntervalMs = parsed.fanout_stop_check_interval_ms;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -123,6 +127,8 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.voicebox_port) config.voiceboxPort = parsed.voicebox_port;
       if (parsed.fanout_statusline !== undefined) config.fanoutStatusline = !!parsed.fanout_statusline;
       if (parsed.fanout_statusline_delegate !== undefined) config.fanoutStatuslineDelegate = parsed.fanout_statusline_delegate;
+      if (parsed.fanout_control !== undefined) config.fanoutControl = !!parsed.fanout_control;
+      if (parsed.fanout_stop_check_interval_ms !== undefined) config.fanoutStopCheckIntervalMs = parsed.fanout_stop_check_interval_ms;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -156,6 +162,7 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
   if (updates.voicebox_port !== undefined) existing.voicebox_port = updates.voicebox_port;
   if (updates.fanout_statusline !== undefined) existing.fanout_statusline = updates.fanout_statusline;
   if (updates.fanout_statusline_delegate !== undefined) existing.fanout_statusline_delegate = updates.fanout_statusline_delegate;
+  if (updates.fanout_control !== undefined) existing.fanout_control = updates.fanout_control;
   if (updates.permissions !== undefined) {
     existing.permissions = {
       ...(existing.permissions || {}),
@@ -916,6 +923,10 @@ const TOOLS = [
         fanout_statusline_delegate: {
           type: 'string',
           description: 'The previous statusLine.command to preserve when installing fanout-statusline.js, so it keeps rendering whatever the user had (e.g. claude-hud) alongside the fanout segment. Set by the setup skill, not meant for manual use.'
+        },
+        fanout_control: {
+          type: 'boolean',
+          description: 'Whether agy_fanout watches per-task stop sentinels (.claude/worktrees/.fanout-stop-<slug>-<taskId>.json) and kills a running subagent early when one appears. Default true; set false to disable the stop mechanism without disabling fanout itself.'
         }
       }
     }
@@ -2194,6 +2205,7 @@ function executeAgy(args, options = {}) {
 
     const timer = setTimeout(() => {
       killed = true;
+      clearInterval(stopTimer);
       terminateTree(child);
       limpiarPrompt();
       resolve({
@@ -2203,6 +2215,33 @@ function executeAgy(args, options = {}) {
         stderr
       });
     }, timeoutMs);
+
+    // Sondeo opcional de detención temprana (FEAT-012). Generaliza el mismo
+    // mecanismo del watchdog de arriba —terminateTree + resolve— pero
+    // disparado por un predicado externo en vez de por tiempo transcurrido.
+    // `stopCheck` no se pasa desde ningún otro caso hoy salvo agy_fanout, así
+    // que sin él el comportamiento es exactamente el de antes de FEAT-012.
+    let stopTimer = null;
+    if (typeof options.stopCheck === 'function') {
+      stopTimer = setInterval(() => {
+        const motivo = options.stopCheck();
+        if (!motivo) return;
+        killed = true;
+        clearTimeout(timer);
+        clearInterval(stopTimer);
+        terminateTree(child);
+        limpiarPrompt();
+        resolve({
+          success: false,
+          error: 'Detenido por el usuario',
+          stopped: true,
+          motivo: typeof motivo === 'string' ? motivo : (motivo.motivo || null),
+          stdout,
+          stderr
+        });
+      }, options.stopCheckIntervalMs || 2000);
+      stopTimer.unref?.();
+    }
 
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString('utf8');
@@ -2215,6 +2254,7 @@ function executeAgy(args, options = {}) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      clearInterval(stopTimer);
       limpiarPrompt();
       resolve({
         success: false,
@@ -2226,6 +2266,7 @@ function executeAgy(args, options = {}) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      clearInterval(stopTimer);
       limpiarPrompt();
       if (killed) return;
 
@@ -2551,11 +2592,23 @@ async function handleToolCall(name, args) {
     case 'agy_fanout': {
       const repoPath = args.cwd || process.cwd();
 
+      // Lector de centinelas de detención (FEAT-012), opcional igual que el
+      // escritor de estado de abajo: si está desactivado, `stopCheck` nunca se
+      // pasa y executeAgy se comporta exactamente igual que sin la feature.
+      const lectorControl = config.fanoutControl !== false
+        ? crearLectorDeControl(repoPath, args.slug)
+        : null;
+
       // El ejecutor que se le inyecta al orquestador arma los mismos argumentos
       // que agy_run. `--sandbox` no se ofrece a propósito: rompe el aislamiento
       // por worktree en vez de reforzarlo, y exige UAC (H1 a H3 del documento de
       // diseño). El confinamiento acá es el worktree.
       const ejecutar = async (peticion) => {
+        // Centinela viejo de una corrida anterior con el mismo slug/taskId
+        // (p. ej. reintentar un lote fallido): si sobreviviera, mataría a este
+        // subagente en el primer tick de sondeo antes de que hiciera nada.
+        if (lectorControl) lectorControl.limpiar(peticion.taskId);
+
         const cliArgs = ['--output-format', 'json', '--dangerously-skip-permissions'];
         cliArgs.push('--mode', peticion.mode || 'accept-edits');
         cliArgs.push('--effort', peticion.effort || config.defaultEffort || 'high');
@@ -2565,7 +2618,9 @@ async function handleToolCall(name, args) {
 
         const res = await executeAgy(cliArgs, {
           cwd: peticion.cwd,
-          timeoutMinutes: peticion.timeout_minutes || config.defaultTimeoutMinutes || 15
+          timeoutMinutes: peticion.timeout_minutes || config.defaultTimeoutMinutes || 15,
+          stopCheck: lectorControl ? () => lectorControl.consumirDetencion(peticion.taskId) : undefined,
+          stopCheckIntervalMs: config.fanoutStopCheckIntervalMs
         });
 
         const datos = res.data || {};
@@ -2610,11 +2665,14 @@ async function handleToolCall(name, args) {
       texto += `- Rama base: \`${salida.ramaBase}\`${salida.ramaBaseCreada ? ' (creada ahora)' : ''}\n`;
       texto += `- Concurrencia: ${salida.concurrencia} · ${salida.lotes} lote(s)\n`;
       texto += `- Resultado: ${salida.resumen.exitosas} ok, ${salida.resumen.fallidas} fallidas`;
-      texto += salida.resumen.fallidasPorCuota ? ` (${salida.resumen.fallidasPorCuota} por cuota)\n\n` : '\n\n';
+      const detalleFallas = [];
+      if (salida.resumen.fallidasPorCuota) detalleFallas.push(`${salida.resumen.fallidasPorCuota} por cuota`);
+      if (salida.resumen.fallidasDetenidas) detalleFallas.push(`${salida.resumen.fallidasDetenidas} detenidas`);
+      texto += detalleFallas.length ? ` (${detalleFallas.join(', ')})\n\n` : '\n\n';
 
       texto += `| Tarea | Rama | Estado | Intentos | Conversation ID |\n|---|---|---|---|---|\n`;
       for (const r of salida.resultados) {
-        const estado = r.exito ? 'ok' : (r.porCuota ? 'falló (cuota)' : 'falló');
+        const estado = r.exito ? 'ok' : (r.detenido ? 'detenida' : (r.porCuota ? 'falló (cuota)' : 'falló'));
         texto += `| \`${r.id}\` | \`${r.rama}\` | ${estado} | ${r.intentos} | ${r.conversation_id || '—'} |\n`;
       }
 

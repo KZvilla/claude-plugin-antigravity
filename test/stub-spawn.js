@@ -35,9 +35,22 @@ cp.spawn = function (cmd, args, opts) {
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.stdin = { write() {}, end() {} };
-  child.kill = () => {};
 
-  setImmediate(() => {
+  // Sin STUB_HOLD_MS, el comportamiento es idéntico al de antes de FEAT-012
+  // (resuelve en el próximo tick). Con él, el "proceso" se queda vivo esos ms
+  // — lo que permite a un test escribir el centinela de detención a mitad de
+  // camino y comprobar que executeAgy lo mata antes de que termine solo,
+  // en vez de tener que esperar el timeout real de 15+ minutos.
+  let killed = false;
+  child.kill = () => {
+    if (killed) return;
+    killed = true;
+    fs.appendFileSync(CAPTURE_FILE, JSON.stringify({ event: 'kill', cwd: opts && opts.cwd }) + '\n');
+  };
+
+  const holdMs = parseInt(process.env.STUB_HOLD_MS, 10) || 0;
+  const emitirRespuesta = () => {
+    if (killed) return; // ya lo mataron: no simular un cierre exitoso por detrás.
     child.stdout.emit('data', Buffer.from(JSON.stringify({
       response: 'STUBBED RESPONSE',
       conversation_id: 'stub-conversation-id',
@@ -45,7 +58,10 @@ cp.spawn = function (cmd, args, opts) {
       usage: USAGE_STUB
     })));
     child.emit('close', 0);
-  });
+  };
+
+  if (holdMs > 0) setTimeout(emitirRespuesta, holdMs);
+  else setImmediate(emitirRespuesta);
 
   return child;
 };

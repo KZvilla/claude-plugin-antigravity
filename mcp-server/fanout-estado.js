@@ -38,6 +38,58 @@ function rutaEstado(repoPath, slug) {
 }
 
 /**
+ * Centinela de detención por tarea (FEAT-012).
+ *
+ * A propósito NO es un único archivo compartido con un array de ids: eso
+ * reintroduce entre procesos (varios panes, o un pane y la CLI) exactamente
+ * la carrera que BE-010 tuvo que resolver con un lock para
+ * antigravity-usage.json. Con un archivo por `taskId`, cada uno tiene como
+ * máximo un escritor posible por construcción — nada más que quien apunta a
+ * ese taskId va a crear ese path exacto — así que no hace falta lock.
+ */
+function rutaControl(repoPath, slug, taskId) {
+  return path.join(repoPath, DIR_WORKTREES, `.fanout-stop-${slugificarArchivo(slug)}-${slugificarArchivo(taskId)}.json`);
+}
+
+/**
+ * Pide que se detenga una tarea en vuelo. La escritura es atómica
+ * (temporal + rename) por consistencia con el resto del módulo, aunque acá
+ * no hay un escritor rival contra el que protegerse.
+ */
+function marcarDetencion(repoPath, slug, taskId, motivo) {
+  const ruta = rutaControl(repoPath, slug, taskId);
+  fs.mkdirSync(path.dirname(ruta), { recursive: true });
+  const tmp = `${ruta}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ detenidoEn: new Date().toISOString(), motivo: motivo || null }, null, 2), 'utf8');
+  fs.renameSync(tmp, ruta);
+}
+
+/**
+ * Lector del lado del orquestador. `consumirDetencion` no solo chequea: borra
+ * el centinela al leerlo, para que un pedido de esta corrida no sobreviva y
+ * mate en silencio a un subagente de una corrida futura que reuse el mismo
+ * slug/taskId (p. ej. reintentar un lote fallido).
+ */
+function crearLectorDeControl(repoPath, slug) {
+  return {
+    consumirDetencion(taskId) {
+      const ruta = rutaControl(repoPath, slug, taskId);
+      let datos;
+      try {
+        datos = JSON.parse(fs.readFileSync(ruta, 'utf8'));
+      } catch {
+        return null; // no existe (el caso normal) o quedó a medio escribir: no hay pedido válido.
+      }
+      try { fs.unlinkSync(ruta); } catch {}
+      return datos;
+    },
+    limpiar(taskId) {
+      try { fs.unlinkSync(rutaControl(repoPath, slug, taskId)); } catch {}
+    }
+  };
+}
+
+/**
  * @param {string} repoPath
  * @param {string} slug
  * @param {Array<{id:string}>} tareas
@@ -98,4 +150,7 @@ function crearEscritorDeEstado(repoPath, slug, tareas) {
   return { iniciar, marcar, terminar, rutaArchivo };
 }
 
-module.exports = { rutaEstado, crearEscritorDeEstado, DIR_WORKTREES };
+module.exports = {
+  rutaEstado, crearEscritorDeEstado, DIR_WORKTREES,
+  rutaControl, marcarDetencion, crearLectorDeControl
+};

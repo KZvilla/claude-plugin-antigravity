@@ -14,7 +14,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { check, group, report } = require('./lib/assert');
 
-const { rutaEstado, crearEscritorDeEstado } = require('../mcp-server/fanout-estado.js');
+const { rutaEstado, crearEscritorDeEstado, rutaControl, marcarDetencion, crearLectorDeControl } = require('../mcp-server/fanout-estado.js');
 
 const borrar = d => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch {} };
 
@@ -70,6 +70,52 @@ async function main() {
       e2.iniciar({});
       check('cada slug tiene su propio archivo', e1.rutaArchivo !== e2.rutaArchivo);
       check('ambos archivos existen', fs.existsSync(e1.rutaArchivo) && fs.existsSync(e2.rutaArchivo));
+    });
+    await group('centinela de detención por tarea (FEAT-012)', () => {
+      const lector = crearLectorDeControl(repo, 'mi lote');
+
+      check('sin pedido no hay nada que consumir', lector.consumirDetencion('a') === null);
+
+      marcarDetencion(repo, 'mi lote', 'a', 'se fue por las ramas');
+      check('el archivo existe donde rutaControl dice', fs.existsSync(rutaControl(repo, 'mi lote', 'a')));
+
+      const consumido = lector.consumirDetencion('a');
+      check('devuelve el motivo', consumido && consumido.motivo === 'se fue por las ramas');
+      check('trae timestamp', typeof consumido.detenidoEn === 'string' && consumido.detenidoEn.length > 0);
+      check('lo borra al consumirlo', !fs.existsSync(rutaControl(repo, 'mi lote', 'a')));
+      check('un segundo consumo ya no encuentra nada', lector.consumirDetencion('a') === null);
+
+      marcarDetencion(repo, 'mi lote', 'b');
+      check('motivo es null si no se pasa', lector.consumirDetencion('b').motivo === null);
+
+      check('no deja temporales sueltos',
+        fs.readdirSync(path.dirname(rutaControl(repo, 'mi lote', 'a'))).every(n => !n.endsWith('.tmp')));
+    });
+
+    await group('el centinela no cruza tareas ni slugs', () => {
+      marcarDetencion(repo, 'lote-x', 'a');
+      const lectorY = crearLectorDeControl(repo, 'lote-y');
+      const lectorXOtraTarea = crearLectorDeControl(repo, 'lote-x');
+      check('otro slug no lo ve', lectorY.consumirDetencion('a') === null);
+      check('el mismo slug pero otra tarea no lo ve', lectorXOtraTarea.consumirDetencion('otra') === null);
+      check('la tarea correcta sí lo ve', crearLectorDeControl(repo, 'lote-x').consumirDetencion('a') !== null);
+    });
+
+    await group('limpiar() borra sin exigir que exista', () => {
+      const lector = crearLectorDeControl(repo, 'lote-limpieza');
+      let lanzo = false;
+      try { lector.limpiar('nunca-existio'); } catch { lanzo = true; }
+      check('no revienta si no había nada', !lanzo);
+
+      marcarDetencion(repo, 'lote-limpieza', 'a');
+      lector.limpiar('a');
+      check('borra un centinela existente', !fs.existsSync(rutaControl(repo, 'lote-limpieza', 'a')));
+    });
+
+    await group('taskIds con caracteres raros no rompen la ruta', () => {
+      marcarDetencion(repo, 'lote-raro', 'Tarea Con Espacios/Barras');
+      const lector = crearLectorDeControl(repo, 'lote-raro');
+      check('se puede consumir igual', lector.consumirDetencion('Tarea Con Espacios/Barras') !== null);
     });
   } finally {
     borrar(repo);

@@ -61,6 +61,10 @@ function ejecutorFalso({ fallar = {}, registrarConcurrencia = false } = {}) {
     // El id de la tarea viaja dentro del prompt, bajo la sección [TAREA].
     const id = (peticion.prompt.match(/hacer ([a-z0-9-]+)/) || [])[1];
     const plan = fallar[id];
+    if (plan && plan.stopped) {
+      plan.usadas = (plan.usadas || 0) + 1;
+      return { success: false, error: 'Detenido por el usuario', stopped: true };
+    }
     if (plan) {
       const restantes = plan.veces === undefined ? Infinity : plan.veces;
       plan.usadas = (plan.usadas || 0) + 1;
@@ -228,6 +232,35 @@ async function main() {
 
   repo = crearRepo();
   try {
+    await group('detención pedida a mano (FEAT-012)', async () => {
+      const eje = ejecutorFalso({ fallar: { a: { stopped: true } } });
+      const registrador = registradorFalso();
+
+      const r = await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-stop',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])],
+        concurrencia: 2
+      }, { ejecutar: eje.ejecutar, registrarEstado: registrador });
+
+      check('la petición lleva su propio taskId',
+        eje.llamadas.every(l => typeof l.taskId === 'string' && l.taskId.length > 0));
+
+      const porId = Object.fromEntries(r.resultados.map(x => [x.id, x]));
+      check('no se reintenta (un solo intento)', porId.a.intentos === 1, `intentos = ${porId.a.intentos}`);
+      check('queda marcada como detenida, no como error genérico', porId.a.detenido === true);
+      check('no se confunde con una falla de cuota', porId.a.porCuota === false);
+      check('la otra tarea sigue su curso normal', porId.b.exito === true && porId.b.detenido === false);
+
+      check('el resumen distingue las detenidas', r.resumen.fallidasDetenidas === 1);
+      check('y las cuenta aparte de las de cuota', r.resumen.fallidasPorCuota === 0);
+      check('registrarEstado también ve `detenido`',
+        registrador.llamadas.marcar.some(m => m.id === 'a' && m.estado === 'error' && m.detenido === true));
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
     await group('engancha el estado de orquestación (FEAT-005 V1)', async () => {
       const eje = ejecutorFalso({ fallar: { a: { error: 'HTTP 429 quota exceeded', veces: 1 } } });
       const registrador = registradorFalso();
@@ -358,6 +391,58 @@ async function main() {
     } finally {
       await s.stop();
       removeFixture(repoTmp);
+    }
+  });
+
+  await group('agy_fanout mata un subagente en vuelo vía centinela (FEAT-012)', async () => {
+    const { startServer, removeFixture } = require('./lib/mcp-client');
+    const { marcarDetencion } = require('../mcp-server/fanout-estado.js');
+    const repoTmp = crearRepo();
+    const capturas = path.join(repoTmp, 'cap.jsonl');
+    fs.writeFileSync(capturas, '');
+
+    // Sondeo rápido para que el test no tenga que esperar los 2s de producción,
+    // y un stub que se queda "corriendo" 2.5s para poder demostrar que se lo
+    // mata ANTES de que termine solo, no que casualmente coincida con el cierre.
+    fs.mkdirSync(path.join(repoTmp, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(repoTmp, '.claude', 'antigravity.json'),
+      JSON.stringify({ fanout_stop_check_interval_ms: 50 }));
+
+    const previoHold = process.env.STUB_HOLD_MS;
+    process.env.STUB_HOLD_MS = '2500';
+    const s = startServer({ cwd: repoTmp, captureFile: capturas });
+
+    try {
+      await s.initialize();
+
+      const inicio = Date.now();
+      const promesa = s.callTool('agy_fanout', {
+        slug: 'con-stop',
+        tareas: [{ id: 'solo', prompt: 'hacer algo', archivos: ['src/solo.js'] }],
+        concurrencia: 1
+      }, 15000);
+
+      // Deja que el subagente arranque de verdad (el spawn del stub quede
+      // registrado) antes de pedir que lo maten.
+      await new Promise(r => setTimeout(r, 200));
+      marcarDetencion(repoTmp, 'con-stop', 'solo', 'se fue por las ramas');
+
+      const r = await promesa;
+      const elapsedMs = Date.now() - inicio;
+
+      check('resuelve bien antes de los 2.5s del hold', elapsedMs < 2000, `elapsed = ${elapsedMs}ms`);
+      check('no devuelve isError', r.result.isError !== true, JSON.stringify(r.result));
+      const texto = r.result.content[0].text;
+      check('la tabla marca la tarea como detenida', /\bdetenida\b/.test(texto), texto);
+      check('el resumen cuenta 1 detenida', /1 detenidas/.test(texto), texto);
+
+      const eventos = fs.readFileSync(capturas, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+      check('efectivamente se invocó kill() sobre el proceso', eventos.some(e => e.event === 'kill'), JSON.stringify(eventos));
+    } finally {
+      await s.stop();
+      removeFixture(repoTmp);
+      if (previoHold === undefined) delete process.env.STUB_HOLD_MS;
+      else process.env.STUB_HOLD_MS = previoHold;
     }
   });
 

@@ -14,6 +14,12 @@
  *
  * `ejecutar` se inyecta para poder probar la orquestación —el reparto en lotes,
  * el backoff, el mapeo tarea→worktree— sin lanzar un solo proceso de agy.
+ *
+ * `taskId` viaja dentro de la petición que recibe `ejecutar` (además de en las
+ * opciones de `ejecutarConReintento`) para que el ejecutor real pueda
+ * atender un pedido de detención por tarea (FEAT-012) — ver
+ * mcp-server/fanout-estado.js. Un resultado con `stopped: true` no cuenta
+ * como error de cuota (esErrorDeCuota no lo reconoce) y no se reintenta.
  */
 const { validarReparto, explicarReparto } = require('./reparto.js');
 const { prepararRamaBase, crearWorktrees } = require('./worktrees.js');
@@ -158,15 +164,20 @@ async function lanzarFanout(opciones, deps) {
         model: tarea.modelo || modelo,
         effort: tarea.effort || effort,
         mode: tarea.soloLectura ? 'plan' : 'accept-edits',
-        timeout_minutes: timeoutMinutes
+        timeout_minutes: timeoutMinutes,
+        taskId: tarea.id
       }, { reintentos: reintentosPorCuota, esperaBaseMs, alDormir, taskId: tarea.id, registrarEstado });
 
       const exito = !!respuesta.success;
       const porCuota = !exito && esErrorDeCuota(respuesta.error);
+      // Un stop pedido a mano (FEAT-012) no es error de cuota ni de código: se
+      // distingue aparte para que auditar la corrida no lo confunda con un bug.
+      const detenido = !exito && respuesta.stopped === true;
       registrarEstado.marcar(tarea.id, {
         estado: exito ? 'ok' : 'error',
         intentos: respuesta.intentos,
         porCuota,
+        detenido,
         fin: new Date().toISOString()
       });
 
@@ -178,6 +189,7 @@ async function lanzarFanout(opciones, deps) {
         exito,
         error: exito ? null : (respuesta.error || 'error desconocido'),
         porCuota,
+        detenido,
         intentos: respuesta.intentos,
         conversation_id: respuesta.conversation_id || (respuesta.data && respuesta.data.conversation_id) || null,
         duracionMs: Date.now() - inicioMs
@@ -202,7 +214,8 @@ async function lanzarFanout(opciones, deps) {
       total: resultados.length,
       exitosas: resultados.length - fallidas.length,
       fallidas: fallidas.length,
-      fallidasPorCuota: fallidas.filter(r => r.porCuota).length
+      fallidasPorCuota: fallidas.filter(r => r.porCuota).length,
+      fallidasDetenidas: fallidas.filter(r => r.detenido).length
     },
     // El siguiente paso es de Claude, no de este módulo.
     siguientePaso: 'Auditar los diffs de cada rama, correr los tests y mergear en orden. '
