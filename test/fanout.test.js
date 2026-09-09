@@ -352,45 +352,6 @@ async function main() {
     });
   } finally { borrar(repo); }
 
-  repo = crearRepo();
-  try {
-    await group('alArrancar (FEAT-010) se llama una sola vez, con el reparto completo, antes del primer lote', async () => {
-      const llamadas = [];
-      const alArrancar = (asignacion) => llamadas.push({ momento: 'alArrancar', asignacion });
-      const eje = ejecutorFalso();
-      const ejecutarConLog = async (peticion) => {
-        llamadas.push({ momento: 'ejecutar' });
-        return eje.ejecutar(peticion);
-      };
-
-      await lanzarFanout({
-        repoPath: repo,
-        slug: 'con-ventana',
-        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])]
-      }, { ejecutar: ejecutarConLog, alArrancar });
-
-      check('se llamó exactamente una vez', llamadas.filter(l => l.momento === 'alArrancar').length === 1, JSON.stringify(llamadas.map(l => l.momento)));
-
-      const iAlArrancar = llamadas.findIndex(l => l.momento === 'alArrancar');
-      const iPrimerEjecutar = llamadas.findIndex(l => l.momento === 'ejecutar');
-      check('corre antes de cualquier ejecutar', iAlArrancar < iPrimerEjecutar, JSON.stringify(llamadas.map(l => l.momento)));
-
-      const asignacionRecibida = llamadas.find(l => l.momento === 'alArrancar').asignacion;
-      check('recibe las 2 tareas con su tarea y worktree', asignacionRecibida.length === 2 &&
-        asignacionRecibida.every(a => a.tarea && a.tarea.id && a.worktree && a.worktree.ruta));
-    });
-  } finally { borrar(repo); }
-
-  repo = crearRepo();
-  try {
-    await group('sin alArrancar no cambia nada (no-op por defecto)', async () => {
-      const eje = ejecutorFalso();
-      const r = await lanzarFanout({
-        repoPath: repo, slug: 'sin-ventana', tareas: [tarea('a', ['src/a.js'])]
-      }, { ejecutar: eje.ejecutar });
-      check('funciona igual sin alArrancar', r.lanzado === true && r.resumen.exitosas === 1);
-    });
-  } finally { borrar(repo); }
 
   repo = crearRepo();
   try {

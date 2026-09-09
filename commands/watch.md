@@ -1,0 +1,45 @@
+---
+description: Watch a running fan-out live in the browser — per-subagent progress and a stop button
+argument-hint: [slug del lote (opcional) o --port N]
+---
+
+Levantar el visor local de un fan-out en curso: una página en `127.0.0.1` que
+muestra todos los subagentes a la vez, su estado, lo que va haciendo cada uno en
+vivo, y un botón para detener cualquiera.
+
+Argumentos (opcionales — sin nada, toma el lote más reciente):
+$ARGUMENTS
+
+Instrucciones:
+
+1. El visor es un script standalone, **no** una tool MCP: se corre en una
+   terminal y se queda ahí hasta que el usuario haga Ctrl+C. No lo lances vos en
+   background ni intentes mantenerlo vivo desde acá — decile al usuario que lo
+   corra él, o corrélo solo si te lo pide explícitamente.
+
+2. El comando es:
+
+   ```
+   node <plugin>/mcp-server/fanout-watch.js [repoPath] [--slug <nombre>] [--port <N>]
+   ```
+
+   Sin `repoPath` usa el directorio actual; sin `--slug` toma el lote más
+   reciente de `.claude/worktrees/`; el puerto por defecto es 4517 (si está
+   ocupado, avisa y sugiere `--port`).
+
+3. Pasale al usuario la URL que imprime (`http://127.0.0.1:<puerto>`).
+
+4. Si dice que no hay ningún lote, es porque todavía no corrió un `agy_fanout` en
+   ese repo: el visor lee lo que deja el fan-out (`.fanout-status-*.json` y
+   `.agy-progress-*.jsonl` en `.claude/worktrees/`), no inventa nada.
+
+Notas:
+
+- El botón **Detener** escribe el mismo centinela que `fanout-stop.js`, así que
+  el subagente muere en su próximo sondeo (unos segundos). Un worktree con
+  trabajo a medio commitear se preserva: lo clasifica como "sucio" la limpieza
+  de siempre.
+- Escucha **solo en loopback** a propósito: los logs traen prompts y código
+  generado. No lo expongas a la red.
+- Sirve también para mirar un lote ya terminado: el estado y los logs quedan en
+  disco hasta la próxima corrida con el mismo slug.

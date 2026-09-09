@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 /**
- * Contenido de cada pane de `wt` (FEAT-010): sigue el log NDJSON de un
- * subagente (FEAT-009, mcp-server/fanout-estado.js `rutaProgreso`) y lo
- * formatea línea por línea a medida que se escribe. No depende del servidor
- * MCP — se invoca como proceso aparte, uno por pane.
+ * `tail -f` formateado sobre el log NDJSON de UN subagente (FEAT-009,
+ * mcp-server/fanout-estado.js `rutaProgreso`). No depende del servidor MCP:
+ * se corre a mano, en la terminal que uno ya tenga abierta.
  *
  * Uso: node fanout-tail.js <rutaLog> <nombre>
  *
- * Imprime el nombre como primera línea de su propia salida porque `--title`
- * de `wt` no rotula el pane individual, solo la pestaña entera (ver
- * fanout-window.js). Tolera JSON corrupto o el log todavía inexistente
- * (el subagente puede no haber arrancado a escribir) sin tirar excepción —
- * un pane roto es peor que un pane mudo.
+ * Para ver TODOS los subagentes a la vez, con estado y botón de detener,
+ * está `fanout-watch.js` (`/lagrange:watch`), que reutiliza el
+ * `formatearLinea` de este módulo para que las dos vistas digan lo mismo.
+ *
+ * Tolera JSON corrupto o el log todavía inexistente (el subagente puede no
+ * haber arrancado a escribir) sin tirar excepción — una vista rota es peor
+ * que una vista muda.
  */
 'use strict';
 const fs = require('node:fs');
@@ -26,24 +27,34 @@ function formatearHora(d = new Date()) {
 
 /**
  * Traduce una línea NDJSON cruda (el esquema de agy_stream.js:
- * init/step_update/result) a una línea legible para un pane angosto.
+ * init/step_update/result) a una línea legible.
  * `null` significa "no hay nada que mostrar" (p. ej. el eco del prompt del
  * propio usuario, que step_type distingue de la respuesta del agente).
+ *
+ * `opciones.conHora: false` omite el reloj. Importa para quien REPRODUZCA
+ * historial en vez de seguir el log en vivo (el visor de `/lagrange:watch`
+ * al abrir una pestaña): los eventos de agy no traen timestamp propio, así
+ * que la hora sale de `new Date()` en el momento de formatear. En un tail
+ * en vivo eso es aproximadamente cierto; replicando historial es inventar
+ * un dato — se veían veinte líneas viejas todas selladas con la hora en que
+ * se abrió la página, contradiciendo su propio contenido.
  */
-function formatearLinea(cruda) {
-  const hora = formatearHora();
+function formatearLinea(cruda, opciones = {}) {
+  // Prefijo con la hora solo si corresponde; sin él, nada de espacios sueltos
+  // al principio de la línea.
+  const p = opciones.conHora === false ? '' : `${formatearHora()} `;
 
   let ev;
   try {
     ev = JSON.parse(cruda);
   } catch {
-    return `${hora} ？ ${cruda.slice(0, MAX_LARGO_CRUDO)}`;
+    return `${p}？ ${cruda.slice(0, MAX_LARGO_CRUDO)}`;
   }
 
   switch (ev.event) {
     case 'init': {
       const cid = ev.conversation_id || (ev.init && ev.init.conversation_id);
-      return `${hora} ▶ iniciado${cid ? ` (${String(cid).slice(0, 8)})` : ''}`;
+      return `${p}▶ iniciado${cid ? ` (${String(cid).slice(0, 8)})` : ''}`;
     }
 
     case 'step_update': {
@@ -51,7 +62,7 @@ function formatearLinea(cruda) {
       if (su.step_type && su.step_type !== 'agent_response') return null;
       const delta = su.text_delta || su.delta || su.text;
       if (!delta || !String(delta).trim()) return null;
-      return `${hora} · ${String(delta).replace(/\s+/g, ' ').trim().slice(0, MAX_LARGO_DELTA)}`;
+      return `${p}· ${String(delta).replace(/\s+/g, ' ').trim().slice(0, MAX_LARGO_DELTA)}`;
     }
 
     case 'result': {
@@ -59,11 +70,11 @@ function formatearLinea(cruda) {
       const ok = r.status === 'SUCCESS' && !r.error;
       const marca = ok ? '✔' : '✘';
       const dur = typeof r.duration_seconds === 'number' ? ` ${r.duration_seconds.toFixed(1)}s` : '';
-      return `${hora} ${marca} terminado${dur}${r.error ? ` — ${String(r.error).slice(0, MAX_LARGO_DELTA)}` : ''}`;
+      return `${p}${marca} terminado${dur}${r.error ? ` — ${String(r.error).slice(0, MAX_LARGO_DELTA)}` : ''}`;
     }
 
     default:
-      return `${hora} ？ evento: ${ev.event || '(sin campo event)'}`;
+      return `${p}？ evento: ${ev.event || '(sin campo event)'}`;
   }
 }
 
@@ -130,8 +141,14 @@ function seguir(rutaLog, nombre, { intervaloMs = INTERVALO_MS, escribir = consol
     }
   }
   tick();
+  // A propósito SIN `.unref()`: este proceso existe para seguir el log, así
+  // que el intervalo es lo único que lo mantiene vivo. Con unref, Node se
+  // quedaba sin nada pendiente después del primer tick y el proceso salía
+  // de inmediato (exit 0). Reproducido en vivo el 2026-09-09 corriendo
+  // `node fanout-tail.js` a mano: salía solo en vez de quedarse esperando.
+  // Quien lo llame desde un test debe hacer `clearInterval` del timer que
+  // se devuelve acá.
   const timer = setInterval(tick, intervaloMs);
-  timer.unref?.();
   return timer;
 }
 

@@ -24,7 +24,6 @@ const { executeAgyStdin, executeAgyStreaming } = require('./agy-stream.js');
 const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
 const { lanzarFanout } = require('./fanout.js');
 const { crearEscritorDeEstado, crearLectorDeControl, rutaProgreso, limpiarProgreso } = require('./fanout-estado.js');
-const { abrirVentanaWt } = require('./fanout-window.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -86,10 +85,6 @@ function loadConfig(cwd = process.cwd()) {
     fanoutControl: true,
     fanoutStopCheckIntervalMs: parseInt(process.env.AGY_FANOUT_STOP_INTERVAL_MS, 10) || 2000,
     fanoutProgressLog: true,
-    // Default false a propósito, a diferencia del resto de FEAT-009/012: una
-    // ventana nueva apareciendo en pantalla es mucho más intrusivo que un
-    // archivo escribiéndose en silencio. Opt-in explícito (/lagrange:setup).
-    fanoutWindow: false,
     permissions: {
       allow: ['read', 'edit', 'commands', 'network'],
       deny: [],
@@ -117,7 +112,6 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.fanout_control !== undefined) config.fanoutControl = !!parsed.fanout_control;
       if (parsed.fanout_stop_check_interval_ms !== undefined) config.fanoutStopCheckIntervalMs = parsed.fanout_stop_check_interval_ms;
       if (parsed.fanout_progress_log !== undefined) config.fanoutProgressLog = !!parsed.fanout_progress_log;
-      if (parsed.fanout_window !== undefined) config.fanoutWindow = !!parsed.fanout_window;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -138,7 +132,6 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.fanout_control !== undefined) config.fanoutControl = !!parsed.fanout_control;
       if (parsed.fanout_stop_check_interval_ms !== undefined) config.fanoutStopCheckIntervalMs = parsed.fanout_stop_check_interval_ms;
       if (parsed.fanout_progress_log !== undefined) config.fanoutProgressLog = !!parsed.fanout_progress_log;
-      if (parsed.fanout_window !== undefined) config.fanoutWindow = !!parsed.fanout_window;
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
@@ -174,7 +167,6 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
   if (updates.fanout_statusline_delegate !== undefined) existing.fanout_statusline_delegate = updates.fanout_statusline_delegate;
   if (updates.fanout_control !== undefined) existing.fanout_control = updates.fanout_control;
   if (updates.fanout_progress_log !== undefined) existing.fanout_progress_log = updates.fanout_progress_log;
-  if (updates.fanout_window !== undefined) existing.fanout_window = updates.fanout_window;
   if (updates.permissions !== undefined) {
     existing.permissions = {
       ...(existing.permissions || {}),
@@ -942,11 +934,7 @@ const TOOLS = [
         },
         fanout_progress_log: {
           type: 'boolean',
-          description: 'Whether agy_fanout writes a live per-subagent NDJSON progress log (.claude/worktrees/.agy-progress-<slug>-<taskId>.jsonl), one line per stream-json event as it arrives. Default true; set false to skip writing it (agy_fanout still runs in streaming mode either way).'
-        },
-        fanout_window: {
-          type: 'boolean',
-          description: 'Windows only. Whether agy_fanout opens a new Windows Terminal window (wt.exe), one pane per subagent, tailing its NDJSON progress log live. Default false (opt-in — a new window popping up is far more intrusive than a background file write). No-op on non-Windows platforms.'
+          description: 'Whether agy_fanout writes a live per-subagent NDJSON progress log (.claude/worktrees/.agy-progress-<slug>-<taskId>.jsonl), one line per stream-json event as it arrives. Default true; set false to skip writing it (agy_fanout still runs in streaming mode either way). This log is what /lagrange:watch renders.'
         }
       }
     }
@@ -2650,28 +2638,6 @@ async function handleToolCall(name, args) {
         ? (taskId) => limpiarProgreso(repoPath, args.slug, taskId)
         : undefined;
 
-      // FEAT-010: ventana de wt, Windows only y opt-in (default false — ver
-      // loadConfig). Silenciosamente no-op en cualquier otra plataforma,
-      // aunque el usuario la haya activado: agy_fanout sigue funcionando
-      // igual, solo sin la ventana (queda el log de FEAT-009 y la
-      // statusline de FEAT-008).
-      const alArrancar = (config.fanoutWindow && process.platform === 'win32')
-        ? (asignacion) => {
-            try {
-              abrirVentanaWt(asignacion.map(({ tarea, worktree }) => ({
-                nombre: tarea.id,
-                cwd: worktree.ruta,
-                rutaLog: rutaProgreso(repoPath, args.slug, tarea.id)
-              })));
-            } catch (err) {
-              // Que falle abrir la ventana (p. ej. wt.exe no instalado) no
-              // debe tumbar el fan-out entero — es una comodidad, no el
-              // camino crítico.
-              process.stderr.write(`[antigravity-mcp] No se pudo abrir la ventana de wt: ${err.message}\n`);
-            }
-          }
-        : undefined;
-
       let salida;
       try {
         salida = await lanzarFanout({
@@ -2682,7 +2648,7 @@ async function handleToolCall(name, args) {
           modelo: args.modelo,
           effort: args.effort,
           timeoutMinutes: args.timeout_minutes
-        }, { ejecutar, registrarEstado, limpiarControlPrevio, limpiarProgresoPrevio, alArrancar });
+        }, { ejecutar, registrarEstado, limpiarControlPrevio, limpiarProgresoPrevio });
       } catch (err) {
         return {
           isError: true,
