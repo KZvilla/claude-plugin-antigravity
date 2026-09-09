@@ -15,7 +15,7 @@ const http = require('node:http');
 const { check, group, report } = require('./lib/assert');
 
 const { crearServidor, descubrirLotes, crearVigilante, paginaHtml } = require('../mcp-server/fanout-watch.js');
-const { crearEscritorDeEstado, rutaProgreso, rutaControl } = require('../mcp-server/fanout-estado.js');
+const { crearEscritorDeEstado, rutaProgreso, rutaControl, rutaEstado } = require('../mcp-server/fanout-estado.js');
 
 const borrar = d => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch {} };
 
@@ -145,6 +145,27 @@ async function main() {
     check('lo deja escapado', html.includes('&lt;script&gt;'));
   });
 
+  await group('el JS de la página PARSEA (el punto ciego de los tests de servidor)', () => {
+    // La página se arma dentro de un template literal, así que el servidor
+    // levanta igual aunque su JavaScript esté roto: para Node es un string
+    // válido. Ya pasó dos veces —un backtick en un comentario, y un \n que
+    // se comió el literal de afuera dejando un salto de línea real en medio
+    // de un string— con los 41 checks de servidor en verde y la página
+    // muerta en el navegador. Esto lo agarra sin abrir un navegador.
+    const html = paginaHtml('mi-lote');
+    const script = (html.match(/<script>([\s\S]*?)<\/script>/) || [])[1];
+    check('la página trae un bloque de script', typeof script === 'string' && script.length > 100);
+
+    let error = null;
+    try {
+      // eslint-disable-next-line no-new-func
+      new Function(script);
+    } catch (err) {
+      error = err.message;
+    }
+    check('el script del cliente es sintácticamente válido', error === null, String(error));
+  });
+
   await group('servidor: sirve la página y transmite estado + eventos por SSE', async () => {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-srv-'));
     let servidor;
@@ -237,6 +258,59 @@ async function main() {
       servidor = lanzado.servidor;
       const r = await pedir(lanzado.puerto, '/favicon.ico');
       check('204, no 404', r.status === 204, String(r.status));
+    } finally {
+      if (servidor) await new Promise(r => servidor.close(r));
+      borrar(repo);
+    }
+  });
+
+  await group('ultimaSenal mira los logs, no solo `actualizado` (FEAT-016)', async () => {
+    // El remedio que proponía la auditoría —comparar contra `actualizado`—
+    // habría dado falso positivo en el caso más normal: una tarea que corre
+    // diez minutos genera UN solo `marcar`, así que `actualizado` queda
+    // congelado aunque el subagente esté escupiendo texto sin parar.
+    const { ultimaSenal } = require('../mcp-server/fanout-watch.js');
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-senal-'));
+    try {
+      const escritor = crearEscritorDeEstado(repo, 'lote-vivo', [{ id: 'a' }]);
+      escritor.iniciar({ ramaBase: 'x', concurrencia: 1 });
+
+      // Envejecer el archivo de estado a 30 minutos atrás: es lo que pasaría
+      // con una tarea larga que ya fue marcada "corriendo" y nada más.
+      const viejo = Date.now() - 30 * 60 * 1000;
+      fs.utimesSync(rutaEstado(repo, 'lote-vivo'), new Date(viejo), new Date(viejo));
+
+      const soloEstado = ultimaSenal(repo, 'lote-vivo', ['a']);
+      check('sin log, la señal es la del archivo de estado (vieja)',
+        Math.abs(soloEstado - viejo) < 5000, `${soloEstado} vs ${viejo}`);
+
+      // Ahora el subagente escribe en su log: eso ES señal de vida.
+      escribirEvento(repo, 'lote-vivo', 'a', { event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'sigo trabajando' } });
+      const conLog = ultimaSenal(repo, 'lote-vivo', ['a']);
+      check('con log reciente, la señal se actualiza aunque el estado sea viejo',
+        Date.now() - conLog < 5000, `hace ${Date.now() - conLog}ms`);
+      check('y es más nueva que la del archivo de estado', conLog > soloEstado);
+    } finally { borrar(repo); }
+  });
+
+  await group('servidor: el estado que viaja incluye ultimaSenal (FEAT-016)', async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-fin-'));
+    let servidor;
+    try {
+      const escritor = crearEscritorDeEstado(repo, 'lote-fin', [{ id: 'a' }]);
+      escritor.iniciar({ ramaBase: 'x', concurrencia: 1 });
+      escritor.marcar('a', { estado: 'ok', intentos: 1, fin: new Date().toISOString() });
+      escritor.terminar();
+
+      const lanzado = await levantar(repo, 'lote-fin');
+      servidor = lanzado.servidor;
+      const recibidos = await escucharSse(lanzado.puerto, 250);
+      const estado = recibidos.find(r => r.tipo === 'estado');
+
+      check('el lote terminado informa `terminado`', typeof estado.datos.terminado === 'string', JSON.stringify(estado.datos.terminado));
+      check('e `iniciado`, para poder calcular la duración total', typeof estado.datos.iniciado === 'string');
+      check('y viaja la última señal para saber si sigue habiendo movimiento',
+        typeof estado.datos.ultimaSenal === 'number' && estado.datos.ultimaSenal > 0, JSON.stringify(estado.datos.ultimaSenal));
     } finally {
       if (servidor) await new Promise(r => servidor.close(r));
       borrar(repo);

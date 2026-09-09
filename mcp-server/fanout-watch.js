@@ -79,6 +79,39 @@ function leerEstado(repoPath, slug) {
 }
 
 /**
+ * Momento de la última señal de vida del lote, en ms.
+ *
+ * Por qué NO alcanza con `datos.actualizado` (FEAT-016): ese campo solo se
+ * bumpea dentro de `marcar()`/`terminar()`, y una tarea que corre diez
+ * minutos genera UN solo `marcar` — el de "corriendo", al despacharla. O sea
+ * que `actualizado` queda congelado durante toda la corrida de un subagente
+ * perfectamente sano. Un "¿hace cuánto que no pasa nada?" basado solo en eso
+ * daría falso positivo en el caso más normal que existe.
+ *
+ * El log de progreso (FEAT-009) sí crece mientras el subagente escupe
+ * deltas, así que la señal real es el más reciente de los dos. Se saca del
+ * disco y no del ciclo de vida de la conexión: así sobrevive a un F5 y no se
+ * resetea al reconectar, que es cuando un lote muerto podría disfrazarse de
+ * recién llegado.
+ */
+function ultimaSenal(repoPath, slug, taskIds) {
+  let masReciente = 0;
+  const mirar = (ruta) => {
+    try {
+      const t = fs.statSync(ruta).mtimeMs;
+      if (t > masReciente) masReciente = t;
+    } catch {
+      // Que falte un archivo no es un error: la tarea puede no haber escrito
+      // todavía.
+    }
+  };
+
+  mirar(rutaEstado(repoPath, slug));
+  for (const taskId of taskIds) mirar(rutaProgreso(repoPath, slug, taskId));
+  return masReciente;
+}
+
+/**
  * Mantiene un seguidor por tarea y devuelve solo lo nuevo desde la última
  * vez. Se apoya en `crearSeguidor` de fanout-tail.js —el mismo lector
  * incremental por offset, ya probado— en vez de releer el archivo entero
@@ -153,6 +186,8 @@ function paginaHtml(slug) {
   .pendiente { color: #7d8596; } .corriendo { color: #58a6ff; }
   .reintentando { color: #d29922; } .ok { color: #3fb950; }
   .error { color: #f85149; } .detenida { color: #db6d28; }
+  .meta.fin { color: #3fb950; }
+  .meta.quieto { color: #d29922; }
   .tiempo { font-size: 11px; color: #7d8596; font-variant-numeric: tabular-nums; }
   .tiempo.vivo { color: #58a6ff; }
   /* Scopeado a .tarea: la cabecera de la página ya usa .meta para su resumen
@@ -250,7 +285,7 @@ function refrescarTiempos() {
 }
 // Un solo interval global para toda la página, no uno por tarjeta: attachear
 // timers en cada pintarEstado los iria acumulando.
-setInterval(refrescarTiempos, 1000);
+setInterval(() => { refrescarTiempos(); refrescarCabecera(); }, 1000);
 
 function explicarFallo(t) {
   if (t.detenido) return t.motivo ? 'detenida: ' + t.motivo : 'detenida a pedido';
@@ -286,7 +321,12 @@ function pintarEstado(datos) {
     // La fila se recorta con ellipsis para no comerse la tarjeta; el title
     // deja leer la lista de archivos entera al pasar el mouse, que si no
     // quedaría truncada sin manera de verla.
-    elMeta.title = meta.join('\n');
+    // Doble escape a propósito: esto vive dentro del template literal que
+    // arma la página, así que una secuencia de escape simple la consumiría el
+    // literal de AFUERA y emitiría un salto de línea real en medio del string
+    // del cliente — error de sintaxis en el navegador que ningún test de
+    // servidor ve. (Este comentario también evita escribirla, por lo mismo.)
+    elMeta.title = meta.join('\\n');
 
     const porque = explicarFallo(t);
     const elPorque = el.querySelector('.porque');
@@ -298,8 +338,53 @@ function pintarEstado(datos) {
     else if (t.estado === 'corriendo' || t.estado === 'reintentando') corriendo++;
   }
   refrescarTiempos();
-  resumen.textContent = ids.length + ' tareas · ' + ok + ' ok · ' + err + ' error · ' +
-    corriendo + ' en vuelo' + (datos.terminado ? ' · terminado' : '');
+
+  loteTerminado = datos.terminado || null;
+  loteIniciado = datos.iniciado || null;
+  // Punto de partida que sale del disco; los eventos que lleguen después la
+  // adelantan (ver marcarActividad).
+  if (typeof datos.ultimaSenal === 'number' && datos.ultimaSenal > ultimaActividad) {
+    ultimaActividad = datos.ultimaSenal;
+  }
+
+  const partes = [ids.length + ' tareas', ok + ' ok', err + ' error'];
+  if (!loteTerminado) partes.push(corriendo + ' en vuelo');
+  resumenBase = partes.join(' · ');
+  refrescarCabecera();
+}
+
+// Estado del lote que necesita la cabecera entre repintados.
+let loteTerminado = null;
+let loteIniciado = null;
+let resumenBase = '';
+let ultimaActividad = 0;
+
+// Cualquier evento que llegue es señal de vida: adelanta el reloj de
+// "sin novedad" sin que el servidor tenga que mandar pulsos.
+function marcarActividad() { ultimaActividad = Date.now(); }
+
+// Cuánto silencio hace falta para decirlo. Un subagente que piensa un rato
+// largo es normal; varios minutos sin una sola línea ni cambio de estado ya
+// merece que la persona lo sepa — sin declararlo muerto, porque desde acá no
+// se puede saber si el proceso sigue vivo.
+const SILENCIO_AVISO_MS = 2 * 60 * 1000;
+
+function refrescarCabecera() {
+  if (!resumenBase) return;
+  let extra = '';
+  if (loteTerminado) {
+    const total = loteIniciado
+      ? ' en ' + duracion(new Date(loteTerminado).getTime() - new Date(loteIniciado).getTime())
+      : '';
+    extra = ' · terminado' + total;
+  } else if (ultimaActividad) {
+    const quieto = Date.now() - ultimaActividad;
+    // No se afirma que esté muerto: se dice desde cuándo no hay señales y
+    // que juzgue quien mira. El visor no puede saber si el proceso vive.
+    if (quieto > SILENCIO_AVISO_MS) extra = ' · sin novedad hace ' + duracion(quieto);
+  }
+  resumen.textContent = resumenBase + extra;
+  resumen.className = 'meta' + (loteTerminado ? ' fin' : (extra ? ' quieto' : ''));
 }
 
 const MARCA = { inicio: '▶', prosa: '·', tool: '🔧', 'fin-ok': '✔', 'fin-error': '✘', raro: '？' };
@@ -357,8 +442,19 @@ function pintarEvento(ev) {
 }
 
 const fuente = new EventSource('/api/eventos');
+// Ojo con qué cuenta como "actividad". La ráfaga inicial al conectar es
+// HISTORIAL, no vida: si contara, abrir la pestaña sobre un lote abandonado
+// hace media hora lo mostraría como recién activo — que es justo la mentira
+// que FEAT-016 viene a sacar. El estado no bumpea nada: trae ultimaSenal
+// sacada del mtime en disco, que es la verdad. Y de los eventos de log solo
+// cuentan los que llegan en vivo, que son los que traen hora (el replay
+// viene con hora en null, ver crearVigilante).
 fuente.addEventListener('estado', e => pintarEstado(JSON.parse(e.data)));
-fuente.addEventListener('evento', e => pintarEvento(JSON.parse(e.data)));
+fuente.addEventListener('evento', e => {
+  const ev = JSON.parse(e.data);
+  if (ev.hora) marcarActividad();
+  pintarEvento(ev);
+});
 fuente.onerror = () => { resumen.textContent = 'desconectado (¿se cerró el visor?)'; };
 </script>
 </body>
@@ -404,10 +500,21 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS } = {
 
       // El primer envío va con el estado completo para que una pestaña que
       // se abre a mitad del lote no arranque en blanco.
+      // `ultimaSenal` viaja con el estado y no en un pulso periódico: el
+      // cliente la usa como punto de partida y después la adelanta sola cada
+      // vez que le llega CUALQUIER evento. Así una pestaña recién abierta
+      // sobre un lote muerto no lo ve "recién activo" (el dato sale del
+      // disco), y un lote vivo nunca se marca quieto (los eventos lo
+      // refrescan) — todo sin mandar un mensaje cada 500ms.
+      const conSenal = (estado) => ({
+        ...estado,
+        ultimaSenal: ultimaSenal(repoPath, slug, Object.keys(estado.tareas || {}))
+      });
+
       const estadoInicial = leerEstado(repoPath, slug);
       if (estadoInicial) {
         ultimoEstadoSerializado = JSON.stringify(estadoInicial.tareas || {});
-        empujar('estado', estadoInicial);
+        empujar('estado', conSenal(estadoInicial));
         for (const ev of vigilante.nuevosEventos(Object.keys(estadoInicial.tareas || {}), { conHora: false })) {
           empujar('evento', ev);
         }
@@ -420,7 +527,7 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS } = {
         const serializado = JSON.stringify(estado.tareas || {});
         if (serializado !== ultimoEstadoSerializado) {
           ultimoEstadoSerializado = serializado;
-          empujar('estado', estado);
+          empujar('estado', conSenal(estado));
         }
         for (const ev of vigilante.nuevosEventos(Object.keys(estado.tareas || {}))) {
           empujar('evento', ev);
@@ -517,4 +624,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { crearServidor, descubrirLotes, crearVigilante, paginaHtml };
+module.exports = { crearServidor, descubrirLotes, crearVigilante, paginaHtml, ultimaSenal };
