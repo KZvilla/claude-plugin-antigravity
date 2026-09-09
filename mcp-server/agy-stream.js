@@ -20,6 +20,7 @@
  */
 const { spawn } = require('child_process');
 const readline = require('readline');
+const { offloadLargePrompt } = require('./prompt-offload.js');
 
 /**
  * Acumulador puro de la salida NDJSON de agy.
@@ -250,7 +251,13 @@ function executeAgyStreaming(binario, args, options = {}) {
   const onLine = options.onLine || (() => {});
   const terminate = options.terminate || ((child) => { try { child.kill('SIGKILL'); } catch {} });
 
-  const finalArgs = args.includes('--output-format') ? [...args] : [...args, '--output-format', 'stream-json'];
+  // Mismo volcado a fichero para prompts grandes que ya usa executeAgy
+  // (index.js) — extraído a prompt-offload.js justamente para que esta
+  // función lo comparta en vez de duplicarlo u olvidarlo (encontrado por
+  // auditoría adversarial, agy_audit, 2026-09-09: la primera versión pasaba
+  // `args` directo a `spawn`, sin volcar prompts por encima del límite).
+  const { args: descargados, cleanup: limpiarPrompt } = offloadLargePrompt(args);
+  const finalArgs = descargados.includes('--output-format') ? [...descargados] : [...descargados, '--output-format', 'stream-json'];
 
   return new Promise((resolve) => {
     const acumulador = crearAcumuladorStream();
@@ -262,6 +269,7 @@ function executeAgyStreaming(binario, args, options = {}) {
     try {
       child = spawn(binario, finalArgs, { cwd, shell: false, env: { ...process.env } });
     } catch (err) {
+      limpiarPrompt();
       return resolve({ success: false, error: `Failed to spawn ${binario}: ${err.message}`, stdout: '', stderr: '' });
     }
 
@@ -269,6 +277,7 @@ function executeAgyStreaming(binario, args, options = {}) {
       killed = true;
       clearInterval(stopTimer);
       terminate(child);
+      limpiarPrompt();
       resolve({
         success: false,
         error: `Antigravity MCP process watchdog timed out after ${timeoutMinutes} minutes`,
@@ -286,6 +295,7 @@ function executeAgyStreaming(binario, args, options = {}) {
         clearTimeout(timer);
         clearInterval(stopTimer);
         terminate(child);
+        limpiarPrompt();
         resolve({
           success: false,
           error: 'Detenido por el usuario',
@@ -309,12 +319,14 @@ function executeAgyStreaming(binario, args, options = {}) {
     child.on('error', (err) => {
       clearTimeout(timer);
       clearInterval(stopTimer);
+      limpiarPrompt();
       resolve({ success: false, error: `Failed to spawn ${binario}: ${err.message}`, stdout: '', stderr });
     });
 
     child.on('close', (code) => {
       clearTimeout(timer);
       clearInterval(stopTimer);
+      limpiarPrompt();
       if (killed) return;
 
       // Mismo motivo que executeAgy: consumir un centinela que haya llegado

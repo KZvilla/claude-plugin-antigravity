@@ -99,6 +99,37 @@ async function main() {
     check('devuelve el mismo comando que construirComandoWt', resultado.bin === 'wt.exe' && Array.isArray(resultado.args));
   });
 
+  await group('abrirVentanaWt — un binario faltante no tumba el proceso (regresión de auditoría adversarial)', async () => {
+    // agy_audit (2026-09-09) reprodujo que spawn('wt.exe', ...) sin listener
+    // de 'error' tumba TODO el proceso del servidor MCP cuando wt.exe no
+    // está instalado — `spawn` no tira de forma síncrona ante ENOENT, emite
+    // 'error' en el próximo tick, y un EventEmitter sin listener para eso
+    // es una excepción no capturada para Node. Acá se reproduce con el
+    // spawn REAL de Node (no un mock) apuntado a un binario que seguro no
+    // existe, para ejercitar el mismo camino asincrónico que reventó en el
+    // audit — si el fix no estuviera, este test ni siquiera llegaría a los
+    // checks de abajo: el proceso entero de la suite moriría acá.
+    const { spawn: spawnReal } = require('node:child_process');
+    const entradas = [{ nombre: 'sola', cwd: process.cwd(), rutaLog: 'no-importa.jsonl' }];
+
+    let logueoAlgo = false;
+    const stderrOriginal = process.stderr.write;
+    process.stderr.write = (chunk) => { logueoAlgo = true; return true; };
+
+    try {
+      abrirVentanaWt(entradas, {
+        spawn: (bin, args, opts) => spawnReal('binario-definitivamente-inexistente-xyz123', args, opts)
+      });
+      // Dar tiempo a que el 'error' asincrónico de spawn dispare de verdad.
+      await new Promise(r => setTimeout(r, 300));
+    } finally {
+      process.stderr.write = stderrOriginal;
+    }
+
+    check('el proceso de test sigue vivo (si no, esto nunca se ejecuta)', true);
+    check('el fallo se loguea en vez de quedar silencioso', logueoAlgo);
+  });
+
   process.exit(report() ? 0 : 1);
 }
 

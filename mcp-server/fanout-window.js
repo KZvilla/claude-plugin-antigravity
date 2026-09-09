@@ -78,11 +78,23 @@ function construirComandoWt(entradas, opciones = {}) {
  *
  * `opciones.spawn` va inyectado para poder probar la construcción del
  * comando sin abrir una ventana real durante los tests.
+ *
+ * El listener de `'error'` no es opcional: si `wt.exe` no está instalado,
+ * `spawn` no tira de forma síncrona (así que un `try/catch` alrededor de
+ * esta llamada no alcanza) — emite `'error'` en el próximo tick. Un
+ * `EventEmitter` sin listener para `'error'` hace que Node lo trate como
+ * excepción no capturada y tumbe **todo el proceso del servidor MCP**, no
+ * solo este fan-out. Encontrado por auditoría adversarial (agy_audit,
+ * 2026-09-09), reproducido de verdad apuntando `spawn` a un binario
+ * inexistente.
  */
 function abrirVentanaWt(entradas, opciones = {}) {
   const { bin, args } = construirComandoWt(entradas, opciones);
   const spawnFn = opciones.spawn || spawn;
   const child = spawnFn(bin, args, { detached: true, stdio: 'ignore', shell: false });
+  child.on?.('error', (err) => {
+    process.stderr.write(`[antigravity-mcp] No se pudo abrir la ventana de wt (${bin}): ${err.message}\n`);
+  });
   child.unref?.();
   return { bin, args };
 }
