@@ -261,6 +261,56 @@ async function main() {
 
   repo = crearRepo();
   try {
+    await group('limpiarControlPrevio corre una sola vez por tarea, antes de cualquier ejecutar (FEAT-012)', async () => {
+      // Regresión de la auditoría adversarial (agy_audit, 2026-09-09): la
+      // primera versión limpiaba el centinela DENTRO de `ejecutar`, en cada
+      // intento — lo que borraba un pedido de detención legítimo escrito
+      // mientras una tarea esperaba turno, o durante el backoff de un
+      // reintento por cuota. Acá se prueba la garantía de orden que lo evita:
+      // el barrido pasa una sola vez, antes de que arranque el primer lote.
+      const eventos = [];
+      const limpiarControlPrevio = (taskId) => eventos.push(`limpiar:${taskId}`);
+      const eje = ejecutorFalso({ fallar: { a: { error: 'HTTP 429 quota exceeded', veces: 2 } } });
+      const ejecutarConLog = async (peticion) => {
+        const id = (peticion.prompt.match(/hacer ([a-z0-9-]+)/) || [])[1];
+        eventos.push(`ejecutar:${id}`);
+        return eje.ejecutar(peticion);
+      };
+
+      await lanzarFanout({
+        repoPath: repo,
+        slug: 'con-orden',
+        tareas: [tarea('a', ['src/a.js']), tarea('b', ['src/b.js'])],
+        esperaBaseMs: 1
+      }, { ejecutar: ejecutarConLog, alDormir: async () => {}, limpiarControlPrevio });
+
+      const ultimaLimpieza = Math.max(eventos.indexOf('limpiar:a'), eventos.indexOf('limpiar:b'));
+      const primerEjecutar = Math.min(
+        eventos.indexOf('ejecutar:a'),
+        eventos.indexOf('ejecutar:b') === -1 ? Infinity : eventos.indexOf('ejecutar:b')
+      );
+      check('ambas limpiezas ocurren antes de cualquier ejecutar', ultimaLimpieza < primerEjecutar, eventos.join(','));
+
+      check('a se reintenta 3 veces por cuota pero se limpia una sola vez',
+        eventos.filter(e => e === 'ejecutar:a').length === 3 &&
+        eventos.filter(e => e === 'limpiar:a').length === 1,
+        eventos.join(','));
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
+    await group('sin limpiarControlPrevio no cambia nada (no-op por defecto)', async () => {
+      const eje = ejecutorFalso();
+      const r = await lanzarFanout({
+        repoPath: repo, slug: 'sin-limpieza', tareas: [tarea('a', ['src/a.js'])]
+      }, { ejecutar: eje.ejecutar });
+      check('funciona igual sin limpiarControlPrevio', r.lanzado === true && r.resumen.exitosas === 1);
+    });
+  } finally { borrar(repo); }
+
+  repo = crearRepo();
+  try {
     await group('engancha el estado de orquestación (FEAT-005 V1)', async () => {
       const eje = ejecutorFalso({ fallar: { a: { error: 'HTTP 429 quota exceeded', veces: 1 } } });
       const registrador = registradorFalso();
@@ -422,13 +472,32 @@ async function main() {
         concurrencia: 1
       }, 15000);
 
-      // Deja que el subagente arranque de verdad (el spawn del stub quede
-      // registrado) antes de pedir que lo maten.
-      await new Promise(r => setTimeout(r, 200));
-      marcarDetencion(repoTmp, 'con-stop', 'solo', 'se fue por las ramas');
+      // Reescribe el centinela cada 25ms hasta que la tool call resuelva, en
+      // vez de un único write cronometrado a mano. La primera versión de este
+      // test escribía una sola vez tras un `setTimeout(200)`, apostando a que
+      // ya hubiera pasado el barrido de centinelas viejos del lado del
+      // servidor (preparar rama base + crear worktrees, variable e
+      // independiente de este proceso) — una auditoría adversarial
+      // (agy_audit, 2026-09-09) lo reprodujo como flaky en un entorno donde
+      // esa preparación tardó más que el margen elegido. Reescribir en loop
+      // hasta que la promesa resuelva es correcto para cualquier timing: el
+      // servidor solo barre centinelas ANTES del primer lote (fanout.js,
+      // `limpiarControlPrevio`) y nunca más durante la corrida, así que
+      // cualquier escritura nuestra posterior a ese barrido sobrevive hasta
+      // que `stopCheck` la consuma.
+      let sigueEscribiendo = true;
+      const reescribir = async () => {
+        while (sigueEscribiendo) {
+          marcarDetencion(repoTmp, 'con-stop', 'solo', 'se fue por las ramas');
+          await new Promise(r => setTimeout(r, 25));
+        }
+      };
+      const loopEscritura = reescribir();
 
       const r = await promesa;
       const elapsedMs = Date.now() - inicio;
+      sigueEscribiendo = false;
+      await loopEscritura;
 
       check('resuelve bien antes de los 2.5s del hold', elapsedMs < 2000, `elapsed = ${elapsedMs}ms`);
       check('no devuelve isError', r.result.isError !== true, JSON.stringify(r.result));

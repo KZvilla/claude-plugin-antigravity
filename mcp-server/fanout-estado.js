@@ -21,6 +21,7 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const DIR_WORKTREES = path.join('.claude', 'worktrees');
 
@@ -38,6 +39,21 @@ function rutaEstado(repoPath, slug) {
 }
 
 /**
+ * Igual que slugificarArchivo, pero pensado para un `taskId` que va a
+ * formar parte de un NOMBRE DE ARCHIVO junto al de otras tareas del mismo
+ * lote — no alcanza con truncar a 40 chars y listo: dos ids que solo
+ * difieren después del carácter 40 producirían el mismo archivo y
+ * terminarían compartiendo el mismo centinela (encontrado por auditoría
+ * adversarial, agy_audit, 2026-09-09). El sufijo hash hace la colisión
+ * computacionalmente despreciable sin perder la parte legible para debug.
+ */
+function idParaArchivo(taskId) {
+  const legible = slugificarArchivo(taskId).slice(0, 24);
+  const hash = crypto.createHash('sha1').update(String(taskId)).digest('hex').slice(0, 10);
+  return `${legible}-${hash}`;
+}
+
+/**
  * Centinela de detención por tarea (FEAT-012).
  *
  * A propósito NO es un único archivo compartido con un array de ids: eso
@@ -48,20 +64,52 @@ function rutaEstado(repoPath, slug) {
  * ese taskId va a crear ese path exacto — así que no hace falta lock.
  */
 function rutaControl(repoPath, slug, taskId) {
-  return path.join(repoPath, DIR_WORKTREES, `.fanout-stop-${slugificarArchivo(slug)}-${slugificarArchivo(taskId)}.json`);
+  return path.join(repoPath, DIR_WORKTREES, `.fanout-stop-${slugificarArchivo(slug)}-${idParaArchivo(taskId)}.json`);
+}
+
+const RENAME_REINTENTOS = 5;
+const RENAME_ESPERA_MS = 15;
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * No hay un escritor rival del que protegerse (rutaControl es un archivo por
+ * taskId), pero SÍ hay un lector-y-borrador rival: `consumirDetencion` del
+ * lado del orquestador hace su propio `readFileSync`/`unlinkSync` sobre este
+ * mismo path, en otro proceso. En Windows eso puede dejar el destino
+ * brevemente tomado y `renameSync` tira `EPERM`/`EBUSY` — no hipotético:
+ * reproducido escribiendo en loop rápido mientras el otro lado sondea
+ * (auditoría adversarial, agy_audit, 2026-09-09). No hace falta un lock como
+ * el de antigravity-usage.json (BE-010): el conflicto es transitorio, no una
+ * carrera de datos — `consumirDetencion` ya tolera un archivo ausente o a
+ * medio escribir. Alcanza con reintentar el rename unos milisegundos.
+ */
+function renombrarConReintento(origen, destino) {
+  for (let intento = 0; ; intento++) {
+    try {
+      fs.renameSync(origen, destino);
+      return;
+    } catch (err) {
+      const transitorio = err && (err.code === 'EPERM' || err.code === 'EBUSY');
+      if (!transitorio || intento >= RENAME_REINTENTOS) throw err;
+      sleepSync(RENAME_ESPERA_MS);
+    }
+  }
 }
 
 /**
  * Pide que se detenga una tarea en vuelo. La escritura es atómica
- * (temporal + rename) por consistencia con el resto del módulo, aunque acá
- * no hay un escritor rival contra el que protegerse.
+ * (temporal + rename), con reintento ante contención transitoria — ver
+ * renombrarConReintento.
  */
 function marcarDetencion(repoPath, slug, taskId, motivo) {
   const ruta = rutaControl(repoPath, slug, taskId);
   fs.mkdirSync(path.dirname(ruta), { recursive: true });
   const tmp = `${ruta}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify({ detenidoEn: new Date().toISOString(), motivo: motivo || null }, null, 2), 'utf8');
-  fs.renameSync(tmp, ruta);
+  renombrarConReintento(tmp, ruta);
 }
 
 /**

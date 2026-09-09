@@ -20,6 +20,14 @@
  * atender un pedido de detención por tarea (FEAT-012) — ver
  * mcp-server/fanout-estado.js. Un resultado con `stopped: true` no cuenta
  * como error de cuota (esErrorDeCuota no lo reconoce) y no se reintenta.
+ *
+ * `deps.limpiarControlPrevio` (FEAT-012) se llama UNA VEZ por tarea, antes
+ * del primer lote — nunca dentro de `ejecutar` — para no arriesgarse a
+ * borrar un pedido de detención legítimo escrito mientras una tarea espera
+ * turno en un lote siguiente o durante el backoff de un reintento por
+ * cuota. Una auditoría adversarial (agy_audit, 2026-09-09) encontró esa
+ * carrera en la primera versión, que limpiaba por intento dentro de
+ * `ejecutar`.
  */
 const { validarReparto, explicarReparto } = require('./reparto.js');
 const { prepararRamaBase, crearWorktrees } = require('./worktrees.js');
@@ -118,6 +126,9 @@ async function lanzarFanout(opciones, deps) {
   if (typeof ejecutar !== 'function') throw new Error('lanzarFanout requiere deps.ejecutar');
   const alDormir = (deps && deps.alDormir) || dormir;
   const registrarEstado = (deps && deps.registrarEstado) || ESTADO_NULO;
+  // No-op por defecto, igual que registrarEstado: si no se inyecta, el
+  // comportamiento es el de antes de FEAT-012.
+  const limpiarControlPrevio = (deps && deps.limpiarControlPrevio) || (() => {});
 
   if (!Number.isInteger(concurrencia) || concurrencia < 1) {
     throw new Error(`concurrencia debe ser un entero >= 1, recibido: ${concurrencia}`);
@@ -147,6 +158,16 @@ async function lanzarFanout(opciones, deps) {
   const asignacion = tareas.map((t, i) => ({ tarea: t, worktree: worktrees[i] }));
 
   registrarEstado.iniciar({ ramaBase: base.rama, concurrencia });
+
+  // Barrido de centinelas viejos de una corrida ANTERIOR con el mismo
+  // slug/taskId (FEAT-012) — una sola vez acá, antes de que arranque el
+  // primer lote. A propósito NO se limpia dentro de `ejecutar` (por
+  // intento): eso borraría un pedido de detención legítimo escrito mientras
+  // una tarea espera su turno en un lote siguiente, o durante el backoff de
+  // un reintento por cuota — justo los dos casos que la feature existe para
+  // cubrir. Después de este punto, cualquier centinela que aparezca es de
+  // esta corrida y nadie más lo toca hasta que `stopCheck` lo consuma.
+  for (const { tarea } of asignacion) limpiarControlPrevio(tarea.id);
 
   // 4. Ejecución en lotes. El tope existe por cuota, no por CPU: lanzar las N de
   //    golpe es la forma más rápida de comerse un 429 y perder el lote entero.

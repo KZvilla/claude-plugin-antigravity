@@ -117,6 +117,79 @@ async function main() {
       const lector = crearLectorDeControl(repo, 'lote-raro');
       check('se puede consumir igual', lector.consumirDetencion('Tarea Con Espacios/Barras') !== null);
     });
+
+    await group('taskIds largos que solo difieren después del carácter 40 no colisionan', () => {
+      // Regresión de la auditoría adversarial (agy_audit, 2026-09-09): con
+      // slugificarArchivo solo (trunca a 40 chars), estos dos ids producían
+      // el mismo nombre de archivo y compartían centinela.
+      const idA = 'feature-subtask-implementation-step-001-parte-a';
+      const idB = 'feature-subtask-implementation-step-001-parte-b';
+      check('los primeros 40 chars son iguales a propósito', idA.slice(0, 40) === idB.slice(0, 40));
+
+      const lector = crearLectorDeControl(repo, 'lote-colision');
+      check('distintas rutas de archivo', rutaControl(repo, 'lote-colision', idA) !== rutaControl(repo, 'lote-colision', idB));
+
+      marcarDetencion(repo, 'lote-colision', idA);
+      check('B no ve el centinela de A', lector.consumirDetencion(idB) === null);
+      check('A sigue teniendo el suyo', lector.consumirDetencion(idA) !== null);
+    });
+
+    await group('marcarDetencion reintenta ante EPERM/EBUSY transitorio (FEAT-012)', () => {
+      // Regresión de la auditoría adversarial (agy_audit, 2026-09-09): en
+      // Windows, escribir el centinela mientras el orquestador lo está
+      // leyendo/borrando del otro lado (consumirDetencion, otro proceso) hace
+      // que renameSync tire EPERM/EBUSY — reproducido de verdad corriendo el
+      // test de integración de fanout.test.js en loop. Acá se simula sin
+      // depender de una carrera real: se hace que renameSync falle dos veces
+      // y a la tercera pase.
+      const renameOriginal = fs.renameSync;
+      let llamadas = 0;
+      fs.renameSync = (origen, destino) => {
+        llamadas++;
+        if (llamadas <= 2) {
+          const err = new Error('EPERM simulado');
+          err.code = 'EPERM';
+          throw err;
+        }
+        return renameOriginal(origen, destino);
+      };
+
+      try {
+        let lanzo = false;
+        try {
+          marcarDetencion(repo, 'lote-eperm', 'a');
+        } catch { lanzo = true; }
+        check('no propaga el error transitorio', !lanzo);
+        check('reintentó hasta pasar (3 intentos)', llamadas === 3, `llamadas = ${llamadas}`);
+
+        const lector = crearLectorDeControl(repo, 'lote-eperm');
+        check('el centinela quedó escrito de verdad', lector.consumirDetencion('a') !== null);
+      } finally {
+        fs.renameSync = renameOriginal;
+      }
+    });
+
+    await group('marcarDetencion no reintenta un error que no es transitorio', () => {
+      const renameOriginal = fs.renameSync;
+      let llamadas = 0;
+      fs.renameSync = () => {
+        llamadas++;
+        const err = new Error('ENOENT simulado');
+        err.code = 'ENOENT';
+        throw err;
+      };
+
+      try {
+        let lanzo = false;
+        try {
+          marcarDetencion(repo, 'lote-enoent', 'a');
+        } catch { lanzo = true; }
+        check('propaga un error no transitorio', lanzo);
+        check('un solo intento, no reintenta lo que no tiene sentido reintentar', llamadas === 1, `llamadas = ${llamadas}`);
+      } finally {
+        fs.renameSync = renameOriginal;
+      }
+    });
   } finally {
     borrar(repo);
   }

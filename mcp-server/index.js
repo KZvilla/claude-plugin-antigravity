@@ -2270,6 +2270,12 @@ function executeAgy(args, options = {}) {
       limpiarPrompt();
       if (killed) return;
 
+      // El proceso terminó solo antes del próximo tick de stopCheck: un pedido
+      // de detención que hubiera llegado justo en ese margen ya no sirve para
+      // nada (nada que matar), pero igual hay que consumirlo para no dejar el
+      // centinela huérfano en disco hasta la próxima corrida de este slug.
+      if (typeof options.stopCheck === 'function') options.stopCheck();
+
       let parsed = null;
       try {
         parsed = JSON.parse(stdout.trim());
@@ -2604,11 +2610,6 @@ async function handleToolCall(name, args) {
       // por worktree en vez de reforzarlo, y exige UAC (H1 a H3 del documento de
       // diseño). El confinamiento acá es el worktree.
       const ejecutar = async (peticion) => {
-        // Centinela viejo de una corrida anterior con el mismo slug/taskId
-        // (p. ej. reintentar un lote fallido): si sobreviviera, mataría a este
-        // subagente en el primer tick de sondeo antes de que hiciera nada.
-        if (lectorControl) lectorControl.limpiar(peticion.taskId);
-
         const cliArgs = ['--output-format', 'json', '--dangerously-skip-permissions'];
         cliArgs.push('--mode', peticion.mode || 'accept-edits');
         cliArgs.push('--effort', peticion.effort || config.defaultEffort || 'high');
@@ -2636,6 +2637,16 @@ async function handleToolCall(name, args) {
         ? crearEscritorDeEstado(repoPath, args.slug, args.tareas)
         : undefined;
 
+      // Barrido de centinelas viejos (FEAT-012): una sola vez por tarea, ANTES
+      // del primer lote — nunca en cada intento, para no arriesgarse a borrar
+      // un pedido de detención legítimo escrito mientras la tarea espera turno
+      // en un lote siguiente o durante el backoff de un reintento por cuota.
+      // Encontrado por auditoría adversarial (agy_audit, 2026-09-09): la
+      // primera versión limpiaba dentro de `ejecutar`, en cada intento.
+      const limpiarControlPrevio = lectorControl
+        ? (taskId) => lectorControl.limpiar(taskId)
+        : undefined;
+
       let salida;
       try {
         salida = await lanzarFanout({
@@ -2646,7 +2657,7 @@ async function handleToolCall(name, args) {
           modelo: args.modelo,
           effort: args.effort,
           timeoutMinutes: args.timeout_minutes
-        }, { ejecutar, registrarEstado });
+        }, { ejecutar, registrarEstado, limpiarControlPrevio });
       } catch (err) {
         return {
           isError: true,
