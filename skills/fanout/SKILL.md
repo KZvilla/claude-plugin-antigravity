@@ -1,6 +1,7 @@
 ---
 name: fanout
 description: "[skill, loads itself] Background knowledge for running several Antigravity subagents concurrently, each confined to its own git worktree; /lagrange:fanout is the explicit trigger. Use when a plan is already broken into atomic tasks and the user wants them implemented in parallel, or mentions fan-out, subagentes concurrentes, paralelizar tareas, worktrees por subagente, or asks to split implementation work across several agy instances. Covers the disjointness contract, the branch and worktree conventions, what --sandbox actually does, and why auditing and testing must stay with Claude."
+user-invocable: false
 ---
 
 # Fan-out concurrente de subagentes de Antigravity

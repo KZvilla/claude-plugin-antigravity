@@ -1,6 +1,7 @@
 ---
 name: setup
 description: '[skill, loads itself] Guided setup and troubleshooting for the optional parts of this plugin: the Antigravity CLI itself, local Voicebox TTS, outbound Telegram notifications, the bidirectional Telegram daemon, and live agy_fanout progress in the statusline. /lagrange:setup is the explicit trigger. Use this skill when the user wants to configure, install, connect or fix any of those — or mentions "configurar telegram", "instalar voicebox", "set up the bridge", "no me llegan las notificaciones", "el bot no responde", "how do I get the voice narration working", "quiero ver el progreso del fanout", "trackear subagentes en la statusline", or asks why a Telegram/voice tool is failing.'
+user-invocable: false
 license: MIT
 ---
 
