@@ -127,11 +127,15 @@ async function main() {
       // inventar el dato (se veía "17:26:32 · sigue en vuelo 17:25:10").
       escribirEvento(repo, 'lote', 'b', { event: 'init', conversation_id: 'bbbb2222' });
       const sinHora = crearVigilante(repo, 'lote').nuevosEventos(['b'], { conHora: false });
-      check('el replay del historial no lleva reloj', !/^\d\d:\d\d:\d\d/.test(sinHora[0].texto), sinHora[0].texto);
+      check('el replay del historial viene sin hora', sinHora[0].hora === null, JSON.stringify(sinHora[0]));
 
       escribirEvento(repo, 'lote', 'c', { event: 'init', conversation_id: 'cccc3333' });
       const conHora = crearVigilante(repo, 'lote').nuevosEventos(['c']);
-      check('lo que llega en vivo sí lleva reloj', /^\d\d:\d\d:\d\d/.test(conHora[0].texto), conHora[0].texto);
+      check('lo que llega en vivo sí trae hora', /^\d\d:\d\d:\d\d$/.test(conHora[0].hora), JSON.stringify(conHora[0]));
+
+      // FEAT-014: el evento ahora viaja estructurado, no como una línea ya
+      // armada — el navegador necesita `stepIndex` para unir los fragmentos.
+      check('el evento trae tipo y stepIndex', conHora[0].tipo === 'inicio' && 'stepIndex' in conHora[0], JSON.stringify(conHora[0]));
     } finally { borrar(repo); }
   });
 

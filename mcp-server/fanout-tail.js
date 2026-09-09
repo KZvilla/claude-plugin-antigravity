@@ -20,10 +20,128 @@ const fs = require('node:fs');
 const INTERVALO_MS = 300;
 const MAX_LARGO_DELTA = 300;
 const MAX_LARGO_CRUDO = 200;
+const MAX_LARGO_PARAM = 120;
 
 function formatearHora(d = new Date()) {
   return d.toTimeString().slice(0, 8);
 }
+
+/**
+ * Nombres de parámetro que valen como "el sujeto" de una llamada a
+ * herramienta, en orden de preferencia.
+ *
+ * A propósito es una lista de CANDIDATOS y no un mapa herramienta →
+ * parámetro: de las herramientas de `agy` solo se verificó en vivo la forma
+ * de `write_to_file` (`TargetFile`), así que un mapa fijo sería inventar el
+ * resto. Con candidatos, una herramienta desconocida degrada a mostrar solo
+ * su nombre en vez de `🔧 run_command → undefined`.
+ *
+ * Se excluyen a propósito los parámetros que traen payload (`CodeContent`,
+ * `TargetContent`, `ReplacementContent`): son de kilobytes y volcarlos en el
+ * visor sería peor que no mostrar nada.
+ */
+const PARAMS_INTERESANTES = [
+  'TargetFile', 'AbsolutePath', 'DirectoryPath', 'SearchPath', 'FilePath',
+  'CommandLine', 'Command', 'Query', 'SearchTerm', 'Url', 'Pattern'
+];
+
+function resumirHerramienta(su) {
+  const nombre = su.tool_name || (su.tool_info && su.tool_info.name) || 'herramienta';
+  const params = (su.tool_info && su.tool_info.parameters) || {};
+
+  let sujeto = null;
+  for (const clave of PARAMS_INTERESANTES) {
+    const v = params[clave];
+    if (typeof v === 'string' && v.trim()) { sujeto = v.trim(); break; }
+  }
+
+  if (!sujeto) return nombre;
+  const corto = sujeto.length > MAX_LARGO_PARAM
+    ? `${sujeto.slice(0, MAX_LARGO_PARAM)}…`
+    : sujeto;
+  return `${nombre} → ${corto}`;
+}
+
+/**
+ * Proyección PURA y sin estado de un evento NDJSON a algo mostrable.
+ * Devuelve `null` cuando no hay nada que mostrar.
+ *
+ * Existe separada de `formatearLinea` porque el visor y la CLI necesitan
+ * cosas distintas del mismo evento: la CLI quiere una línea ya armada; el
+ * visor quiere los campos sueltos —sobre todo `stepIndex`— para poder unir
+ * en el navegador los `text_delta` de un mismo paso.
+ *
+ * Lo que NO hace, deliberadamente: acumular. `agy` parte la prosa en
+ * `text_delta` a mitad de palabra, y la tentación es juntarlos acá hasta que
+ * el paso cierre con `state: "DONE"`. Una auditoría adversarial del plan
+ * (2026-09-09) mostró por qué sería un error: si a un subagente lo matan
+ * (FEAT-012), su paso en curso nunca recibe el `DONE` y todo lo acumulado se
+ * perdería sin mostrarse jamás; y un paso largo dejaría la vista congelada
+ * hasta terminar. Se emite todo, siempre, apenas llega; unir es trabajo de
+ * quien pinta, que además ya tiene estado propio por tarea.
+ *
+ * @returns {{tipo: string, stepIndex: number|null, texto: string}|null}
+ */
+function interpretarEvento(cruda) {
+  let ev;
+  try {
+    ev = JSON.parse(cruda);
+  } catch {
+    return { tipo: 'raro', stepIndex: null, texto: String(cruda).slice(0, MAX_LARGO_CRUDO) };
+  }
+
+  switch (ev.event) {
+    case 'init': {
+      const cid = ev.conversation_id || (ev.init && ev.init.conversation_id);
+      return { tipo: 'inicio', stepIndex: null, texto: `iniciado${cid ? ` (${String(cid).slice(0, 8)})` : ''}` };
+    }
+
+    case 'step_update': {
+      const su = ev.step_update || {};
+      const stepIndex = typeof su.step_index === 'number' ? su.step_index : null;
+
+      if (su.step_type === 'tool') {
+        // Solo el ACTIVE: es cuando querés enterarte de que arrancó algo que
+        // puede tardar. El DONE del mismo paso repetiría la misma línea.
+        if (su.state && su.state !== 'ACTIVE') return null;
+        return { tipo: 'tool', stepIndex, texto: resumirHerramienta(su) };
+      }
+
+      // Cualquier otro step_type que no sea la respuesta del agente (el eco
+      // del prompt del usuario, por ejemplo) no aporta nada al visor.
+      if (su.step_type && su.step_type !== 'agent_response') return null;
+
+      const delta = su.text_delta || su.delta || su.text;
+      // Un `agent_response` puede cerrar en DONE sin texto: es el paso de
+      // "pensamiento", con usage y duración pero nada que leer.
+      if (!delta) return null;
+      return { tipo: 'prosa', stepIndex, texto: String(delta) };
+    }
+
+    case 'result': {
+      const r = ev.result || {};
+      const ok = r.status === 'SUCCESS' && !r.error;
+      const dur = typeof r.duration_seconds === 'number' ? ` ${r.duration_seconds.toFixed(1)}s` : '';
+      return {
+        tipo: ok ? 'fin-ok' : 'fin-error',
+        stepIndex: null,
+        texto: `terminado${dur}${r.error ? ` — ${String(r.error).slice(0, MAX_LARGO_DELTA)}` : ''}`
+      };
+    }
+
+    default:
+      return { tipo: 'raro', stepIndex: null, texto: `evento: ${ev.event || '(sin campo event)'}` };
+  }
+}
+
+const MARCA_POR_TIPO = {
+  inicio: '▶',
+  prosa: '·',
+  tool: '🔧',
+  'fin-ok': '✔',
+  'fin-error': '✘',
+  raro: '？'
+};
 
 /**
  * Traduce una línea NDJSON cruda (el esquema de agy_stream.js:
@@ -40,42 +158,23 @@ function formatearHora(d = new Date()) {
  * se abrió la página, contradiciendo su propio contenido.
  */
 function formatearLinea(cruda, opciones = {}) {
+  const e = interpretarEvento(cruda);
+  if (e === null) return null;
+
+  // La CLI es una terminal: una línea por evento, ya escrita, sin manera de
+  // volver atrás a unirla con la siguiente. Así que acá sí se aplasta el
+  // texto a una sola línea. El visor NO usa este camino — puede unir los
+  // fragmentos en el DOM y conserva los saltos.
+  if (e.tipo === 'prosa') {
+    const plano = e.texto.replace(/\s+/g, ' ').trim();
+    if (!plano) return null;
+    e.texto = plano.slice(0, MAX_LARGO_DELTA);
+  }
+
   // Prefijo con la hora solo si corresponde; sin él, nada de espacios sueltos
   // al principio de la línea.
   const p = opciones.conHora === false ? '' : `${formatearHora()} `;
-
-  let ev;
-  try {
-    ev = JSON.parse(cruda);
-  } catch {
-    return `${p}？ ${cruda.slice(0, MAX_LARGO_CRUDO)}`;
-  }
-
-  switch (ev.event) {
-    case 'init': {
-      const cid = ev.conversation_id || (ev.init && ev.init.conversation_id);
-      return `${p}▶ iniciado${cid ? ` (${String(cid).slice(0, 8)})` : ''}`;
-    }
-
-    case 'step_update': {
-      const su = ev.step_update || {};
-      if (su.step_type && su.step_type !== 'agent_response') return null;
-      const delta = su.text_delta || su.delta || su.text;
-      if (!delta || !String(delta).trim()) return null;
-      return `${p}· ${String(delta).replace(/\s+/g, ' ').trim().slice(0, MAX_LARGO_DELTA)}`;
-    }
-
-    case 'result': {
-      const r = ev.result || {};
-      const ok = r.status === 'SUCCESS' && !r.error;
-      const marca = ok ? '✔' : '✘';
-      const dur = typeof r.duration_seconds === 'number' ? ` ${r.duration_seconds.toFixed(1)}s` : '';
-      return `${p}${marca} terminado${dur}${r.error ? ` — ${String(r.error).slice(0, MAX_LARGO_DELTA)}` : ''}`;
-    }
-
-    default:
-      return `${p}？ evento: ${ev.event || '(sin campo event)'}`;
-  }
+  return `${p}${MARCA_POR_TIPO[e.tipo] || '？'} ${e.texto}`;
 }
 
 /**
@@ -164,4 +263,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { formatearLinea, crearSeguidor, seguir };
+module.exports = { formatearLinea, interpretarEvento, crearSeguidor, seguir };

@@ -38,7 +38,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { rutaEstado, rutaProgreso, marcarDetencion, DIR_WORKTREES } = require('./fanout-estado.js');
-const { formatearLinea, crearSeguidor } = require('./fanout-tail.js');
+const { interpretarEvento, crearSeguidor } = require('./fanout-tail.js');
 
 const PUERTO_POR_DEFECTO = 4517;
 const INTERVALO_SONDEO_MS = 500;
@@ -89,10 +89,18 @@ function crearVigilante(repoPath, slug) {
 
   return {
     /**
+     * Devuelve los eventos nuevos ya interpretados, pero SIN unir: cada
+     * `text_delta` sale tal cual llegó, con su `stepIndex`. Unir los
+     * fragmentos de un mismo paso es trabajo del navegador (ver `pintarEvento`
+     * en la página) — hacerlo acá significaría retener texto hasta que el paso
+     * cierre con `DONE`, y un subagente al que matan (FEAT-012) nunca emite
+     * ese `DONE`: lo retenido se perdería sin mostrarse nunca, y un paso largo
+     * dejaría la tarjeta congelada mientras tanto.
+     *
      * `conHora: false` para la reproducción del historial al conectar: los
-     * eventos de agy no traen timestamp, así que ponerle la hora actual a
-     * una línea vieja es inventar el dato (ver formatearLinea). Los eventos
-     * que llegan en vivo sí la llevan.
+     * eventos de agy no traen timestamp, así que ponerle la hora actual a una
+     * línea vieja es inventar el dato. Los eventos que llegan en vivo sí la
+     * llevan.
      */
     nuevosEventos(taskIds, { conHora = true } = {}) {
       const salida = [];
@@ -101,8 +109,15 @@ function crearVigilante(repoPath, slug) {
           seguidores.set(taskId, crearSeguidor(rutaProgreso(repoPath, slug, taskId)));
         }
         for (const cruda of seguidores.get(taskId).leerNuevas()) {
-          const texto = formatearLinea(cruda, { conHora });
-          if (texto !== null) salida.push({ taskId, texto });
+          const e = interpretarEvento(cruda);
+          if (e === null) continue;
+          salida.push({
+            taskId,
+            tipo: e.tipo,
+            stepIndex: e.stepIndex,
+            texto: e.texto,
+            hora: conHora ? new Date().toTimeString().slice(0, 8) : null
+          });
         }
       }
       return salida;
@@ -143,7 +158,17 @@ function paginaHtml(slug) {
   .stop:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
   .stop:disabled { opacity: .35; cursor: default; }
   .log { overflow-y: auto; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; flex: 1; }
-  .log div { padding: 1px 0; border-bottom: 1px solid #1c2029; }
+  .linea { padding: 1px 0; border-bottom: 1px solid #1c2029; }
+  .hora { color: #4d5566; }
+  .marca { color: #7d8596; }
+  /* La llamada a herramienta es lo que dice qué está HACIENDO el subagente:
+     tiene que saltar por encima de la prosa, no perderse dentro de ella. */
+  .linea.tool { background: #1a2030; border-left: 2px solid #58a6ff; padding-left: 6px; }
+  .linea.tool .marca, .linea.tool .txt { color: #9cc7ff; }
+  .linea.inicio .txt { color: #7d8596; }
+  .linea .fin-ok, .linea.fin-ok .txt { color: #3fb950; }
+  .linea.fin-error .txt { color: #f85149; }
+  .linea.raro .txt { color: #d29922; }
   #vacio { padding: 40px 16px; color: #7d8596; text-align: center; }
 </style>
 </head>
@@ -212,12 +237,57 @@ function pintarEstado(datos) {
     corriendo + ' en vuelo' + (datos.terminado ? ' · terminado' : '');
 }
 
+const MARCA = { inicio: '▶', prosa: '·', tool: '🔧', 'fin-ok': '✔', 'fin-error': '✘', raro: '？' };
+const MAX_LINEAS = 400;
+
+// Acá es donde se unen los fragmentos. agy parte la prosa en text_delta a
+// mitad de palabra ("...en e" / "l artefacto..."), así que un div por evento
+// rendía una frase partida en siete líneas rotas. Los deltas de un mismo
+// paso comparten stepIndex: si el último bloque de la tarjeta es del mismo
+// paso, el texto se APPENDEA ahí en vez de abrir uno nuevo, y la frase se
+// escribe sola como un párrafo.
+//
+// Se hace en el cliente y no en el servidor a propósito: así no hay que
+// retener nada esperando el DONE de un paso que quizás nunca llegue (a un
+// subagente lo pueden matar a mitad), y lo que ya llegó queda a la vista.
 function pintarEvento(ev) {
   const el = tarjeta(ev.taskId).querySelector('.log');
   const pegadoAbajo = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
-  const linea = document.createElement('div');
-  linea.textContent = ev.texto;
-  el.appendChild(linea);
+
+  const ultimo = el.lastElementChild;
+  const continua = ev.tipo === 'prosa' &&
+    ultimo &&
+    ultimo.dataset.tipo === 'prosa' &&
+    ultimo.dataset.step === String(ev.stepIndex);
+
+  if (continua) {
+    ultimo.querySelector('.txt').textContent += ev.texto;
+  } else {
+    const linea = document.createElement('div');
+    linea.className = 'linea ' + ev.tipo;
+    linea.dataset.tipo = ev.tipo;
+    linea.dataset.step = String(ev.stepIndex);
+    if (ev.hora) {
+      const h = document.createElement('span');
+      h.className = 'hora';
+      h.textContent = ev.hora + ' ';
+      linea.appendChild(h);
+    }
+    const m = document.createElement('span');
+    m.className = 'marca';
+    m.textContent = (MARCA[ev.tipo] || '？') + ' ';
+    linea.appendChild(m);
+    const t = document.createElement('span');
+    t.className = 'txt';
+    t.textContent = ev.texto;
+    linea.appendChild(t);
+    el.appendChild(linea);
+
+    // Tope simple: una corrida larga no debe dejar la pestaña con decenas de
+    // miles de nodos. Se tira el más viejo, no hay retención sofisticada.
+    while (el.childElementCount > MAX_LINEAS) el.firstElementChild.remove();
+  }
+
   if (pegadoAbajo) el.scrollTop = el.scrollHeight;
 }
 
