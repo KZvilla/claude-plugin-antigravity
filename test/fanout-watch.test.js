@@ -259,6 +259,26 @@ async function main() {
 
       const malo = await postear(puerto, '/api/detener', { nada: true });
       check('400 si falta taskId', malo.status === 400, String(malo.status));
+
+      // El taskId llega del navegador: no puede escaparse del directorio de
+      // worktrees por más raro que venga. `rutaControl` lo pasa por
+      // `idParaArchivo` (slugifica + sufijo hash), así que no hay separadores
+      // de ruta que sobrevivan — pero conviene probarlo, no asumirlo.
+      const dirWorktrees = path.join(repo, '.claude', 'worktrees');
+      const antes = new Set(fs.readdirSync(dirWorktrees));
+      const travesia = await postear(puerto, '/api/detener', { taskId: '../../../../evil' });
+      check('acepta el pedido sin reventar', travesia.status === 200, String(travesia.status));
+
+      const fueraDelDir = fs.existsSync(path.join(repo, 'evil')) ||
+        fs.existsSync(path.join(repo, '..', 'evil')) ||
+        fs.existsSync(path.join(repo, '.claude', 'evil'));
+      check('no escribió nada fuera de .claude/worktrees', !fueraDelDir);
+
+      const nuevos = fs.readdirSync(dirWorktrees).filter(n => !antes.has(n));
+      check('el archivo quedó dentro del dir, con nombre saneado', nuevos.length === 1, JSON.stringify(nuevos));
+      check('sin separadores de ruta en el nombre',
+        nuevos[0] && !nuevos[0].includes('/') && !nuevos[0].includes('\\') && !nuevos[0].includes('..'),
+        nuevos[0]);
     } finally {
       if (servidor) await new Promise(r => servidor.close(r));
       borrar(repo);
