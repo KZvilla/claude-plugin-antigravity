@@ -24,6 +24,10 @@ const { executeAgyStdin, executeAgyStreaming } = require('./agy-stream.js');
 const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
 const { lanzarFanout } = require('./fanout.js');
 const { crearEscritorDeEstado, crearLectorDeControl, rutaProgreso, limpiarProgreso } = require('./fanout-estado.js');
+const registroAgentes = require('./agents/registry.js');
+const estadoAgentes = require('./agents/estado.js');
+const memoriaAgentes = require('./agents/memoria.js');
+const aprendizajeAgentes = require('./agents/aprendizaje.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -1269,6 +1273,69 @@ const TOOLS = [
         caption: {
           type: 'string',
           description: 'Optional caption text to display with the voice note.'
+        }
+      }
+    }
+  },
+  {
+    name: 'cast_agent',
+    description: 'Cast a persistent, SKILL-bound agent: an agent with a fixed identity that remembers its own criteria across sessions. Unlike agy_run (generic and stateless) and agy_fanout (ephemeral parallel workers), a cast agent keeps the same conversation thread and the same accumulated judgment every time you call it. Meant for opinion work - code review, security audit, planning, reality checks - not for writing code. Read-only agents are enforced by a tool allowlist in their agent.md plus --mode plan, and the cast is aborted if Antigravity cannot resolve the agent name (passing an unknown --agent silently falls back to a full-write default agent). Use action:"register" once per agent to derive it from an installed SKILL, then action:"cast" to talk to it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['cast', 'register', 'unregister', 'list', 'skills', 'forget'],
+          description: 'What to do. "cast" (default) invokes the agent with a prompt. "register" derives an agent from an installed SKILL and materializes its agent.md. "unregister" removes it. "list" shows registered agents and whether Antigravity actually resolves each one. "skills" lists the SKILLs available to derive agents from. "forget" drops the stored conversation thread of an agent without touching its long-term memory, so the next cast starts a fresh thread with the same identity.'
+        },
+        agent: {
+          type: 'string',
+          description: 'Agent name (letters, digits, dash, underscore). Required for cast, register, unregister and forget.'
+        },
+        prompt: {
+          type: 'string',
+          description: 'What you are asking the agent. Required for action:"cast".'
+        },
+        skill: {
+          type: 'string',
+          description: 'SKILL to derive the identity from, e.g. "agency-code-reviewer". Required for action:"register". Use action:"skills" to see what is installed.'
+        },
+        read_only: {
+          type: 'boolean',
+          description: 'For action:"register". When true (default), the agent gets a tool allowlist without write_to_file, replace_file_content or run_command, and every cast also runs with --mode plan. Note this does not remove call_mcp_tool, which Antigravity injects unconditionally - a read-only agent still reaches every MCP server you have configured.'
+        },
+        project_id: {
+          type: 'string',
+          description: 'Optional project scope for the agent memory, so a reviewer rehydrates the criteria it built on this project rather than on every project at once.'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Working directory for the cast. Defaults to the current directory.'
+        },
+        fresh: {
+          type: 'boolean',
+          description: 'When true, ignores the stored conversation thread and starts a new one, keeping the same identity and long-term memory. Use it when the previous thread drifted or is no longer relevant. Defaults to false.'
+        },
+        memory: {
+          type: 'boolean',
+          description: 'When true (default), rehydrates the agent from mcp-memory before the cast and commits what it learned afterwards. If the memory service is unreachable the cast still runs, just without accumulated context. Set to false to skip memory entirely.'
+        },
+        budget_tokens: {
+          type: 'integer',
+          description: 'Token budget for the rehydrated context. Defaults to 2048. Higher values give the agent more history at the cost of prompt size.'
+        },
+        model: {
+          type: 'string',
+          description: 'Model override for this cast.'
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'Reasoning effort. Defaults to "high": these agents exist to exercise judgment.'
+        },
+        timeout_minutes: {
+          type: 'number',
+          description: 'Timeout in minutes. Defaults to 15.'
         }
       }
     }
@@ -2693,6 +2760,250 @@ async function handleToolCall(name, args) {
       }
 
       return { content: [{ type: 'text', text: texto }] };
+    }
+
+    case 'cast_agent': {
+      const accion = args.action || 'cast';
+      const homeDir = os.homedir();
+
+      const texto = t => ({ content: [{ type: 'text', text: t }] });
+      const error = t => ({ isError: true, content: [{ type: 'text', text: t }] });
+
+      if (accion === 'skills') {
+        const skills = registroAgentes.listarSkills(homeDir);
+        if (!skills.length) {
+          return error(`No hay SKILLs instalados en \`${registroAgentes.dirSkills(homeDir)}\`.`);
+        }
+        return texto(
+          `### SKILLs disponibles (${skills.length})\n\n`
+          + skills.map(n => `- \`${n}\``).join('\n')
+          + '\n\nRegistrá uno con `action: "register"`, `agent: "<nombre-corto>"`, `skill: "<skill>"`.'
+        );
+      }
+
+      if (accion === 'list') {
+        const agentes = await registroAgentes.listar(AGY_BIN, homeDir);
+        if (!agentes.length) {
+          return texto('No hay agentes persistidos registrados todavía. Usá `action: "register"`.');
+        }
+        let salida = `### Agentes persistidos (${agentes.length})\n\n`;
+        salida += '| Agente | SKILL | Acceso | Resuelve | Hilo | Casts |\n|---|---|---|---|---|---|\n';
+        for (const a of agentes) {
+          const est = estadoAgentes.estadoDe(a.nombre, homeDir) || {};
+          const hilo = est.conversation_id ? `\`${est.conversation_id.slice(0, 12)}…\`` : '—';
+          salida += `| \`${a.nombre}\` | \`${a.skill}\` | ${a.read_only ? 'read-only' : 'read/write'} `
+            + `| ${a.resuelve ? '✅' : '⚠️ no'} | ${hilo} | ${est.casts || 0} |\n`;
+        }
+        const rotos = agentes.filter(a => !a.resuelve);
+        if (rotos.length) {
+          salida += `\n⚠️ Antigravity no resuelve ${rotos.map(a => `\`${a.nombre}\``).join(', ')}. `
+            + 'Castearlos se aborta a propósito: `--agent` con un nombre inexistente cae en silencio al agente por defecto, con escritura completa. Volvé a registrarlos.';
+        }
+        return texto(salida);
+      }
+
+      if (accion === 'register') {
+        if (!args.agent || !args.skill) {
+          return error('`register` necesita `agent` (nombre corto) y `skill` (SKILL de origen).');
+        }
+        let entrada;
+        try {
+          entrada = registroAgentes.instalarAgente(args.agent, {
+            skill: args.skill,
+            readOnly: args.read_only !== false,
+            projectId: args.project_id
+          }, homeDir);
+        } catch (err) {
+          return error(`No se pudo registrar el agente: ${err.message}`);
+        }
+
+        // Verificar contra agy es parte del registro, no un extra: un agente que
+        // no resuelve es peor que uno que no existe, porque el cast igual corre.
+        const verificacion = await registroAgentes.verificarResuelve(args.agent, AGY_BIN);
+        const servers = memoriaAgentes.serversMcpDelUsuario(homeDir);
+
+        let salida = `### Agente \`${args.agent}\` registrado\n\n`;
+        salida += `- SKILL de origen: \`${entrada.skill}\`\n`;
+        salida += `- Acceso: ${entrada.read_only ? '`read-only`' : '`read/write`'}\n`;
+        salida += `- Tools nativas: ${entrada.tools.map(t => `\`${t}\``).join(', ')}\n`;
+        salida += `- Definición: \`${entrada.agent_md}\`\n`;
+        salida += `- Antigravity lo resuelve: ${verificacion.ok ? '✅ sí' : '⚠️ no'}\n`;
+        if (!verificacion.ok) salida += `\n⚠️ ${verificacion.motivo}\n`;
+        if (entrada.read_only && servers.length) {
+          salida += `\n> **Límite de \`read-only\`:** Antigravity inyecta \`call_mcp_tool\` sin importar el allowlist, `
+            + `así que este agente alcanza igual tus servidores MCP: ${servers.map(x => `\`${x}\``).join(', ')}. `
+            + 'El allowlist cierra las tools nativas de escritura, no la puerta MCP.\n';
+        }
+        return texto(salida);
+      }
+
+      if (accion === 'unregister') {
+        if (!args.agent) return error('`unregister` necesita `agent`.');
+        let existia;
+        try {
+          existia = registroAgentes.desinstalarAgente(args.agent, homeDir);
+        } catch (err) {
+          return error(`No se pudo desregistrar: ${err.message}`);
+        }
+        return texto(existia
+          ? `Agente \`${args.agent}\` desregistrado. Su memoria en mcp-memory queda intacta.`
+          : `No había ningún agente registrado como \`${args.agent}\`.`);
+      }
+
+      if (accion === 'forget') {
+        if (!args.agent) return error('`forget` necesita `agent`.');
+        const habia = estadoAgentes.olvidarHilo(args.agent, homeDir);
+        return texto(habia
+          ? `Hilo de \`${args.agent}\` olvidado. El próximo cast arranca conversación nueva, con la misma identidad y la misma memoria de largo plazo.`
+          : `\`${args.agent}\` no tenía ningún hilo guardado.`);
+      }
+
+      // --- cast ---
+      if (!args.agent) return error('`cast` necesita `agent`. Usá `action: "list"` para ver los registrados.');
+      if (!args.prompt) return error('`cast` necesita `prompt`.');
+
+      const registro = registroAgentes.leerRegistro(homeDir);
+      const entrada = registro.agents[args.agent];
+      if (!entrada) {
+        const conocidos = Object.keys(registro.agents);
+        return error(
+          `\`${args.agent}\` no está registrado como agente persistido.`
+          + (conocidos.length ? ` Registrados: ${conocidos.map(x => `\`${x}\``).join(', ')}.` : '')
+          + ' Registralo con `action: "register"`.'
+        );
+      }
+
+      // El guardarrail que justifica todo el módulo: `agy --agent no-existe`
+      // corre igual, con el agente por defecto y escritura completa. Verificado
+      // el 2026-09-10. Un cast sin verificar no es un cast degradado, es otro
+      // agente.
+      const verificacion = await registroAgentes.verificarResuelve(args.agent, AGY_BIN);
+      if (!verificacion.ok) {
+        return error(`No se casteó \`${args.agent}\`: ${verificacion.motivo}`);
+      }
+
+      const usarMemoria = args.memory !== false;
+      let contexto = null;
+      let motivoSinMemoria = null;
+      if (usarMemoria) {
+        const rehidratacion = await memoriaAgentes.rehidratar(args.agent, {
+          projectId: args.project_id || entrada.project_id || undefined,
+          taskSummary: args.prompt,
+          budgetTokens: args.budget_tokens
+        });
+        if (rehidratacion.ok) contexto = rehidratacion.texto;
+        else motivoSinMemoria = rehidratacion.motivo;
+      }
+
+      const hiloGuardado = args.fresh ? null : estadoAgentes.hiloDe(args.agent, homeDir);
+
+      const cliArgs = ['--output-format', 'json', '--agent', args.agent];
+      cliArgs.push('--dangerously-skip-permissions');
+      // Segunda capa para read-only: `--mode plan` sí es un flag real del CLI.
+      // El allowlist de tools y esto se cubren mutuamente; ninguno alcanza solo.
+      if (entrada.read_only) cliArgs.push('--mode', 'plan');
+
+      const effortCast = args.effort || config.defaultEffort || 'high';
+      cliArgs.push('--effort', effortCast);
+      const modelCast = args.model || config.defaultModel;
+      if (modelCast) cliArgs.push('--model', modelCast);
+      if (hiloGuardado) cliArgs.push('--conversation', hiloGuardado);
+
+      // El contexto rehidratado va antes del pedido y marcado como tal: sin la
+      // marca el agente lo lee como parte de la consigna de hoy.
+      let promptCast = contexto
+        ? `<contexto-recuperado>\nLo que ya sabés de trabajos anteriores:\n\n${contexto}\n</contexto-recuperado>\n\n${args.prompt}`
+        : args.prompt;
+
+      // Sin esto el agente no acumula nada: `commit_session_legacy` con los
+      // arrays vacíos solo escribe una observación `session_legacy`, que es
+      // justo el tipo que `get_bootstrap_profile` nunca lee. La cola
+      // estructurada es lo que llena `decisions`, el único canal que rehidrata
+      // con el `agent_id` puesto. Si la memoria está apagada no se pide: sería
+      // pagar tokens por algo que no se va a guardar.
+      if (usarMemoria) promptCast += `\n${aprendizajeAgentes.instruccionDeCierre()}`;
+
+      cliArgs.push('-p', promptCast);
+
+      const timeoutCast = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
+      const resultadoCast = await executeAgy(cliArgs, {
+        cwd: args.cwd,
+        timeoutMinutes: timeoutCast
+      });
+
+      const datosCast = resultadoCast.data || {};
+      const hiloNuevo = datosCast.conversation_id || hiloGuardado || '';
+      const duracionCast = datosCast.duration_seconds || 0;
+
+      if (datosCast.usage) {
+        recordUsage('cast', modelCast, effortCast, hiloNuevo, duracionCast,
+          datosCast.usage, !resultadoCast.success, resultadoCast.error || '');
+      }
+
+      // El hilo se guarda incluso si el turno falló: si agy llegó a abrir
+      // conversación, perderla obliga a re-explicarle todo al agente.
+      if (hiloNuevo) {
+        estadoAgentes.registrarCast(args.agent, { conversationId: hiloNuevo, cwd: args.cwd }, homeDir);
+      }
+
+      if (!resultadoCast.success) {
+        let err = `Falló el cast de \`${args.agent}\`:\n${resultadoCast.error}`;
+        if (hiloNuevo) err += `\n\nEl hilo \`${hiloNuevo}\` quedó guardado: el próximo cast lo retoma.`;
+        return error(err);
+      }
+
+      const crudoCast = datosCast.response || resultadoCast.rawOutput || '(sin respuesta)';
+
+      // El bloque de memoria es plomería: se saca de lo que ve el usuario.
+      const aprendido = usarMemoria
+        ? aprendizajeAgentes.extraerAprendizaje(crudoCast)
+        : { respuesta: crudoCast, decisions: [], userCorrections: [] };
+      const respuestaCast = aprendido.respuesta;
+      const aprendidas = aprendido.decisions.length + aprendido.userCorrections.length;
+
+      if (usarMemoria) {
+        // Best-effort a propósito: que la memoria no acepte el cierre no
+        // invalida el trabajo que el agente ya hizo.
+        //
+        // `errors` va vacío deliberadamente. El servicio los convierte en
+        // `mistake_note_add`, que no recibe `agent_id`, y el bootstrap
+        // comparte las notas sin dueño con TODOS los agentes: mandar los
+        // errores de este agente por ahí se los mete en el perfil a los demás.
+        // El `outcome` estaba fijo en 'success' aunque el turno no hubiera
+        // producido nada. Un turno sin criterio capturado no es un fracaso,
+        // pero tampoco un éxito del que valga la pena aprender: marcarlo
+        // 'partial' evita ensuciar el historial del agente con sesiones vacías.
+        await memoriaAgentes.cerrarSesion(args.agent, {
+          sessionId: hiloNuevo || undefined,
+          taskSummary: args.prompt,
+          outcome: aprendidas > 0 ? 'success' : 'partial',
+          decisions: aprendido.decisions,
+          userCorrections: aprendido.userCorrections
+        });
+      }
+
+      let salida = `${respuestaCast.trim()}\n\n---\n`;
+      salida += `**Cast de \`${args.agent}\`** (SKILL: \`${entrada.skill}\`)\n`;
+      salida += `- Acceso: \`${entrada.read_only ? 'read-only' : 'read/write'}\``
+        + `${entrada.read_only ? ' (allowlist de tools + `--mode plan`)' : ''}\n`;
+      salida += `- Contexto recuperado: ${contexto ? '✅ sí' : `— no (${motivoSinMemoria || 'memoria desactivada'})`}\n`;
+      // Que esto se vea importa: si el agente deja de emitir el bloque, el
+      // síntoma es silencioso (sigue respondiendo bien, pero nunca más
+      // aprende). Acá se nota en el acto.
+      if (usarMemoria) {
+        salida += `- Criterio guardado: ${aprendidas
+          ? `✅ ${aprendidas} entrada(s)`
+          : '— ninguna (el agente no emitió bloque de memoria en este turno)'}\n`;
+      }
+      if (hiloNuevo) {
+        salida += `- Hilo: \`${hiloNuevo}\`${hiloGuardado ? ' (continuado)' : ' (nuevo)'}\n`;
+      }
+      salida += `- Duración: ${duracionCast ? `${duracionCast.toFixed(1)}s` : 'desconocida'} (límite: ${timeoutCast}m)\n`;
+      if (datosCast.usage) {
+        salida += `- Tokens: entrada ${datosCast.usage.input_tokens}, salida ${datosCast.usage.output_tokens}\n`;
+      }
+
+      return texto(salida);
     }
 
     case 'agy_run': {

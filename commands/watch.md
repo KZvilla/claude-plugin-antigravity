@@ -27,11 +27,21 @@ Instrucciones:
    reciente de `.claude/worktrees/`; el puerto por defecto es 4517 (si está
    ocupado, avisa y sugiere `--port`).
 
-3. Pasale al usuario la URL que imprime (`http://127.0.0.1:<puerto>`).
+3. Pasale al usuario **la URL completa que imprime**, con el `?t=<token>` incluido
+   (`http://127.0.0.1:<puerto>/?t=...`). Sin ese token el visor responde 403: es
+   por sesión, cambia en cada arranque y no se persiste. Recortarla a
+   `http://127.0.0.1:<puerto>` no funciona.
 
-4. Si dice que no hay ningún lote, es porque todavía no corrió un `agy_fanout` en
-   ese repo: el visor lee lo que deja el fan-out (`.fanout-status-*.json` y
-   `.agy-progress-*.jsonl` en `.claude/worktrees/`), no inventa nada.
+4. Si no hay ningún lote, el visor **igual arranca** y abre directamente la vista
+   de agentes persistidos (`/agents`). Para la vista de fan-out sí hace falta
+   haber corrido un `agy_fanout` en ese repo: el visor lee lo que el fan-out deja
+   (`.fanout-status-*.json` y `.agy-progress-*.jsonl` en `.claude/worktrees/`),
+   no inventa nada.
+
+5. La pestaña `/agents` lista los agentes persistidos y, al hacer clic en uno,
+   muestra el criterio que fue acumulando en `mcp-memory` con la cantidad de
+   veces que cada memoria se usó de verdad. No tiene decision gates ni estado
+   "corriendo": ver el README.
 
 Notas:
 
@@ -40,6 +50,9 @@ Notas:
   trabajo a medio commitear se preserva: lo clasifica como "sucio" la limpieza
   de siempre.
 - Escucha **solo en loopback** a propósito: los logs traen prompts y código
-  generado. No lo expongas a la red.
+  generado. No lo expongas a la red. Pero loopback no alcanza — cualquier página
+  abierta en otra pestaña puede postearle a `127.0.0.1`, así que desde `SEC-011`
+  el visor además exige un token por sesión, valida `Origin`/`Sec-Fetch-Site` en
+  las mutaciones, rechaza el preflight CORS y exige `Host` de loopback.
 - Sirve también para mirar un lote ya terminado: el estado y los logs quedan en
   disco hasta la próxima corrida con el mismo slug.

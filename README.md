@@ -22,6 +22,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Permissions (ALLOW / DENY)](#-granular-permissions-system-allow--deny)
 - [Concurrent Subagent Fan-Out (`/lagrange:fanout`)](#-concurrent-subagent-fan-out-lagrangefanout)
 - [Watching a Fan-Out Live (`/lagrange:watch`)](#-watching-a-fan-out-live-lagrangewatch)
+- [Persistent SKILL-Bound Agents (`cast_agent`)](#-persistent-skill-bound-agents-cast_agent)
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
 - [Telemetry (`/lagrange:usage`)](#-telemetry--usage-tracking-lagrangeusage)
 - [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-lagrangesummary)
@@ -132,7 +133,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 
 ## 🔧 MCP Tools Reference
 
-Eighteen tools exposed via the MCP server — fourteen `agy_*` tools plus four `telegram_*` bridge tools:
+Nineteen tools exposed via the MCP server — fourteen `agy_*` tools, four `telegram_*` bridge tools, and `cast_agent`:
 
 | Tool | Mode | Default Timeout | Description |
 |------|------|-----------------|-------------|
@@ -153,6 +154,7 @@ Eighteen tools exposed via the MCP server — fourteen `agy_*` tools plus four `
 | `telegram_notify` | outbound | — | Push a notification (with optional file attachment) to your phone — see [Telegram Bridge Setup](#-telegram-bridge-setup-manual--never-automated) |
 | `telegram_ask` | Human-in-the-Loop | 5m | Ask a question with tappable choice buttons and block until you answer on your phone |
 | `telegram_send_voice` | outbound audio | — | Send an audio file (or the latest Voicebox generation) as a native voice note |
+| `cast_agent` | read-only by default | 15m | Cast a persistent, SKILL-bound agent that keeps its identity, thread and accumulated criteria across sessions — see [Persistent SKILL-Bound Agents](#-persistent-skill-bound-agents-cast_agent) |
 | `telegram_bridge_status` | read-only | — | Diagnose the bridge: daemon state, which copy of the code each half runs, where credentials and shared state resolve — `/lagrange:bridge` |
 
 ### `agy_run` — Full Parameters
@@ -314,6 +316,33 @@ Each subagent gets a card showing:
 
 The header reports the batch total, and distinguishes a finished batch (`terminado en 4m00s`) from one that has simply gone quiet (`sin novedad hace 12m`) — useful because a crashed or cancelled fan-out otherwise looks identical to a running one forever.
 
+### The persistent-agents tab (`/agents`)
+
+The same viewer also lists your persistent agents — and, more usefully, **what each one has actually learned**. Click a row to expand its accumulated criteria: every decision and correction it committed to `mcp-memory`, with the date and how many times that memory has actually been used to rehydrate it. That last number is what separates criteria that earn their place in the token budget from criteria that just sit there.
+
+The viewer no longer needs a fan-out batch to start: in a repo where you never ran `agy_fanout`, it opens straight into `/agents`.
+
+What this view deliberately does **not** have: decision gates (there is no escalation protocol — that item was dropped after an adversarial audit) and a live "running" state (`cast_agent` runs synchronously inside the MCP server and leaves no on-disk trace while it does, so no other process can observe it). The states it shows are only the ones that can actually be read.
+
+### Access control (`SEC-011`)
+
+Listening on loopback never protected you from your own browser: any page open in another tab can POST to `127.0.0.1` with a simple request that does not even trigger a CORS preflight. Before this, that was enough for an arbitrary site to stop one of your subagents — and the persistent-agent dashboard (`FEAT-023`) wants to put *approval gates* on the same surface.
+
+So the viewer now prints a URL carrying a **per-session token**:
+
+```
+http://127.0.0.1:4517/?t=7f3c…
+```
+
+Open the full URL — trimming the `?t=` gives you a 403. The token is random per launch, lives only in the process, and four layers back it up, none sufficient alone:
+
+| Layer | Stops |
+|---|---|
+| Token on `GET /` and `GET /api/eventos` | Any other local process or tab reading your prompts and generated code |
+| Token required in the `x-lagrange-token` **header** for mutations | A hostile `<form>`, which cannot set a custom header |
+| CORS preflight refused (`OPTIONS` → 405) | A `fetch` from another origin trying to send that header |
+| `Origin` / `Sec-Fetch-Site` validated, `Host` must be loopback | Cross-site POSTs and DNS rebinding |
+
 ### Stopping a subagent
 
 The stop button writes a small sentinel file that the orchestrator picks up on its next poll (a couple of seconds), then kills that subagent's process tree. The same thing is available from any terminal:
@@ -347,6 +376,58 @@ Set in `.claude/antigravity.json` (or via `agy_set_config`):
 | `fanout_statusline` | `true` | Write the live progress file the statusline script renders |
 | `fanout_progress_log` | `true` | Write the per-subagent NDJSON log that `/lagrange:watch` renders |
 | `fanout_control` | `true` | Watch for stop sentinels and kill a subagent early when one appears |
+
+---
+
+## 🎭 Persistent SKILL-Bound Agents (`cast_agent`)
+
+`agy_run` is generic and stateless. `agy_fanout` spawns ephemeral workers that write code and disappear. Neither fits the third kind of work: **judgment** — code review, security audit, planning, reality checks — where you want the *same* reviewer every time, one that remembers what it already told you.
+
+A **cast agent** has a fixed identity derived from an installed SKILL, keeps its own conversation thread across sessions, and rehydrates its accumulated criteria from `mcp-memory` before each cast.
+
+```
+cast_agent  action:"skills"                                  → what SKILLs you can derive from
+cast_agent  action:"register"  agent:"reviewer"  skill:"agency-code-reviewer"
+cast_agent  action:"cast"      agent:"reviewer"  prompt:"Review the diff on this branch"
+cast_agent  action:"list"                                    → who exists, who resolves, thread state
+```
+
+### How the identity is enforced
+
+Registering an agent writes `~/.gemini/config/agents/<name>/agent.md`: the SKILL body becomes the agent's system prompt, and a `tools:` allowlist in the frontmatter cuts down its native tool inventory. For a read-only agent, `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `notebook_edit` and `run_command` are simply **not in its context** — this is an absence, not an instruction.
+
+Two more layers back that up:
+
+- **`--mode plan`** is added to every cast of a read-only agent. Unlike `allow`/`deny` (which travel as prompt text — see the permissions section), this is a real CLI flag.
+- **Resolution is verified before every cast.** `agy --agent <unknown-name>` does *not* fail: it silently falls back to the default agent with full write tools. So `cast_agent` checks the name against `agy agents` first and **aborts the cast** if it does not resolve, or if that check itself cannot be run.
+
+> ### ⚠️ What `read_only` does *not* cover
+>
+> Antigravity injects `call_mcp_tool`, `list_resources` and `read_resource` into every agent regardless of the `tools:` allowlist. A read-only cast agent therefore still reaches **every MCP server you have configured** — including ones that drive a browser or write data. The allowlist closes the native write tools; it is not a boundary against MCP. `cast_agent action:"register"` prints exactly which servers stay reachable. Treat `read_only` as "will not edit your files directly", not as a sandbox.
+
+### Memory and threads
+
+- **Thread:** the `conversation_id` of each agent is persisted in `~/.claude/antigravity-agents-state.json` and replayed with `--conversation` on the next cast. Long threads grow the input token count on every turn — use `action:"forget"` to start a fresh thread without losing the agent's long-term memory, or `fresh: true` for a one-off.
+- **What it writes back:** at the end of each cast the agent is asked for a short `<memoria>` block — what it concluded and why — which is committed as `decisions` (and `user_corrections`) through `commit_session_legacy`. That is the only channel the rehydration actually rereads: a commit with empty arrays lands as a `session_legacy` observation that `get_bootstrap_profile` never looks at. Errors are deliberately *not* sent: the service turns them into mistake notes that carry no `agent_id`, so they would leak into every other agent's profile. The cast reports how many entries it captured — if an agent stops emitting the block it stops learning, and that would otherwise be silent.
+- **Long-term memory:** rehydration uses `get_bootstrap_profile` from `mcp-memory`, which enforces a token budget server-side (`budget_tokens`, default 2048). Isolation between agents is by native `agent_id`, not by `store` — and it is a filter, not a partition: the service shares any *mistake note* that carries no `agent_id` with every agent, while preferences and decisions are filtered strictly. Requires `MCP_BOOTSTRAP_ENABLED=true` on the memory service; without it the profile comes back as an empty shell and `cast_agent` correctly reports no context recovered. After each cast, `commit_session_legacy` records what the agent learned.
+- **Degradation is silent and deliberate:** if the memory service is unreachable, disabled, or has nothing useful to say, the cast still runs — it just reports `Contexto recuperado: — no (<reason>)` instead of injecting an empty profile into the prompt.
+
+### `cast_agent` — Parameter Reference
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `action` | `string` | `"cast"` | `cast`, `register`, `unregister`, `list`, `skills`, `forget` |
+| `agent` | `string` | — | Agent name. Required for `cast`, `register`, `unregister`, `forget` |
+| `prompt` | `string` | — | Required for `cast` |
+| `skill` | `string` | — | SKILL to derive the identity from. Required for `register` |
+| `read_only` | `boolean` | `true` | On `register`: tool allowlist without write tools, plus `--mode plan` on every cast |
+| `project_id` | `string` | — | Scopes the agent's memory to one project |
+| `fresh` | `boolean` | `false` | Ignore the stored thread and start a new one, same identity and memory |
+| `memory` | `boolean` | `true` | Rehydrate before and commit after. `false` skips `mcp-memory` entirely |
+| `budget_tokens` | `integer` | `2048` | Token budget for the rehydrated context |
+| `model` / `effort` / `timeout_minutes` / `cwd` | | `high`, `15` | As in `agy_run` |
+
+Design rationale, verification evidence and the remaining backlog live in `docs/future-implementations/agentes-persistidos.md`.
 
 ---
 
