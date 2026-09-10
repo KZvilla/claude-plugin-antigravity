@@ -691,15 +691,15 @@ export function createBot({
 Puente móvil autónomo conectado a tu entorno local.
 
 *Comandos disponibles:*
-• `/plan <instrucción>` — Genera un plan de acción de solo lectura con botón para aprobarlo.
-• `/run <instrucción>` — Abre una sesión nueva y ejecuta, permitiendo edición de código y tests.
-• `/resume <instrucción>` — Continúa la sesión de trabajo actual.
-• `/claude` — Inicia o gestiona sesiones de Claude Code (\`/claude stop\`, \`/claude clean\`, \`/claude status\`).
+• \`/plan <instrucción>\` — Genera un plan de acción de solo lectura con botón para aprobarlo.
+• \`/run <instrucción>\` — Abre una sesión nueva y ejecuta, permitiendo edición de código y tests.
+• \`/resume <instrucción>\` — Continúa la sesión de trabajo actual.
+• \`/claude\` — Inicia o gestiona sesiones de Claude Code (\`/claude stop\`, \`/claude clean\`, \`/claude status\`).
 • \`/cast <agente> <pedido>\` — Consulta a un agente persistido de solo lectura; eliges el proyecto con un botón.
-• `/status` — Consulta estado del binario, versión, sesión activa y política de permisos.
-• `/queue` — Muestra la tarea en curso y las encoladas.
-• `/cancel` — Aborta la tarea en curso y vacía la cola.
-• `/reset` — Reinicia la conversación y olvida el contexto actual.
+• \`/status\` — Consulta estado del binario, versión, sesión activa y política de permisos.
+• \`/queue\` — Muestra la tarea en curso y las encoladas.
+• \`/cancel\` — Aborta la tarea en curso y vacía la cola.
+• \`/reset\` — Reinicia la conversación y olvida el contexto actual.
 
 *Sesión activa:* ${convId ? `\`${convId}\`` : '_Ninguna (el próximo mensaje abrirá una nueva)_'}
 

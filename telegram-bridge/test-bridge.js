@@ -2066,6 +2066,31 @@ console.log('✔ Test 49 [FEAT-004 / BE-011]: Detección y purga segura de workt
 }
 console.log('✔ Test 50 [FEAT-022]: /cast solo castea agentes read-only y nada retoma su hilo sin --agent');
 
+// Test 51: /help responde. Las viñetas llevaban backticks sin escapar dentro
+// del template literal: el archivo parseaba (`...` / plan < instrucción > `...`
+// es una expresión válida) pero cada /help tiraba ReferenceError y moría en
+// silencio. Roto desde 42d4b08 sin que ningún test lo notara.
+{
+  const { bot, llamadas } = botDePrueba();
+  resetRuntimeState();
+  const text = '/help';
+  await bot.handleUpdate({
+    update_id: 500,
+    message: {
+      message_id: 1500,
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: Number(USUARIO_OK), type: 'private' },
+      from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+      text,
+      entities: [{ type: 'bot_command', offset: 0, length: text.length }]
+    }
+  });
+  const ayuda = llamadas.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text).join('\n');
+  assert(ayuda.includes('/plan') && ayuda.includes('/cast'), '/help responde y lista los comandos, /cast incluido');
+  resetRuntimeState();
+}
+console.log('✔ Test 51: /help responde con la lista de comandos');
+
 // Limpieza: solo el directorio temporal de test
 try {
   fs.rmSync(path.dirname(TEST_STATE_FILE), { recursive: true, force: true });
