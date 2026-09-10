@@ -32,9 +32,16 @@ Instrucciones:
    por sesión, cambia en cada arranque y no se persiste. Recortarla a
    `http://127.0.0.1:<puerto>` no funciona.
 
-4. Si dice que no hay ningún lote, es porque todavía no corrió un `agy_fanout` en
-   ese repo: el visor lee lo que deja el fan-out (`.fanout-status-*.json` y
-   `.agy-progress-*.jsonl` en `.claude/worktrees/`), no inventa nada.
+4. Si no hay ningún lote, el visor **igual arranca** y abre directamente la vista
+   de agentes persistidos (`/agents`). Para la vista de fan-out sí hace falta
+   haber corrido un `agy_fanout` en ese repo: el visor lee lo que el fan-out deja
+   (`.fanout-status-*.json` y `.agy-progress-*.jsonl` en `.claude/worktrees/`),
+   no inventa nada.
+
+5. La pestaña `/agents` lista los agentes persistidos y, al hacer clic en uno,
+   muestra el criterio que fue acumulando en `mcp-memory` con la cantidad de
+   veces que cada memoria se usó de verdad. No tiene decision gates ni estado
+   "corriendo": ver el README.
 
 Notas:
 
