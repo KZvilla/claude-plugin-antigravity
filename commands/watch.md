@@ -27,7 +27,10 @@ Instrucciones:
    reciente de `.claude/worktrees/`; el puerto por defecto es 4517 (si está
    ocupado, avisa y sugiere `--port`).
 
-3. Pasale al usuario la URL que imprime (`http://127.0.0.1:<puerto>`).
+3. Pasale al usuario **la URL completa que imprime**, con el `?t=<token>` incluido
+   (`http://127.0.0.1:<puerto>/?t=...`). Sin ese token el visor responde 403: es
+   por sesión, cambia en cada arranque y no se persiste. Recortarla a
+   `http://127.0.0.1:<puerto>` no funciona.
 
 4. Si dice que no hay ningún lote, es porque todavía no corrió un `agy_fanout` en
    ese repo: el visor lee lo que deja el fan-out (`.fanout-status-*.json` y
@@ -40,6 +43,9 @@ Notas:
   trabajo a medio commitear se preserva: lo clasifica como "sucio" la limpieza
   de siempre.
 - Escucha **solo en loopback** a propósito: los logs traen prompts y código
-  generado. No lo expongas a la red.
+  generado. No lo expongas a la red. Pero loopback no alcanza — cualquier página
+  abierta en otra pestaña puede postearle a `127.0.0.1`, así que desde `SEC-011`
+  el visor además exige un token por sesión, valida `Origin`/`Sec-Fetch-Site` en
+  las mutaciones, rechaza el preflight CORS y exige `Host` de loopback.
 - Sirve también para mirar un lote ya terminado: el estado y los logs quedan en
   disco hasta la próxima corrida con el mismo slug.

@@ -26,9 +26,9 @@ function escribirEvento(repo, slug, taskId, evento) {
 }
 
 /** GET simple contra el servidor de pruebas. */
-function pedir(puerto, ruta) {
+function pedir(puerto, ruta, token) {
   return new Promise((resolve, reject) => {
-    http.get({ host: '127.0.0.1', port: puerto, path: ruta }, (res) => {
+    http.get({ host: '127.0.0.1', port: puerto, path: conToken(ruta, token) }, (res) => {
       let cuerpo = '';
       res.on('data', c => { cuerpo += c; });
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, cuerpo }));
@@ -36,12 +36,14 @@ function pedir(puerto, ruta) {
   });
 }
 
-function postear(puerto, ruta, datos) {
+function postear(puerto, ruta, datos, { token, cabeceras = {} } = {}) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(datos);
+    const base = { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) };
+    if (token) base['x-lagrange-token'] = token;
     const req = http.request({
       host: '127.0.0.1', port: puerto, path: ruta, method: 'POST',
-      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }
+      headers: { ...base, ...cabeceras }
     }, (res) => {
       let cuerpo = '';
       res.on('data', c => { cuerpo += c; });
@@ -53,10 +55,10 @@ function postear(puerto, ruta, datos) {
 }
 
 /** Abre el stream SSE y junta los eventos que llegan durante `ms`. */
-function escucharSse(puerto, ms) {
+function escucharSse(puerto, ms, token) {
   return new Promise((resolve, reject) => {
     const recibidos = [];
-    const req = http.get({ host: '127.0.0.1', port: puerto, path: '/api/eventos' }, (res) => {
+    const req = http.get({ host: '127.0.0.1', port: puerto, path: conToken('/api/eventos', token) }, (res) => {
       let buffer = '';
       res.on('data', (c) => {
         buffer += c.toString();
@@ -78,10 +80,45 @@ function escucharSse(puerto, ms) {
   });
 }
 
+/** SEC-011: sin token no se sirve nada, asi que los helpers lo llevan siempre. */
+function conToken(ruta, token) {
+  if (!token) return ruta;
+  return ruta + (ruta.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(token);
+}
+
+
+/** GET crudo, con control total de las cabeceras: hace falta para falsear Host. */
+function pedirCrudo(puerto, ruta, cabeceras = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port: puerto, path: ruta, method: 'GET', headers: cabeceras
+    }, (res) => {
+      let cuerpo = '';
+      res.on('data', c => { cuerpo += c; });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, cuerpo }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function opciones(puerto, ruta) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: puerto, path: ruta, method: 'OPTIONS' },
+      (res) => { res.resume(); res.on('end', () => resolve({ status: res.statusCode })); });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 function levantar(repo, slug) {
   return new Promise((resolve) => {
     const servidor = crearServidor(repo, slug, { intervaloMs: 40 });
-    servidor.listen(0, '127.0.0.1', () => resolve({ servidor, puerto: servidor.address().port }));
+    servidor.listen(0, '127.0.0.1', () => resolve({
+      servidor,
+      puerto: servidor.address().port,
+      token: servidor.tokenAcceso
+    }));
   });
 }
 
@@ -177,18 +214,21 @@ async function main() {
 
       const lanzado = await levantar(repo, 'mi-lote');
       servidor = lanzado.servidor;
-      const { puerto } = lanzado;
+      const { puerto, token } = lanzado;
 
-      const pagina = await pedir(puerto, '/');
+      const pagina = await pedir(puerto, '/', token);
       check('GET / responde 200 html', pagina.status === 200 && /text\/html/.test(pagina.headers['content-type']));
       check('la página nombra el lote', pagina.cuerpo.includes('mi-lote'));
-      check('trae el cliente SSE', pagina.cuerpo.includes("new EventSource('/api/eventos')"));
+      check('trae el cliente SSE', pagina.cuerpo.includes("new EventSource('/api/eventos?t='"));
+      check('la pagina lleva el token de la sesion', pagina.cuerpo.includes(token));
+      check('no se cachea, porque lleva el token adentro',
+        pagina.headers['cache-control'] === 'no-store');
 
-      const noExiste = await pedir(puerto, '/no-existe');
+      const noExiste = await pedir(puerto, '/no-existe', token);
       check('404 en rutas desconocidas', noExiste.status === 404);
 
       // Escuchar y, mientras tanto, generar actividad nueva.
-      const escucha = escucharSse(puerto, 400);
+      const escucha = escucharSse(puerto, 400, token);
       await new Promise(r => setTimeout(r, 120));
       escritor.marcar('billing', { estado: 'corriendo' });
       escribirEvento(repo, 'mi-lote', 'billing', {
@@ -230,10 +270,10 @@ async function main() {
 
       const lanzado = await levantar(repo, 'lote-replay');
       servidor = lanzado.servidor;
-      const { puerto } = lanzado;
+      const { puerto, token } = lanzado;
 
-      const primera = await escucharSse(puerto, 250);
-      const segunda = await escucharSse(puerto, 250);
+      const primera = await escucharSse(puerto, 250, token);
+      const segunda = await escucharSse(puerto, 250, token);
 
       const historicasDe = (recibidos) => recibidos
         .filter(r => r.tipo === 'evento' && /linea historica/.test(r.datos.texto)).length;
@@ -256,7 +296,7 @@ async function main() {
       crearEscritorDeEstado(repo, 'lote-fav', [{ id: 'a' }]).iniciar({ ramaBase: 'x', concurrencia: 1 });
       const lanzado = await levantar(repo, 'lote-fav');
       servidor = lanzado.servidor;
-      const r = await pedir(lanzado.puerto, '/favicon.ico');
+      const r = await pedir(lanzado.puerto, '/favicon.ico', lanzado.token);
       check('204, no 404', r.status === 204, String(r.status));
     } finally {
       if (servidor) await new Promise(r => servidor.close(r));
@@ -304,7 +344,7 @@ async function main() {
 
       const lanzado = await levantar(repo, 'lote-fin');
       servidor = lanzado.servidor;
-      const recibidos = await escucharSse(lanzado.puerto, 250);
+      const recibidos = await escucharSse(lanzado.puerto, 250, lanzado.token);
       const estado = recibidos.find(r => r.tipo === 'estado');
 
       check('el lote terminado informa `terminado`', typeof estado.datos.terminado === 'string', JSON.stringify(estado.datos.terminado));
@@ -324,18 +364,18 @@ async function main() {
       crearEscritorDeEstado(repo, 'lote-stop', [{ id: 'solo' }]).iniciar({ ramaBase: 'x', concurrencia: 1 });
       const lanzado = await levantar(repo, 'lote-stop');
       servidor = lanzado.servidor;
-      const { puerto } = lanzado;
+      const { puerto, token } = lanzado;
 
       check('todavía no hay centinela', !fs.existsSync(rutaControl(repo, 'lote-stop', 'solo')));
 
-      const r = await postear(puerto, '/api/detener', { taskId: 'solo' });
+      const r = await postear(puerto, '/api/detener', { taskId: 'solo' }, { token });
       check('responde 200 ok', r.status === 200 && JSON.parse(r.cuerpo).ok === true, r.cuerpo);
       check('el centinela quedó escrito donde FEAT-012 lo busca', fs.existsSync(rutaControl(repo, 'lote-stop', 'solo')));
 
       const contenido = JSON.parse(fs.readFileSync(rutaControl(repo, 'lote-stop', 'solo'), 'utf8'));
       check('deja constancia de que vino del visor', /watch/.test(contenido.motivo || ''), contenido.motivo);
 
-      const malo = await postear(puerto, '/api/detener', { nada: true });
+      const malo = await postear(puerto, '/api/detener', { nada: true }, { token });
       check('400 si falta taskId', malo.status === 400, String(malo.status));
 
       // El taskId llega del navegador: no puede escaparse del directorio de
@@ -344,7 +384,7 @@ async function main() {
       // de ruta que sobrevivan — pero conviene probarlo, no asumirlo.
       const dirWorktrees = path.join(repo, '.claude', 'worktrees');
       const antes = new Set(fs.readdirSync(dirWorktrees));
-      const travesia = await postear(puerto, '/api/detener', { taskId: '../../../../evil' });
+      const travesia = await postear(puerto, '/api/detener', { taskId: '../../../../evil' }, { token });
       check('acepta el pedido sin reventar', travesia.status === 200, String(travesia.status));
 
       const fueraDelDir = fs.existsSync(path.join(repo, 'evil')) ||
@@ -363,7 +403,100 @@ async function main() {
     }
   });
 
+
+  // ------------------------------------------------------------------
+  // SEC-011. El visor escucha en loopback, pero eso nunca protegió del
+  // navegador del propio usuario: cualquier pestaña puede postear a
+  // 127.0.0.1. Lo que se prueba acá es que el ataque falla, no que el camino
+  // feliz anda (eso ya lo cubren las suites de arriba).
+  // ------------------------------------------------------------------
+  await group('SEC-011: el visor exige token y rechaza pedidos cruzados', async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-sec-'));
+    let servidor;
+    let otro;
+    try {
+      crearEscritorDeEstado(repo, 'lote-sec', [{ id: 'solo' }]).iniciar({ ramaBase: 'x', concurrencia: 1 });
+      const lanzado = await levantar(repo, 'lote-sec');
+      servidor = lanzado.servidor;
+      const { puerto, token } = lanzado;
+
+      check('el servidor expone un token de sesión',
+        typeof token === 'string' && token.length >= 32, String(token));
+
+      const otroLanzado = await levantar(repo, 'lote-sec');
+      otro = otroLanzado.servidor;
+      check('cada visor tiene su propio token', otroLanzado.token !== token);
+
+      // --- lectura ---
+      check('GET / sin token es 403', (await pedir(puerto, '/')).status === 403);
+      check('GET / con token equivocado es 403',
+        (await pedir(puerto, '/', 'a'.repeat(token.length))).status === 403);
+      check('GET / con el token de OTRO visor es 403',
+        (await pedir(puerto, '/', otroLanzado.token)).status === 403);
+      check('el 403 explica dónde está la URL buena',
+        /t=/.test((await pedir(puerto, '/')).cuerpo));
+
+      // El stream es lo que filtra prompts y código generado.
+      check('GET /api/eventos sin token es 403',
+        (await pedir(puerto, '/api/eventos')).status === 403);
+
+      // --- DNS rebinding ---
+      check('un Host que no es loopback es 403',
+        (await pedirCrudo(puerto, '/?t=' + token, { host: 'malicioso.example.com' })).status === 403);
+      check('Host loopback con puerto sí pasa',
+        (await pedirCrudo(puerto, '/?t=' + token, { host: '127.0.0.1:' + puerto })).status === 200);
+
+      // --- preflight ---
+      // No responderlo es justamente lo que impide que otra pestaña mande la
+      // cabecera x-lagrange-token.
+      const pre = await opciones(puerto, '/api/detener');
+      check('el preflight CORS no se responde', pre.status === 405, String(pre.status));
+
+      // --- mutación ---
+      const centinela = () => fs.existsSync(rutaControl(repo, 'lote-sec', 'solo'));
+      check('parte sin centinela', !centinela());
+
+      const sinToken = await postear(puerto, '/api/detener', { taskId: 'solo' });
+      check('POST sin token es 403', sinToken.status === 403, String(sinToken.status));
+      check('y no escribió el centinela', !centinela());
+
+      // El caso que motiva la cabecera: un <form> hostil puede poner el token
+      // en la query si alguna vez se filtró la URL, pero no puede mandar una
+      // cabecera propia sin preflight.
+      const soloQuery = await postear(puerto, '/api/detener?t=' + token, { taskId: 'solo' });
+      check('POST con el token solo en la query es 403', soloQuery.status === 403, String(soloQuery.status));
+      check('sigue sin centinela', !centinela());
+
+      const origenAjeno = await postear(puerto, '/api/detener', { taskId: 'solo' },
+        { token, cabeceras: { origin: 'https://malicioso.example.com' } });
+      check('POST con token válido pero Origin ajeno es 403', origenAjeno.status === 403, String(origenAjeno.status));
+
+      const cruzado = await postear(puerto, '/api/detener', { taskId: 'solo' },
+        { token, cabeceras: { 'sec-fetch-site': 'cross-site' } });
+      check('POST con Sec-Fetch-Site cross-site es 403', cruzado.status === 403, String(cruzado.status));
+
+      const desdeOtroVisor = await postear(puerto, '/api/detener', { taskId: 'solo' },
+        { token: otroLanzado.token });
+      check('POST con el token de otro visor es 403', desdeOtroVisor.status === 403);
+
+      check('ninguno de los rechazos escribió el centinela', !centinela());
+
+      // Y el camino legítimo del navegador sigue funcionando.
+      const legitimo = await postear(puerto, '/api/detener', { taskId: 'solo' }, {
+        token,
+        cabeceras: { origin: 'http://127.0.0.1:' + puerto, 'sec-fetch-site': 'same-origin' }
+      });
+      check('el POST del propio visor sí pasa', legitimo.status === 200, String(legitimo.status));
+      check('y ahora sí escribió el centinela', centinela());
+    } finally {
+      if (servidor) await new Promise(r => servidor.close(r));
+      if (otro) await new Promise(r => otro.close(r));
+      borrar(repo);
+    }
+  });
+
   process.exit(report() ? 0 : 1);
+
 }
 
 main().catch(err => {

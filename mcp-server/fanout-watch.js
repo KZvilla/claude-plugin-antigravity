@@ -27,15 +27,36 @@
  * específico del sistema operativo, y con sitio de sobra para mostrar N
  * subagentes sin pelear por el ancho de una columna de terminal.
  *
- * SEGURIDAD: los logs traen prompts y código generado, así que el servidor
- * escucha SOLO en 127.0.0.1 y no se ofrece forma de exponerlo a la red. No
- * hay autenticación más allá de eso: en localhost es razonable, pero es una
- * decisión deliberada, no un olvido.
+ * SEGURIDAD (SEC-011): los logs traen prompts y código generado, así que el
+ * servidor escucha SOLO en 127.0.0.1. Eso no alcanza: escuchar en loopback no
+ * protege del navegador del propio usuario. Cualquier página abierta en otra
+ * pestaña puede postear a 127.0.0.1 con una request simple que ni siquiera
+ * dispara preflight CORS, y hasta esta versión eso bastaba para detenerle un
+ * subagente a alguien desde un sitio cualquiera.
+ *
+ * Cuatro capas, y ninguna alcanza sola:
+ *
+ *   1. Token por sesión (24 bytes al azar) que viaja en la URL que se imprime
+ *      en la terminal. Sin él no se sirve ni la página ni el stream.
+ *   2. Las mutaciones exigen el token en la cabecera `x-lagrange-token`, no en
+ *      la query: una cabecera propia obliga al navegador a pedir preflight
+ *      antes de cruzar orígenes, y el preflight no se responde. Un `<form>`
+ *      hostil no puede mandarla.
+ *   3. `Origin` y `Sec-Fetch-Site` se validan en toda mutación.
+ *   4. El `Host` tiene que ser loopback, contra DNS rebinding — un dominio que
+ *      resuelve a 127.0.0.1 sería mismo-origen para el navegador.
+ *
+ * Esto importa más de lo que parece para el visor de hoy (lo peor era cortar
+ * un fan-out) porque el tablero de agentes persistidos (`FEAT-023`) quiere
+ * montar acá los decision gates: aprobar o rechazar lo que un agente escaló.
+ * Un endpoint de aprobación sin autenticar no es una molestia, es que un sitio
+ * cualquiera apruebe por vos.
  */
 'use strict';
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const { rutaEstado, rutaProgreso, marcarDetencion, DIR_WORKTREES } = require('./fanout-estado.js');
 const { interpretarEvento, crearSeguidor } = require('./fanout-tail.js');
@@ -158,7 +179,7 @@ function crearVigilante(repoPath, slug) {
   };
 }
 
-function paginaHtml(slug) {
+function paginaHtml(slug, token) {
   return `<!doctype html>
 <html lang="es">
 <head>
@@ -224,6 +245,9 @@ function paginaHtml(slug) {
 <div id="grid"></div>
 <div id="vacio" hidden>Sin tareas todavía.</div>
 <script>
+// Inyectado por el servidor. Es de esta sesión del visor: se muere con el
+// proceso y no sirve para el próximo.
+const TOKEN = ${JSON.stringify(token || '')};
 const grid = document.getElementById('grid');
 const resumen = document.getElementById('resumen');
 const tarjetas = new Map();
@@ -242,9 +266,13 @@ function tarjeta(taskId) {
     boton.disabled = true;
     boton.textContent = 'Deteniendo…';
     try {
-      const r = await fetch('/api/detener', {
+      // El token va por cabecera propia y no en la query a propósito: una
+      // cabecera no estándar obliga al navegador a hacer preflight antes de
+      // cruzar orígenes, y el servidor no responde preflights. Un formulario
+      // hostil en otra pestaña no tiene forma de mandarla.
+      const r = await fetch('/api/detener?t=' + encodeURIComponent(TOKEN), {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-lagrange-token': TOKEN },
         body: JSON.stringify({ taskId })
       });
       // El pedido queda escrito, pero al subagente lo mata el orquestador en
@@ -441,7 +469,7 @@ function pintarEvento(ev) {
   if (pegadoAbajo) el.scrollTop = el.scrollHeight;
 }
 
-const fuente = new EventSource('/api/eventos');
+const fuente = new EventSource('/api/eventos?t=' + encodeURIComponent(TOKEN));
 // Ojo con qué cuenta como "actividad". La ráfaga inicial al conectar es
 // HISTORIAL, no vida: si contara, abrir la pestaña sobre un lote abandonado
 // hace media hora lo mostraría como recién activo — que es justo la mentira
@@ -467,17 +495,97 @@ function escapar(s) {
   ));
 }
 
-function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS } = {}) {
+/**
+ * SEC-011 — Comparación en tiempo constante. Un `===` sobre el token filtra,
+ * por cuánto tarda en fallar, cuántos caracteres acertó quien prueba.
+ */
+function tokenCoincide(esperado, recibido) {
+  if (typeof recibido !== 'string' || recibido.length !== esperado.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(recibido), Buffer.from(esperado));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Anti DNS rebinding: escuchar en 127.0.0.1 no impide que un dominio del
+ * atacante resuelva a 127.0.0.1 y que el navegador trate a esa página como
+ * mismo-origen nuestro. Lo que delata el intento es el `Host`.
+ */
+function hostEsLoopback(req) {
+  const host = String(req.headers.host || '');
+  const soloHost = host.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+  return soloHost === '127.0.0.1' || soloHost === 'localhost' || soloHost === '::1';
+}
+
+/**
+ * Para las mutaciones. `Sec-Fetch-Site` lo pone el navegador y no se puede
+ * falsear desde JavaScript; `Origin` cubre a los clientes que no lo mandan.
+ * Un cliente sin navegador (curl, un test) no manda ninguno de los dos: eso
+ * se acepta, porque ahí el token es toda la autenticación que hay y no existe
+ * el problema de la petición cruzada involuntaria.
+ */
+function origenAceptable(req) {
+  const sitio = req.headers['sec-fetch-site'];
+  if (sitio && sitio !== 'same-origin' && sitio !== 'none') return false;
+
+  const origen = req.headers.origin;
+  if (!origen) return true;
+  try {
+    const host = new URL(origen).hostname;
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+
+function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, token } = {}) {
+  // Un token por sesión del visor. No se persiste: si el proceso se cae, el
+  // que quedó en una pestaña abierta deja de servir, que es lo correcto.
+  const tokenAcceso = token || crypto.randomBytes(24).toString('hex');
+
   const servidor = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
 
+    const rechazar = (codigo, mensaje) => {
+      res.writeHead(codigo, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end(mensaje);
+    };
+
+    if (!hostEsLoopback(req)) {
+      return rechazar(403, 'Solo se atiende por loopback.');
+    }
+
+    // El preflight no se responde: es lo que impide que otra pestaña mande la
+    // cabecera `x-lagrange-token` cruzando orígenes.
+    if (req.method === 'OPTIONS') {
+      return rechazar(405, 'No.');
+    }
+
     if (req.method === 'GET' && url.pathname === '/') {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(paginaHtml(slug));
+      if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
+        return rechazar(403,
+          'Falta el token de esta sesión del visor.\n\n'
+          + 'Abrí la URL completa que imprimió la terminal, la que termina en "?t=...".\n'
+          + 'El token cambia cada vez que arranca el visor.');
+      }
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        // La página lleva el token adentro: que no quede en ninguna caché.
+        'cache-control': 'no-store',
+        'referrer-policy': 'no-referrer'
+      });
+      res.end(paginaHtml(slug, tokenAcceso));
       return;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/eventos') {
+      // El stream también va con token: por acá salen los prompts y el código
+      // que genera cada subagente.
+      if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
+        return rechazar(403, 'token invalido');
+      }
       res.writeHead(200, {
         'content-type': 'text/event-stream; charset=utf-8',
         'cache-control': 'no-cache',
@@ -546,6 +654,17 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS } = {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/detener') {
+      // Acá el token se exige en la cabecera, no en la query: una cabecera
+      // propia no se puede mandar cruzando orígenes sin un preflight que este
+      // servidor no responde. Con el token solo en la query, un `<form>` en
+      // otra pestaña alcanzaría.
+      if (!tokenCoincide(tokenAcceso, req.headers['x-lagrange-token'])) {
+        return rechazar(403, 'falta o no coincide x-lagrange-token');
+      }
+      if (!origenAceptable(req)) {
+        return rechazar(403, 'origen no permitido');
+      }
+
       let cuerpo = '';
       req.on('data', c => {
         cuerpo += c;
@@ -577,6 +696,10 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS } = {
     res.end('no encontrado');
   });
 
+  // Quien levanta el servidor necesita el token para poder imprimir una URL
+  // que sirva. Va como propiedad para no cambiarle la forma al valor de
+  // retorno, que ya es el server y lo usan los tests.
+  servidor.tokenAcceso = tokenAcceso;
   return servidor;
 }
 
@@ -605,7 +728,8 @@ function main() {
   // Solo loopback, a propósito: estos logs traen prompts y código.
   servidor.listen(puerto, '127.0.0.1', () => {
     process.stdout.write(`\nVisor de fan-out para "${slug}"\n`);
-    process.stdout.write(`  http://127.0.0.1:${puerto}\n\n`);
+    // La URL SIN el token no sirve para nada: es a propósito (SEC-011).
+    process.stdout.write(`  http://127.0.0.1:${puerto}/?t=${servidor.tokenAcceso}\n\n`);
     if (lotes.length > 1) {
       process.stdout.write(`Otros lotes: ${lotes.slice(1).map(l => l.slug).join(', ')} (--slug <nombre>)\n\n`);
     }

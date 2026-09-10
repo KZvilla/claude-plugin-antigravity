@@ -316,6 +316,25 @@ Each subagent gets a card showing:
 
 The header reports the batch total, and distinguishes a finished batch (`terminado en 4m00s`) from one that has simply gone quiet (`sin novedad hace 12m`) — useful because a crashed or cancelled fan-out otherwise looks identical to a running one forever.
 
+### Access control (`SEC-011`)
+
+Listening on loopback never protected you from your own browser: any page open in another tab can POST to `127.0.0.1` with a simple request that does not even trigger a CORS preflight. Before this, that was enough for an arbitrary site to stop one of your subagents — and the persistent-agent dashboard (`FEAT-023`) wants to put *approval gates* on the same surface.
+
+So the viewer now prints a URL carrying a **per-session token**:
+
+```
+http://127.0.0.1:4517/?t=7f3c…
+```
+
+Open the full URL — trimming the `?t=` gives you a 403. The token is random per launch, lives only in the process, and four layers back it up, none sufficient alone:
+
+| Layer | Stops |
+|---|---|
+| Token on `GET /` and `GET /api/eventos` | Any other local process or tab reading your prompts and generated code |
+| Token required in the `x-lagrange-token` **header** for mutations | A hostile `<form>`, which cannot set a custom header |
+| CORS preflight refused (`OPTIONS` → 405) | A `fetch` from another origin trying to send that header |
+| `Origin` / `Sec-Fetch-Site` validated, `Host` must be loopback | Cross-site POSTs and DNS rebinding |
+
 ### Stopping a subagent
 
 The stop button writes a small sentinel file that the orchestrator picks up on its next poll (a couple of seconds), then kills that subagent's process tree. The same thing is available from any terminal:
@@ -381,7 +400,7 @@ Two more layers back that up:
 ### Memory and threads
 
 - **Thread:** the `conversation_id` of each agent is persisted in `~/.claude/antigravity-agents-state.json` and replayed with `--conversation` on the next cast. Long threads grow the input token count on every turn — use `action:"forget"` to start a fresh thread without losing the agent's long-term memory, or `fresh: true` for a one-off.
-- **Long-term memory:** rehydration uses `get_bootstrap_profile` from `mcp-memory`, which enforces a token budget server-side (`budget_tokens`, default 2048). Isolation between agents is by native `agent_id`, not by `store`. After each cast, `commit_session_legacy` records what the agent learned.
+- **Long-term memory:** rehydration uses `get_bootstrap_profile` from `mcp-memory`, which enforces a token budget server-side (`budget_tokens`, default 2048). Isolation between agents is by native `agent_id`, not by `store` — and it is a filter, not a partition: the service shares any *mistake note* that carries no `agent_id` with every agent, while preferences and decisions are filtered strictly. Requires `MCP_BOOTSTRAP_ENABLED=true` on the memory service; without it the profile comes back as an empty shell and `cast_agent` correctly reports no context recovered. After each cast, `commit_session_legacy` records what the agent learned.
 - **Degradation is silent and deliberate:** if the memory service is unreachable, disabled, or has nothing useful to say, the cast still runs — it just reports `Contexto recuperado: — no (<reason>)` instead of injecting an empty profile into the prompt.
 
 ### `cast_agent` — Parameter Reference
