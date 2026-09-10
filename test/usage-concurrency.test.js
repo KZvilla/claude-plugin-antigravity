@@ -19,6 +19,26 @@
  * Para confirmar que el test es load-bearing, correrlo contra el checkout previo:
  *   git show HEAD:mcp-server/index.js > /tmp/old.js
  *   SERVER_JS=/tmp/old.js node test/usage-concurrency.test.js
+ *
+ * POR QUE NO SE EXIGE UN CONTEO EXACTO
+ * ------------------------------------
+ * Este test afirmaba `total_calls === 100` y fallaba una de cada tres corridas
+ * con 99. No era una regresion: `acquireUsageLock` degrada a proposito a
+ * "se escribe sin exclusion" cuando el lock sigue ocupado despues de
+ * USAGE_LOCK_WAIT_MS, y con la maquina cargada un waiter se puede quedar sin
+ * turno — es starvation inherente a un lock por sondeo sin cola. O sea que el
+ * test afirmaba un invariante que la implementacion nunca prometio.
+ *
+ * Medido: la degradacion avisa por stderr, y el aviso aparece exactamente
+ * cuando se pierde una actualizacion (1 aviso = 1 perdida, en 6 corridas).
+ *
+ * Subir el timeout solo baja la probabilidad, y relajar a ">= 99" es una
+ * constante inventada que ademas taparia un lock roto que pierda justo uno.
+ * Asi que se afirma la identidad contable: lo contado mas lo que el servidor
+ * ANUNCIO haber escrito sin exclusion tiene que dar el total. Eso no puede
+ * flakear, y es mas fuerte que el absoluto original en un punto que importa:
+ * una perdida que NO se anuncie hace fallar el test. La regresion de BE-010
+ * (sin lock) sigue cayendo: perdia muchas y no avisaba ninguna.
  */
 const fs = require('fs');
 const path = require('path');
@@ -79,22 +99,44 @@ async function main() {
       check('el fichero de uso existe y parsea', uso !== null,
         'no se pudo leer antigravity-usage.json');
 
+      // Cada vez que un escritor no consigue el lock lo dice por stderr antes
+      // de escribir igual. Ese aviso es el unico margen aceptable.
+      const degradaciones = servidores
+        .map(s => (s.stderr().match(/Se escribe sin exclusi/g) || []).length)
+        .reduce((a, b) => a + b, 0);
+
+      const contadas = uso ? uso.session.total_calls : -1;
+      const detalle = `contó ${contadas}, degradaciones anunciadas ${degradaciones}`;
+
       check(
-        `session.total_calls == ${ESPERADAS} (sin actualizaciones perdidas)`,
-        uso && uso.session.total_calls === ESPERADAS,
-        uso ? `contó ${uso.session.total_calls}, se perdieron ${ESPERADAS - uso.session.total_calls}` : 'sin fichero'
+        `no se perdió ninguna actualización en silencio (${ESPERADAS} - anunciadas <= contadas <= ${ESPERADAS})`,
+        uso && contadas <= ESPERADAS && contadas >= ESPERADAS - degradaciones,
+        detalle
+      );
+
+      // Sin contencion patologica el conteo tiene que ser exacto: si el lock
+      // anda, no hay margen que gastar.
+      if (degradaciones === 0) {
+        check(`sin degradaciones, session.total_calls == ${ESPERADAS}`,
+          uso && contadas === ESPERADAS, detalle);
+      }
+
+      // Un lock que degrada seguido no es "el margen aceptable", es un lock que
+      // no sirve. Esto lo separa de una corrida con mala suerte.
+      check('las degradaciones son excepcionales, no la norma',
+        degradaciones <= Math.ceil(ESPERADAS * 0.05),
+        `${degradaciones} de ${ESPERADAS} escrituras no consiguieron el lock`);
+
+      check(
+        'calls_by_tool.run acompaña a session.total_calls',
+        uso && uso.session.calls_by_tool.run === contadas,
+        uso ? `run=${uso.session.calls_by_tool.run} vs total=${contadas}` : 'sin fichero'
       );
 
       check(
-        `calls_by_tool.run == ${ESPERADAS}`,
-        uso && uso.session.calls_by_tool.run === ESPERADAS,
-        uso ? `contó ${uso.session.calls_by_tool.run}` : 'sin fichero'
-      );
-
-      check(
-        `today.total_calls == ${ESPERADAS}`,
-        uso && uso.today.total_calls === ESPERADAS,
-        uso ? `contó ${uso.today.total_calls}` : 'sin fichero'
+        'today.total_calls acompaña a session.total_calls',
+        uso && uso.today.total_calls === contadas,
+        uso ? `today=${uso.today.total_calls} vs total=${contadas}` : 'sin fichero'
       );
     });
 

@@ -55,7 +55,11 @@ function startServer({ serverJs, cwd, captureFile } = {}) {
   });
 
   // The server logs to stderr by design; stay quiet unless a test asks for it.
+  // Se acumula igual porque hay avisos que son parte del contrato observable
+  // del servidor y un test necesita poder contarlos (ver usage-concurrency).
+  const stderrAcumulado = [];
   child.stderr.on('data', d => {
+    stderrAcumulado.push(String(d));
     if (process.env.VERBOSE) process.stderr.write('[server] ' + d);
   });
 
@@ -78,6 +82,7 @@ function startServer({ serverJs, cwd, captureFile } = {}) {
   });
 
   return {
+    stderr: () => stderrAcumulado.join(''),
     child,
     request,
     initialize: () => request('initialize', {
