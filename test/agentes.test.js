@@ -30,6 +30,7 @@ cp.execFile = function (_bin, _args, _opts, cb) {
 const registro = require('../mcp-server/agents/registry.js');
 const estado = require('../mcp-server/agents/estado.js');
 const memoria = require('../mcp-server/agents/memoria.js');
+const aprendizaje = require('../mcp-server/agents/aprendizaje.js');
 
 const borrar = d => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch {} };
 
@@ -311,6 +312,111 @@ async function main() {
 
     const cierreMuerto = await memoria.cerrarSesion('reviewer', {}, { config: muerto, timeoutMs: 400 });
     check('el cierre también degrada en silencio', cierreMuerto.ok === false);
+  });
+
+  // ------------------------------------------------------------------
+  // El lado de escritura. Lo que se prueba acá es lo que estaba roto:
+  // `commit_session_legacy` con arrays vacíos solo escribe una observación
+  // `session_legacy`, y `get_bootstrap_profile` no lee ese tipo. Si el cast no
+  // llena `decisions`, el agente no acumula nada por más que la rehidratación
+  // funcione.
+  // ------------------------------------------------------------------
+  await group('extracción del bloque de memoria del agente', () => {
+    const conBloque = [
+      'El módulo de auth mezcla validación con transporte.',
+      '',
+      '<memoria>',
+      'decision: los handlers no validan :: la validación vive en el middleware',
+      '- correccion: creía que usaban JWT :: usan sesiones en Redis',
+      '</memoria>'
+    ].join('\n');
+
+    const r = aprendizaje.extraerAprendizaje(conBloque);
+    check('saca el bloque de la respuesta visible', !r.respuesta.includes('<memoria>'));
+    check('conserva lo que el agente respondió', r.respuesta.includes('mezcla validación con transporte'));
+    check('extrae la decisión', r.decisions.length === 1 && r.decisions[0].what === 'los handlers no validan');
+    check('extrae el porqué de la decisión', r.decisions[0].why === 'la validación vive en el middleware');
+    check('extrae la corrección aunque venga con viñeta',
+      r.userCorrections.length === 1 && r.userCorrections[0].corrected_to === 'usan sesiones en Redis');
+
+    const sinBloque = aprendizaje.extraerAprendizaje('Una respuesta común y silvestre.');
+    check('sin bloque no inventa nada',
+      sinBloque.decisions.length === 0 && sinBloque.userCorrections.length === 0);
+    check('sin bloque la respuesta queda intacta',
+      sinBloque.respuesta === 'Una respuesta común y silvestre.');
+
+    // Un bloque abierto y no cerrado no puede costarle al usuario la respuesta.
+    const roto = aprendizaje.extraerAprendizaje('Texto previo.\n<memoria>\ndecision: algo :: por algo');
+    check('un bloque sin cerrar igual se parsea', roto.decisions.length === 1);
+    check('y la respuesta visible sobrevive', roto.respuesta === 'Texto previo.');
+
+    // El ejemplo del prompt rebotando envenenaría el perfil del agente.
+    const plantilla = aprendizaje.extraerAprendizaje(
+      'x\n<memoria>\ndecision: que concluiste :: por que\n</memoria>');
+    check('descarta la plantilla sin completar', plantilla.decisions.length === 0);
+
+    const muchas = aprendizaje.extraerAprendizaje(
+      'x\n<memoria>\n' + Array.from({ length: 20 }, (_, i) => `decision: d${i} :: w${i}`).join('\n') + '\n</memoria>');
+    check('corta en el máximo de entradas',
+      muchas.decisions.length === aprendizaje.MAX_ENTRADAS, String(muchas.decisions.length));
+
+    const larga = aprendizaje.extraerAprendizaje(
+      'x\n<memoria>\ndecision: ' + 'a'.repeat(5000) + ' :: b\n</memoria>');
+    check('recorta una entrada desmedida',
+      larga.decisions[0].what.length === aprendizaje.MAX_CARACTERES);
+
+    const basura = aprendizaje.extraerAprendizaje('x\n<memoria>\nblah blah\n\n</memoria>');
+    check('ignora líneas que no son entradas', basura.decisions.length === 0);
+
+    check('la instrucción nombra el bloque que se espera',
+      aprendizaje.instruccionDeCierre().includes('<memoria>'));
+  });
+
+  await group('el cierre de sesión viaja por el canal que el bootstrap lee', async () => {
+    const llamadas = [];
+    const servidor = http.createServer((req, res) => {
+      let cuerpo = '';
+      req.on('data', c => { cuerpo += c; });
+      req.on('end', () => {
+        const peticion = JSON.parse(cuerpo);
+        llamadas.push(peticion);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: peticion.id,
+          result: peticion.method === 'initialize'
+            ? { protocolVersion: '2024-11-05', capabilities: {} }
+            : { content: [{ type: 'text', text: '{"status":"recorded"}' }] }
+        }));
+      });
+    });
+    await new Promise(r => servidor.listen(0, '127.0.0.1', r));
+    const config = { url: `http://127.0.0.1:${servidor.address().port}/mcp`, headers: {} };
+
+    try {
+      await memoria.cerrarSesion('reviewer', {
+        sessionId: 's1',
+        taskSummary: 'revisar auth',
+        outcome: 'success',
+        decisions: [{ what: 'los handlers no validan', why: 'vive en el middleware' }],
+        userCorrections: [{ original: 'creía JWT', corrected_to: 'usan Redis' }]
+      }, { config });
+
+      const cierre = llamadas.find(l => l.params && l.params.name === 'commit_session_legacy');
+      const a = cierre.params.arguments;
+
+      check('manda las decisiones, que es el canal con agent_id que sí se relee',
+        a.decisions.length === 1 && a.decisions[0].what === 'los handlers no validan');
+      check('manda las correcciones', a.user_corrections.length === 1);
+      // errors -> mistake_note_add, que no recibe agent_id: esas notas quedan
+      // sin dueño y el bootstrap se las muestra a todos los agentes.
+      check('NO manda errores, que contaminarían a los demás agentes',
+        Array.isArray(a.errors) && a.errors.length === 0);
+      check('el agent_id viaja, que es lo que permite el filtro estricto',
+        a.agent_id === 'reviewer');
+    } finally {
+      await new Promise(r => servidor.close(r));
+    }
   });
 
   report();

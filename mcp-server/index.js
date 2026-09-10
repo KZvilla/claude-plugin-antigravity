@@ -27,6 +27,7 @@ const { crearEscritorDeEstado, crearLectorDeControl, rutaProgreso, limpiarProgre
 const registroAgentes = require('./agents/registry.js');
 const estadoAgentes = require('./agents/estado.js');
 const memoriaAgentes = require('./agents/memoria.js');
+const aprendizajeAgentes = require('./agents/aprendizaje.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -2910,9 +2911,18 @@ async function handleToolCall(name, args) {
 
       // El contexto rehidratado va antes del pedido y marcado como tal: sin la
       // marca el agente lo lee como parte de la consigna de hoy.
-      const promptCast = contexto
+      let promptCast = contexto
         ? `<contexto-recuperado>\nLo que ya sabés de trabajos anteriores:\n\n${contexto}\n</contexto-recuperado>\n\n${args.prompt}`
         : args.prompt;
+
+      // Sin esto el agente no acumula nada: `commit_session_legacy` con los
+      // arrays vacíos solo escribe una observación `session_legacy`, que es
+      // justo el tipo que `get_bootstrap_profile` nunca lee. La cola
+      // estructurada es lo que llena `decisions`, el único canal que rehidrata
+      // con el `agent_id` puesto. Si la memoria está apagada no se pide: sería
+      // pagar tokens por algo que no se va a guardar.
+      if (usarMemoria) promptCast += `\n${aprendizajeAgentes.instruccionDeCierre()}`;
+
       cliArgs.push('-p', promptCast);
 
       const timeoutCast = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
@@ -2942,15 +2952,29 @@ async function handleToolCall(name, args) {
         return error(err);
       }
 
-      const respuestaCast = datosCast.response || resultadoCast.rawOutput || '(sin respuesta)';
+      const crudoCast = datosCast.response || resultadoCast.rawOutput || '(sin respuesta)';
+
+      // El bloque de memoria es plomería: se saca de lo que ve el usuario.
+      const aprendido = usarMemoria
+        ? aprendizajeAgentes.extraerAprendizaje(crudoCast)
+        : { respuesta: crudoCast, decisions: [], userCorrections: [] };
+      const respuestaCast = aprendido.respuesta;
+      const aprendidas = aprendido.decisions.length + aprendido.userCorrections.length;
 
       if (usarMemoria) {
         // Best-effort a propósito: que la memoria no acepte el cierre no
         // invalida el trabajo que el agente ya hizo.
+        //
+        // `errors` va vacío deliberadamente. El servicio los convierte en
+        // `mistake_note_add`, que no recibe `agent_id`, y el bootstrap
+        // comparte las notas sin dueño con TODOS los agentes: mandar los
+        // errores de este agente por ahí se los mete en el perfil a los demás.
         await memoriaAgentes.cerrarSesion(args.agent, {
           sessionId: hiloNuevo || undefined,
           taskSummary: args.prompt,
-          outcome: 'success'
+          outcome: 'success',
+          decisions: aprendido.decisions,
+          userCorrections: aprendido.userCorrections
         });
       }
 
@@ -2959,6 +2983,14 @@ async function handleToolCall(name, args) {
       salida += `- Acceso: \`${entrada.read_only ? 'read-only' : 'read/write'}\``
         + `${entrada.read_only ? ' (allowlist de tools + `--mode plan`)' : ''}\n`;
       salida += `- Contexto recuperado: ${contexto ? '✅ sí' : `— no (${motivoSinMemoria || 'memoria desactivada'})`}\n`;
+      // Que esto se vea importa: si el agente deja de emitir el bloque, el
+      // síntoma es silencioso (sigue respondiendo bien, pero nunca más
+      // aprende). Acá se nota en el acto.
+      if (usarMemoria) {
+        salida += `- Criterio guardado: ${aprendidas
+          ? `✅ ${aprendidas} entrada(s)`
+          : '— ninguna (el agente no emitió bloque de memoria en este turno)'}\n`;
+      }
       if (hiloNuevo) {
         salida += `- Hilo: \`${hiloNuevo}\`${hiloGuardado ? ' (continuado)' : ' (nuevo)'}\n`;
       }
