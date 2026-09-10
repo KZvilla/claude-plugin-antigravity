@@ -519,7 +519,11 @@ export function formatearPieDeCast(task, cast, segundos) {
     `📁 ${task.workspaceName}`,
     segundos ? formatElapsed(segundos) : null,
     `memoria: ${memoria}`,
-    `criterio guardado: ${cast.memoria?.guardadas || 0}`
+    cast.memoria?.guardadas
+      ? `criterio guardado: ${cast.memoria.guardadas}`
+      : (cast.memoria?.extraidas
+        ? `criterio NO guardado (${cast.memoria.motivoCierre})`
+        : 'criterio guardado: 0')
   ];
   return `\n\n—\n${partes.filter(Boolean).join(' · ')}`;
 }

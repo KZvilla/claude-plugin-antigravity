@@ -2921,9 +2921,16 @@ async function handleToolCall(name, args) {
       // síntoma es silencioso (sigue respondiendo bien, pero nunca más
       // aprende). Acá se nota en el acto.
       if (cast.memoria.usada) {
-        salida += `- Criterio guardado: ${cast.memoria.guardadas
-          ? `✅ ${cast.memoria.guardadas} entrada(s)`
-          : '— ninguna (el agente no emitió bloque de memoria en este turno)'}\n`;
+        let criterio;
+        if (cast.memoria.guardadas) {
+          criterio = `✅ ${cast.memoria.guardadas} entrada(s)`;
+        } else if (cast.memoria.extraidas) {
+          criterio = `⚠️ ninguna: el agente emitió ${cast.memoria.extraidas} entrada(s) `
+            + `pero la memoria no aceptó el cierre (${cast.memoria.motivoCierre})`;
+        } else {
+          criterio = '— ninguna (el agente no emitió bloque de memoria en este turno)';
+        }
+        salida += `- Criterio guardado: ${criterio}\n`;
       }
       if (cast.conversationId) {
         salida += `- Hilo: \`${cast.conversationId}\`${cast.continuado ? ' (continuado)' : ' (nuevo)'}\n`;

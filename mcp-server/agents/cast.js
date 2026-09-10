@@ -70,13 +70,18 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
   }
 
   const usarMemoria = opciones.memory !== false;
+  // Solo para tests: apuntar a un servicio falso sin tocar el descubrimiento.
+  const opcionesMemoria = opciones.memoriaConfig
+    ? { config: opciones.memoriaConfig, timeoutMs: opciones.memoriaTimeoutMs }
+    : {};
   let contexto = null;
   let motivoSinMemoria = usarMemoria ? null : 'memoria desactivada';
   if (usarMemoria) {
     const rehidratacion = await memoria.rehidratar(agent, {
       projectId: opciones.projectId || entrada.project_id || undefined,
       taskSummary: prompt,
-      budgetTokens: opciones.budgetTokens
+      budgetTokens: opciones.budgetTokens,
+      ...opcionesMemoria
     });
     if (rehidratacion.ok) contexto = rehidratacion.texto;
     else motivoSinMemoria = rehidratacion.motivo;
@@ -118,7 +123,12 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
   if (usarMemoria) promptCast += `\n${aprendizaje.instruccionDeCierre()}`;
   cliArgs.push('-p', promptCast);
 
+  // Reloj de pared de ESTE turno. `duration_seconds` de agy es el acumulado de
+  // toda la conversacion: con un hilo continuado, el pie llego a decir 32404 s
+  // para un turno de minutos.
+  const inicio = Date.now();
   const resultado = await ejecutar(cliArgs, { cwd, timeoutMinutes, onSpawn: opciones.onSpawn });
+  const duracion = (Date.now() - inicio) / 1000;
   const datos = resultado.data || {};
   const hiloNuevo = datos.conversation_id || hiloGuardado || null;
 
@@ -126,7 +136,7 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
     entrada,
     conversationId: hiloNuevo,
     continuado: Boolean(hiloGuardado),
-    duracion: datos.duration_seconds || 0,
+    duracion,
     usage: datos.usage || null,
     model,
     effort,
@@ -136,7 +146,15 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
 
   // El hilo se guarda incluso si el turno fallo o se cancelo: si agy llego a
   // abrir conversacion, perderla obliga a re-explicarle todo al agente.
-  if (hiloNuevo) estado.registrarCast(agent, { conversationId: hiloNuevo, cwd }, homeDir);
+  // Solo un turno exitoso cuenta como cast; uno fallido o cancelado guarda el
+  // hilo pero no suma.
+  if (hiloNuevo) {
+    estado.registrarCast(agent, {
+      conversationId: hiloNuevo,
+      cwd,
+      contar: Boolean(resultado.success && !resultado.cancelled)
+    }, homeDir);
+  }
 
   // Cancelado: no se extrae aprendizaje de una salida trunca ni se cierra la
   // sesion en la memoria. No hay un `outcome` verificado para "abortado".
@@ -152,26 +170,32 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
   const aprendido = usarMemoria
     ? aprendizaje.extraerAprendizaje(crudo)
     : { respuesta: crudo, decisions: [], userCorrections: [] };
-  const guardadas = aprendido.decisions.length + aprendido.userCorrections.length;
+  // `extraidas` es lo que el agente emitio; `guardadas`, lo que la memoria
+  // acepto. Antes se informaba lo primero como si fuera lo segundo.
+  const extraidas = aprendido.decisions.length + aprendido.userCorrections.length;
+  let guardadas = 0;
+  let motivoCierre = null;
 
   if (usarMemoria) {
     // Best-effort: que la memoria no acepte el cierre no invalida el trabajo.
     // `errors` va vacio a proposito: el servicio los convierte en notas sin
     // `agent_id`, y el bootstrap las comparte con TODOS los agentes.
-    await memoria.cerrarSesion(agent, {
+    const cierre = await memoria.cerrarSesion(agent, {
       sessionId: hiloNuevo || undefined,
       taskSummary: prompt,
-      outcome: guardadas > 0 ? 'success' : 'partial',
+      outcome: extraidas > 0 ? 'success' : 'partial',
       decisions: aprendido.decisions,
       userCorrections: aprendido.userCorrections
-    });
+    }, opcionesMemoria);
+    if (cierre.ok) guardadas = extraidas;
+    else motivoCierre = cierre.motivo || 'la memoria no acepto el cierre';
   }
 
   return {
     ...base,
     ok: true,
     respuesta: aprendido.respuesta,
-    memoria: { ...base.memoria, guardadas }
+    memoria: { ...base.memoria, extraidas, guardadas, motivoCierre }
   };
 }
 

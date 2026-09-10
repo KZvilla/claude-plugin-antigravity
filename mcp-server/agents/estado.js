@@ -56,14 +56,18 @@ function hiloDe(nombre, homeDir = os.homedir()) {
 function registrarCast(nombre, datos = {}, homeDir = os.homedir()) {
   const estado = leerEstado(homeDir);
   const previo = estado.agents[nombre] || { casts: 0 };
+  // `contar: false` es un turno fallido o cancelado: se guarda el hilo, porque
+  // retomarlo evita re-explicarle todo al agente, pero no cuenta como cast
+  // hecho ni mueve la fecha del ultimo.
+  const contar = datos.contar !== false;
   estado.agents[nombre] = {
     ...previo,
     // Un cast que no devolvio conversation_id no debe borrar el hilo anterior.
     conversation_id: datos.conversationId || previo.conversation_id || null,
     estado: 'inactivo',
-    ultimo_cast: new Date().toISOString(),
+    ultimo_cast: contar ? new Date().toISOString() : (previo.ultimo_cast || null),
     ultimo_cwd: datos.cwd || previo.ultimo_cwd || null,
-    casts: (previo.casts || 0) + 1
+    casts: (previo.casts || 0) + (contar ? 1 : 0)
   };
   guardarEstado(estado, homeDir);
   return estado.agents[nombre];

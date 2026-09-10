@@ -177,6 +177,19 @@ async function main() {
       estado.registrarCast('reviewer', { conversationId: 'conv-1' }, home);
       check('acumula la cuenta', estado.estadoDe('reviewer', home).casts === 2);
 
+      // Un turno fallido o cancelado guarda el hilo pero no cuenta como cast.
+      estado.registrarCast('fallido', { conversationId: 'f-1' }, home);
+      const antesDelFallo = estado.estadoDe('fallido', home);
+      estado.registrarCast('fallido', { conversationId: 'f-2', contar: false }, home);
+      const trasElFallo = estado.estadoDe('fallido', home);
+      check('un turno fallido guarda el hilo nuevo', trasElFallo.conversation_id === 'f-2');
+      check('pero no suma al contador', trasElFallo.casts === 1);
+      check('ni mueve la fecha del último cast', trasElFallo.ultimo_cast === antesDelFallo.ultimo_cast);
+
+      estado.registrarCast('estreno', { conversationId: 'e-1', contar: false }, home);
+      check('un primer cast fallido deja el contador en cero y sin fecha',
+        estado.estadoDe('estreno', home).casts === 0 && estado.estadoDe('estreno', home).ultimo_cast === null);
+
       // Un turno que no devolvió conversation_id no puede borrar el hilo: eso
       // obligaría a re-explicarle todo al agente en el siguiente cast.
       estado.registrarCast('reviewer', {}, home);
@@ -565,6 +578,57 @@ async function main() {
       check('con alcance, el prompt le pide leer solo la carpeta elegida',
         promptConAlcance.includes('<alcance>') && promptConAlcance.includes('C:/repo/front'));
       check('sin alcance no se agrega nada', !llamadas[0].args.at(-1).includes('<alcance>'));
+
+      // Un turno que falla guarda el hilo pero no suma al contador.
+      const castsAntes = estado.estadoDe('lector', home).casts;
+      r = await cast.castear({
+        ...base, agent: 'lector', prompt: 'x', opciones: sinMemoria,
+        ejecutar: async () => ({ success: false, data: { conversation_id: 'hilo-1' }, error: 'boom' })
+      });
+      check('un cast fallido no suma al contador',
+        !r.ok && estado.estadoDe('lector', home).casts === castsAntes);
+
+      // La duración es la del turno: agy informa el acumulado de la conversación.
+      r = await cast.castear({
+        ...base, agent: 'lector', prompt: 'x', opciones: sinMemoria,
+        ejecutar: async () => ({ success: true, data: { response: 'ok', conversation_id: 'hilo-1', duration_seconds: 32404 } })
+      });
+      check('la duración es el reloj de pared del turno, no el acumulado de agy', r.ok && r.duracion < 60);
+
+      // "Criterio guardado" es lo que la memoria aceptó, no lo que el agente emitió.
+      const conBloque = 'Respuesta.\n<memoria>\ndecision: algo :: por algo\n</memoria>';
+      const ejecutarConBloque = async () => ({ success: true, data: { response: conBloque, conversation_id: 'hilo-1' } });
+
+      r = await cast.castear({
+        ...base, agent: 'lector', prompt: 'x', ejecutar: ejecutarConBloque,
+        opciones: { memoriaConfig: { url: 'http://127.0.0.1:9/mcp', headers: {} }, memoriaTimeoutMs: 400 }
+      });
+      check('con la memoria caída, lo extraído no se informa como guardado',
+        r.ok && r.memoria.extraidas === 1 && r.memoria.guardadas === 0 && typeof r.memoria.motivoCierre === 'string');
+
+      const servidorMem = http.createServer((req, res) => {
+        let cuerpo = '';
+        req.on('data', c => { cuerpo += c; });
+        req.on('end', () => {
+          const peticion = JSON.parse(cuerpo);
+          const result = peticion.method === 'initialize'
+            ? { protocolVersion: '2024-11-05', capabilities: {} }
+            : { content: [{ type: 'text', text: 'ok' }] };
+          res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': 'sess-cast' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: peticion.id, result }));
+        });
+      });
+      await new Promise(listo => servidorMem.listen(0, '127.0.0.1', listo));
+      try {
+        r = await cast.castear({
+          ...base, agent: 'lector', prompt: 'x', ejecutar: ejecutarConBloque,
+          opciones: { memoriaConfig: { url: `http://127.0.0.1:${servidorMem.address().port}/mcp`, headers: {} } }
+        });
+        check('con la memoria aceptando el cierre, sí se informa como guardado',
+          r.ok && r.memoria.guardadas === 1 && r.memoria.motivoCierre === null);
+      } finally {
+        await new Promise(listo => servidorMem.close(listo));
+      }
 
       r = await cast.castear({
         ...base,
