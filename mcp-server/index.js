@@ -28,6 +28,7 @@ const registroAgentes = require('./agents/registry.js');
 const estadoAgentes = require('./agents/estado.js');
 const memoriaAgentes = require('./agents/memoria.js');
 const aprendizajeAgentes = require('./agents/aprendizaje.js');
+const castAgentes = require('./agents/cast.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -1299,6 +1300,10 @@ const TOOLS = [
         skill: {
           type: 'string',
           description: 'SKILL to derive the identity from, e.g. "agency-code-reviewer". Required for action:"register". Use action:"skills" to see what is installed.'
+        },
+        addendum: {
+          type: 'string',
+          description: 'For action:"register". Project-specific text appended to the agent.md after the SKILL body, taking precedence over it. Use it to constrain a SKILL written for another context (e.g. one that orders running commands, or citing a standard this repo lacks). Re-registering without it keeps the previous addendum; pass "" to remove it.'
         },
         read_only: {
           type: 'boolean',
@@ -2811,7 +2816,8 @@ async function handleToolCall(name, args) {
           entrada = registroAgentes.instalarAgente(args.agent, {
             skill: args.skill,
             readOnly: args.read_only !== false,
-            projectId: args.project_id
+            projectId: args.project_id,
+            addendum: args.addendum
           }, homeDir);
         } catch (err) {
           return error(`No se pudo registrar el agente: ${err.message}`);
@@ -2827,6 +2833,7 @@ async function handleToolCall(name, args) {
         salida += `- Acceso: ${entrada.read_only ? '`read-only`' : '`read/write`'}\n`;
         salida += `- Tools nativas: ${entrada.tools.map(t => `\`${t}\``).join(', ')}\n`;
         salida += `- Definición: \`${entrada.agent_md}\`\n`;
+        salida += `- Addendum de proyecto: ${entrada.addendum ? `sí (${entrada.addendum.length} caracteres)` : 'no'}\n`;
         salida += `- Antigravity lo resuelve: ${verificacion.ok ? '✅ sí' : '⚠️ no'}\n`;
         if (!verificacion.ok) salida += `\n⚠️ ${verificacion.motivo}\n`;
         if (entrada.read_only && servers.length) {
@@ -2859,148 +2866,78 @@ async function handleToolCall(name, args) {
       }
 
       // --- cast ---
+      // La orquestación vive en agents/cast.js, compartida con el `/cast` del
+      // bot de Telegram (FEAT-022). Acá queda solo lo propio del MCP: registrar
+      // uso y formatear la salida para Claude Code.
       if (!args.agent) return error('`cast` necesita `agent`. Usá `action: "list"` para ver los registrados.');
       if (!args.prompt) return error('`cast` necesita `prompt`.');
 
-      const registro = registroAgentes.leerRegistro(homeDir);
-      const entrada = registro.agents[args.agent];
-      if (!entrada) {
-        const conocidos = Object.keys(registro.agents);
-        return error(
-          `\`${args.agent}\` no está registrado como agente persistido.`
-          + (conocidos.length ? ` Registrados: ${conocidos.map(x => `\`${x}\``).join(', ')}.` : '')
-          + ' Registralo con `action: "register"`.'
-        );
-      }
-
-      // El guardarrail que justifica todo el módulo: `agy --agent no-existe`
-      // corre igual, con el agente por defecto y escritura completa. Verificado
-      // el 2026-09-10. Un cast sin verificar no es un cast degradado, es otro
-      // agente.
-      const verificacion = await registroAgentes.verificarResuelve(args.agent, AGY_BIN);
-      if (!verificacion.ok) {
-        return error(`No se casteó \`${args.agent}\`: ${verificacion.motivo}`);
-      }
-
-      const usarMemoria = args.memory !== false;
-      let contexto = null;
-      let motivoSinMemoria = null;
-      if (usarMemoria) {
-        const rehidratacion = await memoriaAgentes.rehidratar(args.agent, {
-          projectId: args.project_id || entrada.project_id || undefined,
-          taskSummary: args.prompt,
-          budgetTokens: args.budget_tokens
-        });
-        if (rehidratacion.ok) contexto = rehidratacion.texto;
-        else motivoSinMemoria = rehidratacion.motivo;
-      }
-
-      const hiloGuardado = args.fresh ? null : estadoAgentes.hiloDe(args.agent, homeDir);
-
-      const cliArgs = ['--output-format', 'json', '--agent', args.agent];
-      cliArgs.push('--dangerously-skip-permissions');
-      // Segunda capa para read-only: `--mode plan` sí es un flag real del CLI.
-      // El allowlist de tools y esto se cubren mutuamente; ninguno alcanza solo.
-      if (entrada.read_only) cliArgs.push('--mode', 'plan');
-
-      const effortCast = args.effort || config.defaultEffort || 'high';
-      cliArgs.push('--effort', effortCast);
-      const modelCast = args.model || config.defaultModel;
-      if (modelCast) cliArgs.push('--model', modelCast);
-      if (hiloGuardado) cliArgs.push('--conversation', hiloGuardado);
-
-      // El contexto rehidratado va antes del pedido y marcado como tal: sin la
-      // marca el agente lo lee como parte de la consigna de hoy.
-      let promptCast = contexto
-        ? `<contexto-recuperado>\nLo que ya sabés de trabajos anteriores:\n\n${contexto}\n</contexto-recuperado>\n\n${args.prompt}`
-        : args.prompt;
-
-      // Sin esto el agente no acumula nada: `commit_session_legacy` con los
-      // arrays vacíos solo escribe una observación `session_legacy`, que es
-      // justo el tipo que `get_bootstrap_profile` nunca lee. La cola
-      // estructurada es lo que llena `decisions`, el único canal que rehidrata
-      // con el `agent_id` puesto. Si la memoria está apagada no se pide: sería
-      // pagar tokens por algo que no se va a guardar.
-      if (usarMemoria) promptCast += `\n${aprendizajeAgentes.instruccionDeCierre()}`;
-
-      cliArgs.push('-p', promptCast);
-
-      const timeoutCast = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
-      const resultadoCast = await executeAgy(cliArgs, {
+      const cast = await castAgentes.castear({
+        agent: args.agent,
+        prompt: args.prompt,
         cwd: args.cwd,
-        timeoutMinutes: timeoutCast
+        agyBin: AGY_BIN,
+        homeDir,
+        ejecutar: (cliArgs, { cwd, timeoutMinutes }) => executeAgy(cliArgs, { cwd, timeoutMinutes }),
+        opciones: {
+          memory: args.memory,
+          fresh: args.fresh,
+          projectId: args.project_id,
+          budgetTokens: args.budget_tokens,
+          model: args.model || config.defaultModel,
+          effort: args.effort || config.defaultEffort || 'high',
+          timeoutMinutes: args.timeout_minutes || config.defaultTimeoutMinutes || 15
+        }
       });
 
-      const datosCast = resultadoCast.data || {};
-      const hiloNuevo = datosCast.conversation_id || hiloGuardado || '';
-      const duracionCast = datosCast.duration_seconds || 0;
-
-      if (datosCast.usage) {
-        recordUsage('cast', modelCast, effortCast, hiloNuevo, duracionCast,
-          datosCast.usage, !resultadoCast.success, resultadoCast.error || '');
+      if (cast.usage) {
+        recordUsage('cast', cast.model, cast.effort, cast.conversationId || '', cast.duracion,
+          cast.usage, !cast.ok, cast.error || '');
       }
 
-      // El hilo se guarda incluso si el turno falló: si agy llegó a abrir
-      // conversación, perderla obliga a re-explicarle todo al agente.
-      if (hiloNuevo) {
-        estadoAgentes.registrarCast(args.agent, { conversationId: hiloNuevo, cwd: args.cwd }, homeDir);
-      }
-
-      if (!resultadoCast.success) {
-        let err = `Falló el cast de \`${args.agent}\`:\n${resultadoCast.error}`;
-        if (hiloNuevo) err += `\n\nEl hilo \`${hiloNuevo}\` quedó guardado: el próximo cast lo retoma.`;
+      if (!cast.ok) {
+        if (cast.noRegistrado) {
+          const conocidos = Object.keys(registroAgentes.leerRegistro(homeDir).agents);
+          return error(
+            `\`${args.agent}\` no está registrado como agente persistido.`
+            + (conocidos.length ? ` Registrados: ${conocidos.map(x => `\`${x}\``).join(', ')}.` : '')
+            + ' Registralo con `action: "register"`.'
+          );
+        }
+        // Sin `conversationId` en el resultado, el cast no llegó a ejecutarse
+        // (falló la verificación contra `agy agents`): el motivo va tal cual.
+        if (!('conversationId' in cast)) return error(cast.error);
+        let err = `Falló el cast de \`${args.agent}\`:\n${cast.error}`;
+        if (cast.conversationId) err += `\n\nEl hilo \`${cast.conversationId}\` quedó guardado: el próximo cast lo retoma.`;
         return error(err);
       }
 
-      const crudoCast = datosCast.response || resultadoCast.rawOutput || '(sin respuesta)';
-
-      // El bloque de memoria es plomería: se saca de lo que ve el usuario.
-      const aprendido = usarMemoria
-        ? aprendizajeAgentes.extraerAprendizaje(crudoCast)
-        : { respuesta: crudoCast, decisions: [], userCorrections: [] };
-      const respuestaCast = aprendido.respuesta;
-      const aprendidas = aprendido.decisions.length + aprendido.userCorrections.length;
-
-      if (usarMemoria) {
-        // Best-effort a propósito: que la memoria no acepte el cierre no
-        // invalida el trabajo que el agente ya hizo.
-        //
-        // `errors` va vacío deliberadamente. El servicio los convierte en
-        // `mistake_note_add`, que no recibe `agent_id`, y el bootstrap
-        // comparte las notas sin dueño con TODOS los agentes: mandar los
-        // errores de este agente por ahí se los mete en el perfil a los demás.
-        // El `outcome` estaba fijo en 'success' aunque el turno no hubiera
-        // producido nada. Un turno sin criterio capturado no es un fracaso,
-        // pero tampoco un éxito del que valga la pena aprender: marcarlo
-        // 'partial' evita ensuciar el historial del agente con sesiones vacías.
-        await memoriaAgentes.cerrarSesion(args.agent, {
-          sessionId: hiloNuevo || undefined,
-          taskSummary: args.prompt,
-          outcome: aprendidas > 0 ? 'success' : 'partial',
-          decisions: aprendido.decisions,
-          userCorrections: aprendido.userCorrections
-        });
-      }
-
-      let salida = `${respuestaCast.trim()}\n\n---\n`;
-      salida += `**Cast de \`${args.agent}\`** (SKILL: \`${entrada.skill}\`)\n`;
-      salida += `- Acceso: \`${entrada.read_only ? 'read-only' : 'read/write'}\``
-        + `${entrada.read_only ? ' (allowlist de tools + `--mode plan`)' : ''}\n`;
-      salida += `- Contexto recuperado: ${contexto ? '✅ sí' : `— no (${motivoSinMemoria || 'memoria desactivada'})`}\n`;
+      let salida = `${cast.respuesta.trim()}\n\n---\n`;
+      salida += `**Cast de \`${args.agent}\`** (SKILL: \`${cast.entrada.skill}\`)\n`;
+      salida += `- Acceso: \`${cast.entrada.read_only ? 'read-only' : 'read/write'}\``
+        + `${cast.entrada.read_only ? ' (allowlist de tools + `--mode plan`)' : ''}\n`;
+      salida += `- Contexto recuperado: ${cast.memoria.recuperada ? '✅ sí' : `— no (${cast.memoria.motivo || 'memoria desactivada'})`}\n`;
       // Que esto se vea importa: si el agente deja de emitir el bloque, el
       // síntoma es silencioso (sigue respondiendo bien, pero nunca más
       // aprende). Acá se nota en el acto.
-      if (usarMemoria) {
-        salida += `- Criterio guardado: ${aprendidas
-          ? `✅ ${aprendidas} entrada(s)`
-          : '— ninguna (el agente no emitió bloque de memoria en este turno)'}\n`;
+      if (cast.memoria.usada) {
+        let criterio;
+        if (cast.memoria.guardadas) {
+          criterio = `✅ ${cast.memoria.guardadas} entrada(s)`;
+        } else if (cast.memoria.extraidas) {
+          criterio = `⚠️ ninguna: el agente emitió ${cast.memoria.extraidas} entrada(s) `
+            + `pero la memoria no aceptó el cierre (${cast.memoria.motivoCierre})`;
+        } else {
+          criterio = '— ninguna (el agente no emitió bloque de memoria en este turno)';
+        }
+        salida += `- Criterio guardado: ${criterio}\n`;
       }
-      if (hiloNuevo) {
-        salida += `- Hilo: \`${hiloNuevo}\`${hiloGuardado ? ' (continuado)' : ' (nuevo)'}\n`;
+      if (cast.conversationId) {
+        salida += `- Hilo: \`${cast.conversationId}\`${cast.continuado ? ' (continuado)' : ' (nuevo)'}\n`;
       }
-      salida += `- Duración: ${duracionCast ? `${duracionCast.toFixed(1)}s` : 'desconocida'} (límite: ${timeoutCast}m)\n`;
-      if (datosCast.usage) {
-        salida += `- Tokens: entrada ${datosCast.usage.input_tokens}, salida ${datosCast.usage.output_tokens}\n`;
+      salida += `- Duración: ${cast.duracion ? `${cast.duracion.toFixed(1)}s` : 'desconocida'} (límite: ${cast.timeoutMinutes}m)\n`;
+      if (cast.usage) {
+        salida += `- Tokens: entrada ${cast.usage.input_tokens}, salida ${cast.usage.output_tokens}\n`;
       }
 
       return texto(salida);

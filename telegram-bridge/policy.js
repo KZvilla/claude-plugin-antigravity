@@ -43,7 +43,12 @@ export const DEFAULT_DENY_PATHS = ['.env*', '**/*.key', '**/*.pem'];
 export const SECRET_ENV_KEYS = [
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_NOTIFY_CHAT_ID',
-  'ALLOWED_USER_IDS'
+  'ALLOWED_USER_IDS',
+  // Credencial del servicio de memoria de los agentes persistidos (FEAT-022).
+  // La usa el proceso del bot para rehidratar y cerrar sesión; el hijo `agy`
+  // no la necesita, y con ella podría leer o escribir la memoria de cualquier
+  // agente.
+  'LAGRANGE_MEMORY_TOKEN'
 ];
 
 export function parseBool(value, fallback = false) {

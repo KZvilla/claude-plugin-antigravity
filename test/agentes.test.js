@@ -102,6 +102,26 @@ async function main() {
       check('desinstalar algo inexistente no revienta',
         registro.desinstalarAgente('fantasma', home) === false);
 
+      // Addendum: acota el SKILL, prevalece sobre él y no se pierde en silencio.
+      registro.instalarAgente('esceptico', { skill: 'agency-code-reviewer', addendum: 'No corras comandos.' }, home);
+      const rutaEsc = path.join(home, '.gemini', 'config', 'agents', 'esceptico', 'agent.md');
+      let mdEsc = fs.readFileSync(rutaEsc, 'utf8');
+      check('el addendum llega al agent.md', mdEsc.includes('No corras comandos.'));
+      check('el addendum va después del cuerpo del SKILL',
+        mdEsc.indexOf('No corras comandos.') > mdEsc.indexOf('Opinás, no editás'));
+      check('el addendum se persiste en el registro',
+        registro.leerRegistro(home).agents['esceptico'].addendum === 'No corras comandos.');
+
+      registro.instalarAgente('esceptico', { skill: 'agency-code-reviewer' }, home);
+      mdEsc = fs.readFileSync(rutaEsc, 'utf8');
+      check('re-registrar sin addendum conserva el anterior', mdEsc.includes('No corras comandos.'));
+
+      registro.instalarAgente('esceptico', { skill: 'agency-code-reviewer', addendum: '' }, home);
+      mdEsc = fs.readFileSync(rutaEsc, 'utf8');
+      check('addendum vacío lo borra a propósito',
+        !mdEsc.includes('No corras comandos.') && registro.leerRegistro(home).agents['esceptico'].addendum === null);
+      check('sin addendum no queda el encabezado de adaptación', !mdEsc.includes('Adaptacion a este proyecto'));
+
       let tiro = false;
       try { registro.instalarAgente('reviewer', { skill: 'no-existe' }, home); } catch { tiro = true; }
       check('registrar con un SKILL inexistente falla', tiro);
@@ -156,6 +176,19 @@ async function main() {
 
       estado.registrarCast('reviewer', { conversationId: 'conv-1' }, home);
       check('acumula la cuenta', estado.estadoDe('reviewer', home).casts === 2);
+
+      // Un turno fallido o cancelado guarda el hilo pero no cuenta como cast.
+      estado.registrarCast('fallido', { conversationId: 'f-1' }, home);
+      const antesDelFallo = estado.estadoDe('fallido', home);
+      estado.registrarCast('fallido', { conversationId: 'f-2', contar: false }, home);
+      const trasElFallo = estado.estadoDe('fallido', home);
+      check('un turno fallido guarda el hilo nuevo', trasElFallo.conversation_id === 'f-2');
+      check('pero no suma al contador', trasElFallo.casts === 1);
+      check('ni mueve la fecha del último cast', trasElFallo.ultimo_cast === antesDelFallo.ultimo_cast);
+
+      estado.registrarCast('estreno', { conversationId: 'e-1', contar: false }, home);
+      check('un primer cast fallido deja el contador en cero y sin fecha',
+        estado.estadoDe('estreno', home).casts === 0 && estado.estadoDe('estreno', home).ultimo_cast === null);
 
       // Un turno que no devolvió conversation_id no puede borrar el hilo: eso
       // obligaría a re-explicarle todo al agente en el siguiente cast.
@@ -485,6 +518,128 @@ async function main() {
       check('no deja temporales colgados', sobrantes.length === 0, JSON.stringify(sobrantes));
     } finally {
       borrar(dir);
+    }
+  });
+
+  // ------------------------------------------------------------------
+  await group('cast compartido entre la tool MCP y /cast de Telegram (FEAT-022)', async () => {
+    const cast = require('../mcp-server/agents/cast.js');
+    const home = crearHome();
+    try {
+      registro.instalarAgente('lector', { skill: 'agency-code-reviewer' }, home);
+      registro.instalarAgente('escritor', { skill: 'agency-code-reviewer', readOnly: false }, home);
+
+      const llamadas = [];
+      const ejecutar = async (args, op) => {
+        llamadas.push({ args, op });
+        return { success: true, data: { response: 'ok del agente', conversation_id: 'hilo-1', duration_seconds: 2 } };
+      };
+      const base = { cwd: home, agyBin: 'agy', ejecutar, homeDir: home };
+      const sinMemoria = { memory: false };
+
+      let tiro = false;
+      try { await cast.castear({ ...base, agyBin: undefined, agent: 'lector', prompt: 'x' }); } catch { tiro = true; }
+      check('sin agyBin lanza en vez de castear sin verificar', tiro);
+
+      let r = await cast.castear({ ...base, agent: 'fantasma', prompt: 'x', opciones: sinMemoria });
+      check('un agente sin registrar no se castea', !r.ok && r.noRegistrado && llamadas.length === 0);
+
+      r = await cast.castear({ ...base, agent: 'escritor', prompt: 'x', opciones: { ...sinMemoria, soloLectura: true } });
+      check('soloLectura rechaza un agente read/write sin ejecutar nada', !r.ok && llamadas.length === 0);
+
+      salidaAgy = { err: null, stdout: 'otro\n' };
+      r = await cast.castear({ ...base, agent: 'lector', prompt: 'x', opciones: sinMemoria });
+      check('si agy no resuelve el agente, no se ejecuta nada', !r.ok && llamadas.length === 0);
+      check('y el resultado distingue que no llegó a ejecutarse', !('conversationId' in r));
+
+      salidaAgy = { err: new Error('timeout'), stdout: '' };
+      r = await cast.castear({ ...base, agent: 'lector', prompt: 'x', opciones: sinMemoria });
+      check('si `agy agents` no responde, falla cerrado', !r.ok && llamadas.length === 0);
+
+      salidaAgy = { err: null, stdout: 'lector\nescritor\n' };
+      r = await cast.castear({ ...base, agent: 'lector', prompt: 'revisá', opciones: sinMemoria });
+      const args = llamadas[0].args;
+      check('pasa --agent con el nombre', args[args.indexOf('--agent') + 1] === 'lector');
+      check('un read-only corre con --mode plan', args[args.indexOf('--mode') + 1] === 'plan');
+      check('el primer cast no retoma ningún hilo', !args.includes('--conversation'));
+      check('devuelve la respuesta del agente', r.ok && r.respuesta === 'ok del agente');
+      check('guarda el hilo en el estado del agente', estado.hiloDe('lector', home) === 'hilo-1');
+
+      await cast.castear({ ...base, agent: 'lector', prompt: 'seguí', opciones: sinMemoria });
+      const args2 = llamadas[1].args;
+      check('el segundo cast retoma el hilo guardado', args2[args2.indexOf('--conversation') + 1] === 'hilo-1');
+
+      check('esHiloDeAgente reconoce el hilo de un agente', cast.esHiloDeAgente('hilo-1', home));
+      check('y no uno ajeno ni uno vacío',
+        !cast.esHiloDeAgente('otro-hilo', home) && !cast.esHiloDeAgente(null, home));
+
+      await cast.castear({ ...base, agent: 'lector', prompt: 'mirá', opciones: { ...sinMemoria, alcance: 'C:/repo/front' } });
+      const promptConAlcance = llamadas.at(-1).args.at(-1);
+      check('con alcance, el prompt le pide leer solo la carpeta elegida',
+        promptConAlcance.includes('<alcance>') && promptConAlcance.includes('C:/repo/front'));
+      check('sin alcance no se agrega nada', !llamadas[0].args.at(-1).includes('<alcance>'));
+
+      // Un turno que falla guarda el hilo pero no suma al contador.
+      const castsAntes = estado.estadoDe('lector', home).casts;
+      r = await cast.castear({
+        ...base, agent: 'lector', prompt: 'x', opciones: sinMemoria,
+        ejecutar: async () => ({ success: false, data: { conversation_id: 'hilo-1' }, error: 'boom' })
+      });
+      check('un cast fallido no suma al contador',
+        !r.ok && estado.estadoDe('lector', home).casts === castsAntes);
+
+      // La duración es la del turno: agy informa el acumulado de la conversación.
+      r = await cast.castear({
+        ...base, agent: 'lector', prompt: 'x', opciones: sinMemoria,
+        ejecutar: async () => ({ success: true, data: { response: 'ok', conversation_id: 'hilo-1', duration_seconds: 32404 } })
+      });
+      check('la duración es el reloj de pared del turno, no el acumulado de agy', r.ok && r.duracion < 60);
+
+      // "Criterio guardado" es lo que la memoria aceptó, no lo que el agente emitió.
+      const conBloque = 'Respuesta.\n<memoria>\ndecision: algo :: por algo\n</memoria>';
+      const ejecutarConBloque = async () => ({ success: true, data: { response: conBloque, conversation_id: 'hilo-1' } });
+
+      r = await cast.castear({
+        ...base, agent: 'lector', prompt: 'x', ejecutar: ejecutarConBloque,
+        opciones: { memoriaConfig: { url: 'http://127.0.0.1:9/mcp', headers: {} }, memoriaTimeoutMs: 400 }
+      });
+      check('con la memoria caída, lo extraído no se informa como guardado',
+        r.ok && r.memoria.extraidas === 1 && r.memoria.guardadas === 0 && typeof r.memoria.motivoCierre === 'string');
+
+      const servidorMem = http.createServer((req, res) => {
+        let cuerpo = '';
+        req.on('data', c => { cuerpo += c; });
+        req.on('end', () => {
+          const peticion = JSON.parse(cuerpo);
+          const result = peticion.method === 'initialize'
+            ? { protocolVersion: '2024-11-05', capabilities: {} }
+            : { content: [{ type: 'text', text: 'ok' }] };
+          res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': 'sess-cast' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: peticion.id, result }));
+        });
+      });
+      await new Promise(listo => servidorMem.listen(0, '127.0.0.1', listo));
+      try {
+        r = await cast.castear({
+          ...base, agent: 'lector', prompt: 'x', ejecutar: ejecutarConBloque,
+          opciones: { memoriaConfig: { url: `http://127.0.0.1:${servidorMem.address().port}/mcp`, headers: {} } }
+        });
+        check('con la memoria aceptando el cierre, sí se informa como guardado',
+          r.ok && r.memoria.guardadas === 1 && r.memoria.motivoCierre === null);
+      } finally {
+        await new Promise(listo => servidorMem.close(listo));
+      }
+
+      r = await cast.castear({
+        ...base,
+        agent: 'lector',
+        prompt: 'x',
+        ejecutar: async () => ({ success: false, cancelled: true, data: null, error: 'cancelado' }),
+        opciones: sinMemoria
+      });
+      check('un cast cancelado se informa como cancelado, no como error', !r.ok && r.cancelled === true);
+    } finally {
+      borrar(home);
     }
   });
 

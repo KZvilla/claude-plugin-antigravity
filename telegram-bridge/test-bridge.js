@@ -815,6 +815,15 @@ console.log('✔ Test 34 [BE-007]: TELEGRAM_BRIDGE_STATE_FILE tiene precedencia 
   for (const f of ['bot.js', 'state.js', 'paths.js', 'policy.js', 'logrotate.js', 'executor.js', 'formatter.js', 'queue.js', 'claude-launcher.js']) {
     fs.copyFileSync(path.join(import.meta.dirname, f), path.join(codigo, f));
   }
+  // FEAT-022: bot.js importa `../mcp-server/agents/` (el cast compartido). Se
+  // replica el árbol real del clon, donde siempre está al lado, en vez de hacer
+  // el import perezoso: un árbol incompleto tiene que fallar al arrancar el
+  // bot, no en el primer /cast.
+  fs.cpSync(
+    path.join(import.meta.dirname, '..', 'mcp-server', 'agents'),
+    path.join(raiz, 'mcp-server', 'agents'),
+    { recursive: true }
+  );
   fs.symlinkSync(path.join(import.meta.dirname, 'node_modules'), path.join(codigo, 'node_modules'), 'junction');
   fs.writeFileSync(path.join(codigo, 'bridge.lock'), JSON.stringify({ pid: 999999, startedAt: null, bootId: null }));
   fs.writeFileSync(path.join(codigo, 'state.json'), '{"chats":{},"pendingAsks":{}}');
@@ -1003,7 +1012,8 @@ console.log('✔ Test 37 [SEC-003]: la subida de ficheros redacta secretos y no 
   assert.strictEqual(ws2.name, 'frontend');
   assert(ws1.displayName.includes('app1'), 'ws1 debe estar desambiguado con su carpeta padre app1');
   assert(ws2.displayName.includes('app2'), 'ws2 debe estar desambiguado con su carpeta padre app2');
-  assert.strictEqual(ws3.displayName, 'landing', 'ws3 sin colisión conserva su nombre directo');
+  assert(ws3.displayName.startsWith('landing (') && ws3.displayName.endsWith(')'),
+    'ws3 sin colisión también lleva su carpeta padre: «frontend» a secas no decía de qué repo era');
 
   // 3. Comprobar que los IDs sean compactos y estables (hash de 8 caracteres) y mantengan numericId
   assert(workspaces.every((w) => typeof w.id === 'string' && /^[0-9a-f]{8}$/.test(w.id)), 'Los IDs deben ser hashes hexadecimales estables de 8 caracteres');
@@ -1908,6 +1918,179 @@ console.log('✔ Test 48 [SEC-006 / BE-010]: Separación estricta de Allowlists 
   fs.rmSync(fakeRepo, { recursive: true, force: true });
 }
 console.log('✔ Test 49 [FEAT-004 / BE-011]: Detección y purga segura de worktrees huérfanos de Claude Code (Opción B)');
+
+// Test 50 [FEAT-022]: /cast desde Telegram.
+// Lo que se afirma es la superficie de seguridad, no el camino feliz (que
+// lanzaría `agy`): solo agentes registrados y read-only, workspace solo por
+// botón, pendientes de un uso y del mismo chat, el token de memoria fuera del
+// entorno del hijo, y ningún camino que retome el hilo de un agente sin
+// `--agent`.
+{
+  const botMod = await import('./bot.js');
+  const policyMod = await import('./policy.js');
+
+  const entornoCast = policyMod.sanitizeEnv({ PATH: '/usr/bin', LAGRANGE_MEMORY_TOKEN: 'secreto-memoria' });
+  assert.strictEqual(entornoCast.LAGRANGE_MEMORY_TOKEN, undefined, 'El token de memoria no se hereda al hijo');
+
+  // Home falso: registro de agentes y estado de hilos sin tocar los del usuario.
+  // `os.homedir()` lee USERPROFILE/HOME en cada llamada.
+  const homeFalso = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cast-home-'));
+  const homePrevio = { USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME };
+  process.env.USERPROFILE = homeFalso;
+  process.env.HOME = homeFalso;
+  fs.mkdirSync(path.join(homeFalso, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(homeFalso, '.claude', 'antigravity-agents.json'), JSON.stringify({
+    agents: {
+      lector: { skill: 'agency-code-reviewer', read_only: true },
+      escritor: { skill: 'agency-code-reviewer', read_only: false }
+    }
+  }));
+  fs.writeFileSync(path.join(homeFalso, '.claude', 'antigravity-agents-state.json'), JSON.stringify({
+    agents: { lector: { conversation_id: 'hilo-del-agente', casts: 1 } }
+  }));
+
+  try {
+    assert.strictEqual(botMod.validarCastDesdeChat('lector').ok, true, 'Un agente read-only registrado se acepta');
+    const rw = botMod.validarCastDesdeChat('escritor');
+    assert(!rw.ok && rw.mensaje.includes('read/write'), 'Un agente read/write se rechaza');
+    const fantasma = botMod.validarCastDesdeChat('fantasma');
+    assert(!fantasma.ok && fantasma.mensaje.includes('no es un agente registrado'), 'Uno sin registrar se rechaza');
+    assert(fantasma.mensaje.includes('`lector`') && !fantasma.mensaje.includes('`escritor`'),
+      'El listado de disponibles ofrece solo los read-only');
+    const raro = botMod.validarCastDesdeChat('../x`*');
+    assert(!raro.ok && !raro.mensaje.includes('../x'), 'Un nombre sin forma de nombre no se repite en el Markdown');
+
+    const kb = botMod.buildCastWorkspacesKeyboard('0a1b2c3d', [
+      { id: 'a1b2c3d4', displayName: 'app' },
+      { id: 'e5f60718', displayName: 'otra' }
+    ]);
+    const botones = kb.inline_keyboard.flat();
+    assert(botones.every((b) => Buffer.byteLength(b.callback_data, 'utf8') <= 64), 'Todo callback_data entra en 64 bytes');
+    assert(botones.some((b) => b.callback_data === 'cast_ws:0a1b2c3d:a1b2c3d4'), 'El botón lleva id de cast y de workspace');
+
+    botMod.resetRuntimeState();
+    const t0 = 1_000_000;
+    const idA = botMod.guardarCastPendiente({ chatId: 1, agent: 'lector', prompt: 'p' }, t0);
+    assert.strictEqual(botMod.tomarCastPendiente(idA, 2, t0), null, 'Otro chat no puede consumir el pendiente');
+    assert.strictEqual(botMod.tomarCastPendiente(idA, 1, t0).agent, 'lector', 'El mismo chat sí');
+    assert.strictEqual(botMod.tomarCastPendiente(idA, 1, t0), null, 'Es de un solo uso');
+    const idB = botMod.guardarCastPendiente({ chatId: 1, agent: 'lector', prompt: 'p' }, t0);
+    assert.strictEqual(botMod.tomarCastPendiente(idB, 1, t0 + 11 * 60 * 1000), null, 'Vence a los 10 minutos');
+
+    const { bot, llamadas } = botDePrueba();
+    botMod.resetRuntimeState();
+    const comando = (text, updateId) => ({
+      update_id: updateId,
+      message: {
+        message_id: 1000 + updateId,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: Number(USUARIO_OK), type: 'private' },
+        from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+        text,
+        entities: [{ type: 'bot_command', offset: 0, length: text.split(' ')[0].length }]
+      }
+    });
+    const textos = () => llamadas.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
+
+    await bot.handleUpdate(comando('/cast', 400));
+    assert(textos().at(-1).includes('Uso'), '/cast sin argumentos explica el uso');
+    await bot.handleUpdate(comando('/cast escritor revisá esto', 401));
+    assert(textos().at(-1).includes('read/write'), '/cast de un agente read/write se rechaza sin encolar');
+    assert.strictEqual(queue.getQueueLength(), 0, 'Nada quedó en la cola');
+
+    await bot.handleUpdate({
+      update_id: 402,
+      callback_query: {
+        id: '402',
+        from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+        chat_instance: 'ci',
+        data: 'cast_ws:deadbeef:a1b2c3d4',
+        message: {
+          message_id: 1402,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: Number(USUARIO_OK), type: 'private' },
+          from: { id: 1, is_bot: true, first_name: 'bot' },
+          text: 'cast'
+        }
+      }
+    });
+    const respuestaCb = llamadas.filter((c) => c.method === 'answerCallbackQuery').at(-1);
+    assert(respuestaCb.payload.text.includes('expiró'), 'Un cast_ws sin pendiente se rechaza');
+    assert.strictEqual(queue.getQueueLength(), 0, 'Y no se despacha nada');
+
+    // El camino al fail-open: la sesión del chat apunta al hilo de un agente
+    // (por la vía que sea) y el usuario hace /resume. Correría el agente por
+    // defecto con escritura sobre la conversación del agente.
+    state.setConversationId(Number(USUARIO_OK), 'hilo-del-agente');
+    await bot.handleUpdate(comando('/resume seguí', 403));
+    assert(textos().at(-1).includes('hilo de un agente persistido'), '/resume se niega a retomar el hilo de un agente');
+    assert.strictEqual(queue.getQueueLength(), 0, 'No se encola la tarea');
+    assert.strictEqual(state.getConversationId(Number(USUARIO_OK)), null, 'Y la sesión envenenada del chat se limpia');
+
+    const callbackCast = (data, updateId) => ({
+      update_id: updateId,
+      callback_query: {
+        id: String(updateId),
+        from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+        chat_instance: 'ci',
+        data,
+        message: {
+          message_id: 1000 + updateId,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: Number(USUARIO_OK), type: 'private' },
+          from: { id: 1, is_bot: true, first_name: 'bot' },
+          text: 'plan'
+        }
+      }
+    });
+
+    // exec_plan con el hilo de un agente: se rechaza ANTES del acuse
+    // optimista, no después de haber anunciado «Plan Aprobado».
+    const antesExec = llamadas.length;
+    await bot.handleUpdate(callbackCast('exec_plan:hilo-del-agente', 404));
+    const trasExec = llamadas.slice(antesExec);
+    assert(trasExec.some((c) => c.method === 'answerCallbackQuery' && c.payload.text.includes('agente persistido')),
+      'exec_plan con el hilo de un agente se rechaza');
+    assert(!trasExec.some((c) => c.method === 'sendMessage'), 'Sin anunciar «Plan Aprobado»');
+    assert.strictEqual(queue.getQueueLength(), 0, 'Ni encolar nada');
+
+    const idCancel = botMod.guardarCastPendiente({ chatId: Number(USUARIO_OK), agent: 'lector', prompt: 'p' });
+    await bot.handleUpdate(callbackCast(`cast_cancel:${idCancel}`, 405));
+    assert.strictEqual(botMod.tomarCastPendiente(idCancel, Number(USUARIO_OK)), null, 'cast_cancel descarta el pendiente');
+    botMod.resetRuntimeState();
+  } finally {
+    process.env.USERPROFILE = homePrevio.USERPROFILE;
+    process.env.HOME = homePrevio.HOME;
+    if (homePrevio.HOME === undefined) delete process.env.HOME;
+    fs.rmSync(homeFalso, { recursive: true, force: true });
+  }
+}
+console.log('✔ Test 50 [FEAT-022]: /cast solo castea agentes read-only y nada retoma su hilo sin --agent');
+
+// Test 51: /help responde. Las viñetas llevaban backticks sin escapar dentro
+// del template literal: el archivo parseaba (`...` / plan < instrucción > `...`
+// es una expresión válida) pero cada /help tiraba ReferenceError y moría en
+// silencio. Roto desde 42d4b08 sin que ningún test lo notara.
+{
+  const { bot, llamadas } = botDePrueba();
+  resetRuntimeState();
+  const text = '/help';
+  await bot.handleUpdate({
+    update_id: 500,
+    message: {
+      message_id: 1500,
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: Number(USUARIO_OK), type: 'private' },
+      from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+      text,
+      entities: [{ type: 'bot_command', offset: 0, length: text.length }]
+    }
+  });
+  const ayuda = llamadas.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text).join('\n');
+  assert(ayuda.includes('/plan') && ayuda.includes('/cast'), '/help responde y lista los comandos, /cast incluido');
+  resetRuntimeState();
+}
+console.log('✔ Test 51: /help responde con la lista de comandos');
 
 // Limpieza: solo el directorio temporal de test
 try {

@@ -48,7 +48,9 @@ export function resolveAgyBin() {
   return binName;
 }
 
-const AGY_BIN = resolveAgyBin();
+// Exportado para el cast (FEAT-022): `verificarResuelve` necesita el binario, y
+// resolverlo otra vez costaría otro `where.exe` síncrono.
+export const AGY_BIN = resolveAgyBin();
 
 // Margen entre la terminación suave y la forzada al abortar una tarea.
 const SIGKILL_GRACE_MS = 5000;
@@ -214,7 +216,6 @@ export function runAgyTask(options = {}) {
 
   const policy = loadPolicy(cwd);
   const useSandbox = sandbox === undefined ? policy.sandbox : Boolean(sandbox);
-  const timeoutMs = (timeoutMinutes + 1) * 60 * 1000;
 
   // Construcción de argumentos CLI
   const cliArgs = [
@@ -247,6 +248,50 @@ export function runAgyTask(options = {}) {
 
   cliArgs.push('-p', buildGuardrailedPrompt(policy, prompt));
 
+  return lanzarAgy(cliArgs, {
+    cwd,
+    timeoutMinutes,
+    conversationId,
+    onSpawn,
+    descripcion: `modo: ${mode}, sandbox: ${useSandbox ? 'sí' : 'no'}, conv: ${conversationId || 'nueva'}, cwd: ${cwd}`
+  });
+}
+
+/**
+ * FEAT-022 — Ejecuta argumentos ya armados. El cast de un agente persistido los
+ * arma en `mcp-server/agents/cast.js` (con `--agent` y `--mode plan`), así que
+ * aquí no se añaden guardrails de texto: el `agent.md` es el system prompt, y su
+ * allowlist más `--mode plan` son los controles reales.
+ *
+ * Mismo spawn que `runAgyTask` —entorno saneado, árbol terminable, prompt largo
+ * a fichero— y devuelve la forma que espera `castear()`, que es la de
+ * `executeAgy` del servidor MCP.
+ */
+export async function runAgyArgs(cliArgs, {
+  cwd = resolveWorkspace(),
+  timeoutMinutes = parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
+  onSpawn = null
+} = {}) {
+  const r = await lanzarAgy(['--print-timeout', `${timeoutMinutes}m`, ...cliArgs], {
+    cwd,
+    timeoutMinutes,
+    onSpawn,
+    descripcion: `cast, cwd: ${cwd}`
+  });
+  return {
+    success: Boolean(r.success),
+    cancelled: Boolean(r.cancelled),
+    data: r.data || null,
+    rawOutput: r.rawOutput || r.stdout || '',
+    error: r.error || null
+  };
+}
+
+/**
+ * El ciclo de vida del proceso hijo, común a `runAgyTask` y `runAgyArgs`.
+ */
+function lanzarAgy(cliArgs, { cwd, timeoutMinutes, conversationId = null, onSpawn = null, descripcion = '' }) {
+  const timeoutMs = (timeoutMinutes + 1) * 60 * 1000;
   const { args: finalArgs, cleanup: limpiarPrompt } = offloadLargePrompt(cliArgs);
 
   return new Promise((resolve) => {
@@ -261,7 +306,7 @@ export function runAgyTask(options = {}) {
       });
     };
 
-    console.log(`[executor] Ejecutando: ${AGY_BIN} (modo: ${mode}, sandbox: ${useSandbox ? 'sí' : 'no'}, conv: ${conversationId || 'nueva'}, cwd: ${cwd})`);
+    console.log(`[executor] Ejecutando: ${AGY_BIN} (${descripcion})`);
 
     const startedAt = Date.now();
     // Entorno saneado: `agy` corre con `--dangerously-skip-permissions` y puede
