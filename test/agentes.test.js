@@ -102,6 +102,26 @@ async function main() {
       check('desinstalar algo inexistente no revienta',
         registro.desinstalarAgente('fantasma', home) === false);
 
+      // Addendum: acota el SKILL, prevalece sobre él y no se pierde en silencio.
+      registro.instalarAgente('esceptico', { skill: 'agency-code-reviewer', addendum: 'No corras comandos.' }, home);
+      const rutaEsc = path.join(home, '.gemini', 'config', 'agents', 'esceptico', 'agent.md');
+      let mdEsc = fs.readFileSync(rutaEsc, 'utf8');
+      check('el addendum llega al agent.md', mdEsc.includes('No corras comandos.'));
+      check('el addendum va después del cuerpo del SKILL',
+        mdEsc.indexOf('No corras comandos.') > mdEsc.indexOf('Opinás, no editás'));
+      check('el addendum se persiste en el registro',
+        registro.leerRegistro(home).agents['esceptico'].addendum === 'No corras comandos.');
+
+      registro.instalarAgente('esceptico', { skill: 'agency-code-reviewer' }, home);
+      mdEsc = fs.readFileSync(rutaEsc, 'utf8');
+      check('re-registrar sin addendum conserva el anterior', mdEsc.includes('No corras comandos.'));
+
+      registro.instalarAgente('esceptico', { skill: 'agency-code-reviewer', addendum: '' }, home);
+      mdEsc = fs.readFileSync(rutaEsc, 'utf8');
+      check('addendum vacío lo borra a propósito',
+        !mdEsc.includes('No corras comandos.') && registro.leerRegistro(home).agents['esceptico'].addendum === null);
+      check('sin addendum no queda el encabezado de adaptación', !mdEsc.includes('Adaptacion a este proyecto'));
+
       let tiro = false;
       try { registro.instalarAgente('reviewer', { skill: 'no-existe' }, home); } catch { tiro = true; }
       check('registrar con un SKILL inexistente falla', tiro);

@@ -173,16 +173,39 @@ function instalarAgente(nombre, opciones = {}, homeDir = os.homedir()) {
       ].join('\n')
     : '';
 
+  // El addendum acota un SKILL escrito para otro contexto (uno que ordena
+  // correr comandos, o citar un estandar que este repo no tiene). Va al final
+  // porque tiene que prevalecer sobre el cuerpo. Un re-register sin addendum
+  // conserva el anterior: perderlo en silencio devolveria al agente las
+  // instrucciones que se le quisieron sacar. `''` lo borra a proposito.
+  const registro = leerRegistro(homeDir);
+  const previo = registro.agents[nombre];
+  const addendum = typeof opciones.addendum === 'string'
+    ? opciones.addendum.trim()
+    : (previo && previo.skill === nombreSkill && previo.addendum) || '';
+
+  const bloqueAddendum = addendum
+    ? [
+        '',
+        '## Adaptacion a este proyecto',
+        '',
+        'Lo que sigue prevalece sobre todo lo anterior cuando se contradicen.',
+        '',
+        addendum,
+        ''
+      ].join('\n')
+    : '';
+
   const destino = path.join(dirAgentesAgy(homeDir), nombre);
   fs.mkdirSync(destino, { recursive: true });
   const rutaAgente = path.join(destino, 'agent.md');
-  fs.writeFileSync(rutaAgente, `${frontmatter}\n${encabezado}${aviso}\n${cuerpo}\n`, 'utf8');
+  fs.writeFileSync(rutaAgente, `${frontmatter}\n${encabezado}${aviso}\n${cuerpo}\n${bloqueAddendum}`, 'utf8');
 
-  const registro = leerRegistro(homeDir);
   registro.agents[nombre] = {
     skill: nombreSkill,
     read_only: readOnly,
     tools,
+    addendum: addendum || null,
     project_id: opciones.projectId || null,
     agent_md: rutaAgente,
     registrado: new Date().toISOString()

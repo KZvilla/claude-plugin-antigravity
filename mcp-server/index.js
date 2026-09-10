@@ -1300,6 +1300,10 @@ const TOOLS = [
           type: 'string',
           description: 'SKILL to derive the identity from, e.g. "agency-code-reviewer". Required for action:"register". Use action:"skills" to see what is installed.'
         },
+        addendum: {
+          type: 'string',
+          description: 'For action:"register". Project-specific text appended to the agent.md after the SKILL body, taking precedence over it. Use it to constrain a SKILL written for another context (e.g. one that orders running commands, or citing a standard this repo lacks). Re-registering without it keeps the previous addendum; pass "" to remove it.'
+        },
         read_only: {
           type: 'boolean',
           description: 'For action:"register". When true (default), the agent gets a tool allowlist without write_to_file, replace_file_content or run_command, and every cast also runs with --mode plan. Note this does not remove call_mcp_tool, which Antigravity injects unconditionally - a read-only agent still reaches every MCP server you have configured.'
@@ -2811,7 +2815,8 @@ async function handleToolCall(name, args) {
           entrada = registroAgentes.instalarAgente(args.agent, {
             skill: args.skill,
             readOnly: args.read_only !== false,
-            projectId: args.project_id
+            projectId: args.project_id,
+            addendum: args.addendum
           }, homeDir);
         } catch (err) {
           return error(`No se pudo registrar el agente: ${err.message}`);
@@ -2827,6 +2832,7 @@ async function handleToolCall(name, args) {
         salida += `- Acceso: ${entrada.read_only ? '`read-only`' : '`read/write`'}\n`;
         salida += `- Tools nativas: ${entrada.tools.map(t => `\`${t}\``).join(', ')}\n`;
         salida += `- Definición: \`${entrada.agent_md}\`\n`;
+        salida += `- Addendum de proyecto: ${entrada.addendum ? `sí (${entrada.addendum.length} caracteres)` : 'no'}\n`;
         salida += `- Antigravity lo resuelve: ${verificacion.ok ? '✅ sí' : '⚠️ no'}\n`;
         if (!verificacion.ok) salida += `\n⚠️ ${verificacion.motivo}\n`;
         if (entrada.read_only && servers.length) {
