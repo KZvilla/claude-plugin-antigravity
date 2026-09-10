@@ -1,10 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { Bot, InlineKeyboard } from 'grammy';
 import { autoRetry } from '@grammyjs/auto-retry';
-import { runAgyTask, getAgyStatus, resolveWorkspace, resolveExtraDirs } from './executor.js';
+import { runAgyTask, runAgyArgs, AGY_BIN, getAgyStatus, resolveWorkspace, resolveExtraDirs } from './executor.js';
 import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk, formatElapsed, finalProgressLabel } from './formatter.js';
 import { redactSecrets } from './policy.js';
 import { startLogRotation } from './logrotate.js';
@@ -30,6 +32,15 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// FEAT-022 — `/cast` usa la MISMA orquestación que la tool MCP `cast_agent`,
+// incluido el guardarrail contra el fail-open de `agy --agent`. El daemon corre
+// siempre desde un clon del repo (ver Assert-DirectorioEstable en daemon.ps1),
+// así que `mcp-server/` está al lado. Son módulos CommonJS sin efectos al
+// cargarse.
+const requireCjs = createRequire(import.meta.url);
+const castAgentes = requireCjs('../mcp-server/agents/cast.js');
+const registroAgentes = requireCjs('../mcp-server/agents/registry.js');
 
 // ==============================================================================
 // 1. Carga de Variables de Entorno (.env)
@@ -187,6 +198,30 @@ let cancelCurrent = null;
 // que operan fuera de cualquier `Context` vivo.
 let botRef = null;
 
+// FEAT-022 — Casts esperando que el usuario elija workspace. `callback_data`
+// tiene 64 bytes, así que el botón lleva un id corto y el pedido queda acá.
+// En memoria a propósito, como la cola: un reinicio los pierde y el usuario
+// vuelve a mandar el /cast.
+const CAST_PENDIENTE_TTL_MS = 10 * 60 * 1000;
+const castsPendientes = new Map();
+
+export function guardarCastPendiente({ chatId, agent, prompt }, ahora = Date.now()) {
+  for (const [id, p] of castsPendientes) {
+    if (ahora - p.creado > CAST_PENDIENTE_TTL_MS) castsPendientes.delete(id);
+  }
+  const id = crypto.randomBytes(4).toString('hex');
+  castsPendientes.set(id, { chatId: String(chatId), agent, prompt, creado: ahora });
+  return id;
+}
+
+/** Consume un cast pendiente: un solo uso, del mismo chat y sin vencer. */
+export function tomarCastPendiente(id, chatId, ahora = Date.now()) {
+  const pendiente = castsPendientes.get(id);
+  if (!pendiente || pendiente.chatId !== String(chatId)) return null;
+  castsPendientes.delete(id);
+  return ahora - pendiente.creado > CAST_PENDIENTE_TTL_MS ? null : pendiente;
+}
+
 /**
  * Reinicia el estado de ejecución. Solo para los tests: cada caso necesita
  * partir de una cola vacía y sin tarea en curso.
@@ -196,6 +231,7 @@ export function resetRuntimeState() {
   currentTask = null;
   cancelCurrent = null;
   clearQueue();
+  castsPendientes.clear();
 }
 
 /**
@@ -268,9 +304,40 @@ async function processTaskQueue() {
       botRef.api.sendChatAction(chatId, 'typing').catch(() => {});
     }, 4500);
 
-    const etiqueta = mode === 'plan' ? '🧠 Generando plan' : '⚙️ Ejecutando tarea';
+    const etiqueta = task.kind === 'cast'
+      ? `🎭 ${task.agent} trabajando`
+      : (mode === 'plan' ? '🧠 Generando plan' : '⚙️ Ejecutando tarea');
     await updateProgress(etiqueta);
     progressInterval = setInterval(() => { updateProgress(etiqueta); }, 15000);
+
+    // FEAT-022 — Rama propia, separada a propósito del cierre de abajo: ese
+    // cierre guarda el hilo como sesión del chat y ofrece `exec_plan`, y
+    // cualquiera de los dos retomaría el hilo del agente SIN `--agent`, o sea
+    // con el agente por defecto y escritura completa.
+    if (task.kind === 'cast') {
+      // `/cancel` tiene que valer también antes del spawn: verificar contra
+      // `agy agents` y rehidratar la memoria llevan segundos, y sin esto el
+      // bot contestaba que no había nada en curso mientras el cast avanzaba.
+      let canceladoAntesDelSpawn = false;
+      cancelCurrent = () => { canceladoAntesDelSpawn = true; return true; };
+      const cast = await castAgentes.castear({
+        agent: task.agent,
+        prompt,
+        cwd: task.cwd,
+        agyBin: AGY_BIN,
+        ejecutar: (cliArgs, op) => (canceladoAntesDelSpawn
+          ? Promise.resolve({ success: false, cancelled: true, data: null, error: 'Cast cancelado antes de lanzar agy.' })
+          : runAgyArgs(cliArgs, op)),
+        opciones: { soloLectura: true, onSpawn: (cancel) => { cancelCurrent = cancel; } }
+      });
+      clearInterval(typingInterval);
+      typingInterval = null;
+      clearInterval(progressInterval);
+      progressInterval = null;
+      await updateProgress(finalProgressLabel({ success: cast.ok, cancelled: cast.cancelled }), ' ');
+      await responderCast(ctx, task, cast, (Date.now() - startedAt) / 1000);
+      return;
+    }
 
     const result = await runAgyTask({
       prompt,
@@ -351,6 +418,7 @@ async function processTaskQueue() {
 export function avisoDeDespacho({ habiaTareaEnCurso, posEnCola, mode }) {
   const encolada = habiaTareaEnCurso || posEnCola > 1;
   if (!encolada) {
+    if (mode === 'cast') return '🎭 Casteando al agente...';
     return mode === 'plan'
       ? '🧠 Generando plan arquitectónico...'
       : '⚙️ Ejecutando tarea con Antigravity...';
@@ -372,6 +440,16 @@ async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = nu
     clearConversationId(chatId);
     activeConvId = null;
   }
+
+  // FEAT-022 — Punto único de defensa: el hilo de un agente persistido solo se
+  // retoma con `--agent`, y esta vía no lo pasa. Cubre `/resume`, el texto
+  // suelto y `exec_plan`, cuyo `callback_data` puede fabricarlo un cliente.
+  if (activeConvId && castAgentes.esHiloDeAgente(activeConvId)) {
+    if (forceConvId === null) clearConversationId(chatId);
+    await ctx.reply('⛔ Esa conversación es el hilo de un agente persistido: por esta vía correría sin su identidad y con escritura. Usá /cast <agente> <pedido>.');
+    return;
+  }
+
   const task = { ctx, chatId, prompt, mode, conversationId: activeConvId, statusMessageId: null };
 
   const habiaTareaEnCurso = isProcessingTask;
@@ -392,6 +470,97 @@ async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = nu
   // `if (isProcessingTask) return`, así que llamarlo de más no cuesta nada,
   // mientras que llamarlo de menos deja la cola parada sin nadie que la drene.
   runQueue();
+}
+
+// ==============================================================================
+// FEAT-022 — Cast de agentes persistidos
+// ==============================================================================
+
+/**
+ * ¿Se puede castear este agente desde el chat? Solo registrados y read-only:
+ * un agente read/write disparado desde el celular escribiría sin que nadie vea
+ * el diff antes. Pura salvo por la lectura del registro, para poder probarla.
+ */
+export function validarCastDesdeChat(nombre, homeDir = os.homedir()) {
+  const agentes = registroAgentes.leerRegistro(homeDir).agents;
+  const disponibles = Object.entries(agentes).filter(([, a]) => a && a.read_only).map(([n]) => n);
+  const lista = disponibles.length
+    ? `\n\nDisponibles: ${disponibles.map((n) => `\`${n}\``).join(', ')}`
+    : '\n\nNo hay agentes read-only registrados. Se registran desde Claude Code con `cast_agent` action:"register".';
+
+  // El nombre solo se repite si tiene forma de nombre: es texto del usuario y
+  // va dentro de Markdown.
+  if (!registroAgentes.nombreValido(nombre) || !agentes[nombre]) {
+    const cual = registroAgentes.nombreValido(nombre) ? `\`${nombre}\`` : 'Ese nombre';
+    return { ok: false, mensaje: `⚠️ ${cual} no es un agente registrado.${lista}` };
+  }
+  if (!agentes[nombre].read_only) {
+    return { ok: false, mensaje: `⛔ \`${nombre}\` es read/write. Desde Telegram solo se castean agentes read-only.${lista}` };
+  }
+  return { ok: true };
+}
+
+export function buildCastWorkspacesKeyboard(castId, workspaces) {
+  const keyboard = new InlineKeyboard();
+  for (const ws of workspaces) {
+    keyboard.text(`📁 ${ws.displayName}`, `cast_ws:${castId}:${ws.id}`).row();
+  }
+  keyboard.text('❌ Cancelar', `cast_cancel:${castId}`);
+  return keyboard;
+}
+
+/** Pie de la respuesta: quién respondió, sobre qué, y si la memoria sirvió. */
+export function formatearPieDeCast(task, cast, segundos) {
+  const memoria = !cast.memoria?.usada
+    ? 'desactivada'
+    : (cast.memoria.recuperada ? 'recuperada' : `sin contexto (${cast.memoria.motivo || 'no disponible'})`);
+  const partes = [
+    `🎭 ${task.agent}`,
+    `📁 ${task.workspaceName}`,
+    segundos ? formatElapsed(segundos) : null,
+    `memoria: ${memoria}`,
+    `criterio guardado: ${cast.memoria?.guardadas || 0}`
+  ];
+  return `\n\n—\n${partes.filter(Boolean).join(' · ')}`;
+}
+
+/**
+ * Encola un cast. No lee `getConversationId(chatId)`: el cast no hereda la
+ * sesión del chat, su hilo lo resuelve `castear()` desde el estado del agente.
+ */
+async function dispatchCast(ctx, { agent, prompt, cwd, workspaceName }) {
+  const chatId = ctx.chat.id;
+  const task = {
+    ctx, chatId, kind: 'cast', agent, prompt, cwd, workspaceName,
+    mode: 'cast', conversationId: null, statusMessageId: null
+  };
+
+  const habiaTareaEnCurso = isProcessingTask;
+  const posEnCola = enqueueTask(task);
+  try {
+    const sent = await ctx.reply(avisoDeDespacho({ habiaTareaEnCurso, posEnCola, mode: 'cast' }));
+    task.statusMessageId = sent?.message_id ?? null;
+  } catch (err) {
+    console.error(`[cast] No se pudo enviar el aviso inicial: ${redactSecrets(err.message)}`);
+  }
+  runQueue();
+}
+
+/** Sin teclado y sin `setConversationId`: ver la rama `cast` de processTaskQueue. */
+async function responderCast(ctx, task, cast, segundos) {
+  if (cast.cancelled) {
+    console.log('[cast] Cancelado por el usuario.');
+    return;
+  }
+  if (!cast.ok) {
+    let msg = `❌ *Falló el cast de* \`${task.agent}\`:\n\n${redactSecrets(cast.error)}`;
+    if (cast.conversationId) msg += '\n\nEl hilo del agente quedó guardado: el próximo /cast lo retoma.';
+    await notifyChat(task.chatId, msg, { parse_mode: 'Markdown' });
+    return;
+  }
+  // El agente lee el disco: si cita un `.env`, esto evita al menos que el
+  // token del bot acabe en el chat y en `daemon.log`.
+  await replyWithSmartChunks(ctx, redactSecrets(cast.respuesta) + formatearPieDeCast(task, cast, segundos));
 }
 
 // ==============================================================================
@@ -526,6 +695,7 @@ Puente móvil autónomo conectado a tu entorno local.
 • `/run <instrucción>` — Abre una sesión nueva y ejecuta, permitiendo edición de código y tests.
 • `/resume <instrucción>` — Continúa la sesión de trabajo actual.
 • `/claude` — Inicia o gestiona sesiones de Claude Code (\`/claude stop\`, \`/claude clean\`, \`/claude status\`).
+• \`/cast <agente> <pedido>\` — Consulta a un agente persistido de solo lectura; eliges el proyecto con un botón.
 • `/status` — Consulta estado del binario, versión, sesión activa y política de permisos.
 • `/queue` — Muestra la tarea en curso y las encoladas.
 • `/cancel` — Aborta la tarea en curso y vacía la cola.
@@ -782,6 +952,30 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
     await dispatchTask(ctx, prompt, 'accept-edits');
   });
 
+  // FEAT-022 — `/cast <agente> <pedido>`. Valida en el acto, sin encolar, y
+  // pide el proyecto con el mismo listado de `/claude` (getKnownWorkspaces):
+  // nunca una ruta escrita a mano.
+  bot.command('cast', async (ctx) => {
+    const partes = (ctx.match || '').trim().match(/^(\S+)\s+([\s\S]+)$/);
+    if (!partes) {
+      return sendSafeChunk(ctx, '⚠️ Uso: `/cast <agente> <pedido>`\nEjemplo: `/cast lagrange-reviewer Revisá el último commit`');
+    }
+    const [, agente, pedido] = partes;
+
+    const validacion = validarCastDesdeChat(agente);
+    if (!validacion.ok) return sendSafeChunk(ctx, validacion.mensaje);
+
+    const workspaces = getKnownWorkspaces();
+    if (workspaces.length === 0) {
+      return sendSafeChunk(ctx, '⚠️ No se encontraron workspaces registrados en `~/.claude.json` con carpetas existentes en tu equipo.');
+    }
+
+    const castId = guardarCastPendiente({ chatId: ctx.chat.id, agent: agente, prompt: pedido.trim() });
+    await sendSafeChunk(ctx, `🎭 *Cast de* \`${agente}\`\n\n¿Sobre qué proyecto trabaja?`, {
+      reply_markup: buildCastWorkspacesKeyboard(castId, workspaces)
+    });
+  });
+
   bot.command('cancel', async (ctx) => {
     const discarded = clearQueue();
     const cancelled = typeof cancelCurrent === 'function' ? cancelCurrent() : false;
@@ -823,6 +1017,38 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
 
   bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data;
+
+    // FEAT-022 — Elección de workspace para un /cast pendiente.
+    if (data.startsWith('cast_ws:') || data.startsWith('cast_cancel:')) {
+      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+
+      if (data.startsWith('cast_cancel:')) {
+        tomarCastPendiente(data.slice('cast_cancel:'.length), ctx.chat?.id);
+        await ctx.answerCallbackQuery({ text: 'Cast descartado' });
+        return;
+      }
+
+      const partes = data.match(/^cast_ws:([0-9a-f]{8}):([A-Za-z0-9_-]{1,32})$/);
+      const pendiente = partes ? tomarCastPendiente(partes[1], ctx.chat?.id) : null;
+      if (!pendiente) {
+        await ctx.answerCallbackQuery({ text: 'Este cast ya no está activo o expiró. Volvé a enviarlo.' });
+        return;
+      }
+      const ws = getKnownWorkspaces().find((w) => String(w.id) === partes[2]);
+      if (!ws) {
+        await ctx.answerCallbackQuery({ text: 'Proyecto no encontrado o ya no existe en disco.' });
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: `Casteando sobre ${ws.name}...` });
+      await dispatchCast(ctx, {
+        agent: pendiente.agent,
+        prompt: pendiente.prompt,
+        cwd: ws.path,
+        workspaceName: ws.displayName || ws.name
+      });
+      return;
+    }
 
     if (data.startsWith('ask:')) {
       // Formato: ask:<askId>:<optionIndex>
@@ -875,6 +1101,13 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
       // arbitraria. Se exige la forma de un identificador antes de usarlo.
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(convId)) {
         await ctx.answerCallbackQuery({ text: 'Identificador de plan inválido.' });
+        return;
+      }
+
+      // FEAT-022 — Antes del acuse «Aprobado». `dispatchTask` también lo
+      // rechaza, pero para entonces el usuario ya leyó que se estaba ejecutando.
+      if (castAgentes.esHiloDeAgente(convId)) {
+        await ctx.answerCallbackQuery({ text: 'Ese hilo es de un agente persistido: no se ejecuta por esta vía.' });
         return;
       }
 

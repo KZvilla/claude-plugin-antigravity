@@ -508,6 +508,71 @@ async function main() {
     }
   });
 
+  // ------------------------------------------------------------------
+  await group('cast compartido entre la tool MCP y /cast de Telegram (FEAT-022)', async () => {
+    const cast = require('../mcp-server/agents/cast.js');
+    const home = crearHome();
+    try {
+      registro.instalarAgente('lector', { skill: 'agency-code-reviewer' }, home);
+      registro.instalarAgente('escritor', { skill: 'agency-code-reviewer', readOnly: false }, home);
+
+      const llamadas = [];
+      const ejecutar = async (args, op) => {
+        llamadas.push({ args, op });
+        return { success: true, data: { response: 'ok del agente', conversation_id: 'hilo-1', duration_seconds: 2 } };
+      };
+      const base = { cwd: home, agyBin: 'agy', ejecutar, homeDir: home };
+      const sinMemoria = { memory: false };
+
+      let tiro = false;
+      try { await cast.castear({ ...base, agyBin: undefined, agent: 'lector', prompt: 'x' }); } catch { tiro = true; }
+      check('sin agyBin lanza en vez de castear sin verificar', tiro);
+
+      let r = await cast.castear({ ...base, agent: 'fantasma', prompt: 'x', opciones: sinMemoria });
+      check('un agente sin registrar no se castea', !r.ok && r.noRegistrado && llamadas.length === 0);
+
+      r = await cast.castear({ ...base, agent: 'escritor', prompt: 'x', opciones: { ...sinMemoria, soloLectura: true } });
+      check('soloLectura rechaza un agente read/write sin ejecutar nada', !r.ok && llamadas.length === 0);
+
+      salidaAgy = { err: null, stdout: 'otro\n' };
+      r = await cast.castear({ ...base, agent: 'lector', prompt: 'x', opciones: sinMemoria });
+      check('si agy no resuelve el agente, no se ejecuta nada', !r.ok && llamadas.length === 0);
+      check('y el resultado distingue que no llegó a ejecutarse', !('conversationId' in r));
+
+      salidaAgy = { err: new Error('timeout'), stdout: '' };
+      r = await cast.castear({ ...base, agent: 'lector', prompt: 'x', opciones: sinMemoria });
+      check('si `agy agents` no responde, falla cerrado', !r.ok && llamadas.length === 0);
+
+      salidaAgy = { err: null, stdout: 'lector\nescritor\n' };
+      r = await cast.castear({ ...base, agent: 'lector', prompt: 'revisá', opciones: sinMemoria });
+      const args = llamadas[0].args;
+      check('pasa --agent con el nombre', args[args.indexOf('--agent') + 1] === 'lector');
+      check('un read-only corre con --mode plan', args[args.indexOf('--mode') + 1] === 'plan');
+      check('el primer cast no retoma ningún hilo', !args.includes('--conversation'));
+      check('devuelve la respuesta del agente', r.ok && r.respuesta === 'ok del agente');
+      check('guarda el hilo en el estado del agente', estado.hiloDe('lector', home) === 'hilo-1');
+
+      await cast.castear({ ...base, agent: 'lector', prompt: 'seguí', opciones: sinMemoria });
+      const args2 = llamadas[1].args;
+      check('el segundo cast retoma el hilo guardado', args2[args2.indexOf('--conversation') + 1] === 'hilo-1');
+
+      check('esHiloDeAgente reconoce el hilo de un agente', cast.esHiloDeAgente('hilo-1', home));
+      check('y no uno ajeno ni uno vacío',
+        !cast.esHiloDeAgente('otro-hilo', home) && !cast.esHiloDeAgente(null, home));
+
+      r = await cast.castear({
+        ...base,
+        agent: 'lector',
+        prompt: 'x',
+        ejecutar: async () => ({ success: false, cancelled: true, data: null, error: 'cancelado' }),
+        opciones: sinMemoria
+      });
+      check('un cast cancelado se informa como cancelado, no como error', !r.ok && r.cancelled === true);
+    } finally {
+      borrar(home);
+    }
+  });
+
   report();
 }
 
