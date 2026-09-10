@@ -1012,7 +1012,8 @@ console.log('✔ Test 37 [SEC-003]: la subida de ficheros redacta secretos y no 
   assert.strictEqual(ws2.name, 'frontend');
   assert(ws1.displayName.includes('app1'), 'ws1 debe estar desambiguado con su carpeta padre app1');
   assert(ws2.displayName.includes('app2'), 'ws2 debe estar desambiguado con su carpeta padre app2');
-  assert.strictEqual(ws3.displayName, 'landing', 'ws3 sin colisión conserva su nombre directo');
+  assert(ws3.displayName.startsWith('landing (') && ws3.displayName.endsWith(')'),
+    'ws3 sin colisión también lleva su carpeta padre: «frontend» a secas no decía de qué repo era');
 
   // 3. Comprobar que los IDs sean compactos y estables (hash de 8 caracteres) y mantengan numericId
   assert(workspaces.every((w) => typeof w.id === 'string' && /^[0-9a-f]{8}$/.test(w.id)), 'Los IDs deben ser hashes hexadecimales estables de 8 caracteres');

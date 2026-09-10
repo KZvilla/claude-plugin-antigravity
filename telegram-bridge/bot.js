@@ -328,7 +328,7 @@ async function processTaskQueue() {
         ejecutar: (cliArgs, op) => (canceladoAntesDelSpawn
           ? Promise.resolve({ success: false, cancelled: true, data: null, error: 'Cast cancelado antes de lanzar agy.' })
           : runAgyArgs(cliArgs, op)),
-        opciones: { soloLectura: true, onSpawn: (cancel) => { cancelCurrent = cancel; } }
+        opciones: { soloLectura: true, alcance: task.cwd, onSpawn: (cancel) => { cancelCurrent = cancel; } }
       });
       clearInterval(typingInterval);
       typingInterval = null;
@@ -971,7 +971,7 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
     }
 
     const castId = guardarCastPendiente({ chatId: ctx.chat.id, agent: agente, prompt: pedido.trim() });
-    await sendSafeChunk(ctx, `🎭 *Cast de* \`${agente}\`\n\n¿Sobre qué proyecto trabaja?`, {
+    await sendSafeChunk(ctx, `🎭 *Cast de* \`${agente}\`\n\n¿Sobre qué proyecto trabaja?\n\nSe le pide que lea solo esa carpeta, pero es una instrucción, no un permiso: puede leer cualquier ruta de tu usuario.`, {
       reply_markup: buildCastWorkspacesKeyboard(castId, workspaces)
     });
   });

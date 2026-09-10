@@ -560,6 +560,12 @@ async function main() {
       check('y no uno ajeno ni uno vacío',
         !cast.esHiloDeAgente('otro-hilo', home) && !cast.esHiloDeAgente(null, home));
 
+      await cast.castear({ ...base, agent: 'lector', prompt: 'mirá', opciones: { ...sinMemoria, alcance: 'C:/repo/front' } });
+      const promptConAlcance = llamadas.at(-1).args.at(-1);
+      check('con alcance, el prompt le pide leer solo la carpeta elegida',
+        promptConAlcance.includes('<alcance>') && promptConAlcance.includes('C:/repo/front'));
+      check('sin alcance no se agrega nada', !llamadas[0].args.at(-1).includes('<alcance>'));
+
       r = await cast.castear({
         ...base,
         agent: 'lector',

@@ -348,6 +348,15 @@ function Invoke-RotateLog {
 
 function Invoke-Start {
     if (-not (Get-BridgeTask)) { Fail "La tarea no está registrada. Ejecuta: .\daemon.ps1 install" }
+    # Con un bot vivo, el arranque nuevo choca contra su bridge.lock y no deja
+    # rastro: el viejo sigue atendiendo con el código anterior y parece que
+    # «start» funcionó.
+    $lock = Get-LockInfo
+    if ($lock -and (Get-Process -Id $lock.pid -ErrorAction SilentlyContinue)) {
+        Warn "El bot ya está corriendo (PID $($lock.pid)); no se arranca otro."
+        Info 'Para que tome código nuevo: .\daemon.ps1 stop y luego start.'
+        return
+    }
     Invoke-RotateLog
     Start-ScheduledTask -TaskName $TaskName
     Ok 'Tarea arrancada.'
@@ -355,8 +364,13 @@ function Invoke-Start {
 
 function Invoke-Stop {
     if (-not (Get-BridgeTask)) { Fail "La tarea no está registrada." }
-    Stop-ScheduledTask -TaskName $TaskName
-    Ok 'Tarea detenida.'
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    # Stop-ScheduledTask no alcanza. En modo oculto la tarea solo lanza
+    # wscript.exe, que termina en el acto: la tarea queda Ready y el bot vive
+    # por su cuenta, sin instancia que detener. El dueño real es el PID del
+    # lockfile, el mismo criterio que usa install.
+    Wait-BotStopped -TimeoutSeconds 3
+    Ok 'Bot detenido.'
 }
 
 function Invoke-Status {

@@ -101,6 +101,17 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
     ? `<contexto-recuperado>\nLo que ya sabés de trabajos anteriores:\n\n${contexto}\n</contexto-recuperado>\n\n${prompt}`
     : prompt;
 
+  // El workspace elegido fija desde donde arranca agy, no que puede leer: no
+  // hay allowlist de rutas en el CLI, y un agente read-only alcanza cualquier
+  // ruta legible por el usuario (visto: arrancado en un frontend, reviso el
+  // backend en WSL). Esto es una instruccion, no un control. La usa el bot,
+  // donde la respuesta sale del equipo.
+  if (opciones.alcance) {
+    promptCast += `\n\n<alcance>\nEl usuario eligio trabajar sobre ${opciones.alcance}. `
+      + 'Lee solo dentro de esa carpeta. Si para responder necesitas otra ruta (otro repo, WSL, '
+      + 'tu home), no la leas: decí cual y para que, y que el usuario decida.\n</alcance>';
+  }
+
   // Sin esto el agente no acumula nada: la cola estructurada es lo que llena
   // `decisions`, el unico canal que rehidrata con el `agent_id` puesto. Con la
   // memoria apagada no se pide: seria pagar tokens por algo que no se guarda.

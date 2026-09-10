@@ -354,17 +354,11 @@ export function getProjectAllowlist({
   const validWorkspaces = Array.from(workspacesByDedup.values())
     .filter((ws) => !requireTrust || ws.hasTrustDialogAccepted !== false);
 
-  // Contar frecuencias del nombre base para desambiguar displayName si hay colisiones
-  const nameCounts = new Map();
-  for (const ws of validWorkspaces) {
-    nameCounts.set(ws.name, (nameCounts.get(ws.name) || 0) + 1);
-  }
-
   return validWorkspaces.map((ws, index) => {
-    const hasCollision = (nameCounts.get(ws.name) || 0) > 1;
-    const displayName = hasCollision && ws.parent
-      ? `${ws.name} (${ws.parent})`
-      : ws.name;
+    // La carpeta padre va siempre, no solo ante colisiones: un botón que dice
+    // «frontend» no dice de qué repo es, y el nombre de la carpeta de un
+    // subproyecto rara vez lo identifica sin su padre.
+    const displayName = ws.parent ? `${ws.name} (${ws.parent})` : ws.name;
 
     // F-05: Generar un ID determinista y compacto (8 chars hex) derivado de la ruta normalizada
     const hashId = crypto.createHash('sha256').update(ws.path.toLowerCase()).digest('hex').slice(0, 8);
