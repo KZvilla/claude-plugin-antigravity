@@ -11,29 +11,30 @@
  * muere de golpe.
  */
 
-const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { leerJson, guardarJson } = require('./almacen.js');
 
 function rutaEstado(homeDir = os.homedir()) {
   return path.join(homeDir, '.claude', 'antigravity-agents-state.json');
 }
 
+/**
+ * Devuelve el estado con una marca `_ilegible` no enumerable cuando el archivo
+ * existe pero no se pudo interpretar. Los lectores pueden ignorarla — un
+ * estado ilegible se comporta como vacío y no le voltea el cast a nadie —, pero
+ * los que escriben tienen que respetarla: sin eso, un read-modify-write sobre
+ * un archivo truncado borraba los hilos de todos los demás agentes.
+ */
 function leerEstado(homeDir = os.homedir()) {
-  try {
-    const datos = JSON.parse(fs.readFileSync(rutaEstado(homeDir), 'utf8'));
-    return datos && typeof datos.agents === 'object' && datos.agents ? datos : { agents: {} };
-  } catch {
-    return { agents: {} };
-  }
+  const { datos, ilegible } = leerJson(rutaEstado(homeDir));
+  const estado = datos && typeof datos.agents === 'object' && datos.agents ? datos : { agents: {} };
+  Object.defineProperty(estado, '_ilegible', { value: ilegible, enumerable: false });
+  return estado;
 }
 
 function guardarEstado(estado, homeDir = os.homedir()) {
-  const ruta = rutaEstado(homeDir);
-  fs.mkdirSync(path.dirname(ruta), { recursive: true });
-  const temporal = `${ruta}.tmp`;
-  fs.writeFileSync(temporal, JSON.stringify(estado, null, 2), 'utf8');
-  fs.renameSync(temporal, ruta);
+  guardarJson(rutaEstado(homeDir), { agents: estado.agents }, { ilegible: estado._ilegible });
 }
 
 function estadoDe(nombre, homeDir = os.homedir()) {

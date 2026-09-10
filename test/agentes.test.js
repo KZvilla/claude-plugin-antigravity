@@ -31,6 +31,7 @@ const registro = require('../mcp-server/agents/registry.js');
 const estado = require('../mcp-server/agents/estado.js');
 const memoria = require('../mcp-server/agents/memoria.js');
 const aprendizaje = require('../mcp-server/agents/aprendizaje.js');
+const almacen = require('../mcp-server/agents/almacen.js');
 
 const borrar = d => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch {} };
 
@@ -416,6 +417,74 @@ async function main() {
         a.agent_id === 'reviewer');
     } finally {
       await new Promise(r => servidor.close(r));
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Regresion de perdida de datos, encontrada por la auditoria adversarial de
+  // FEAT-019 sobre codigo ya mergeado. `leerEstado` devolvia `{agents:{}}` ante
+  // cualquier fallo de parseo, y como los escritores hacen read-modify-write,
+  // UNA sola lectura de un archivo truncado borraba los hilos de todos los
+  // demas agentes, sin un solo mensaje.
+  // ------------------------------------------------------------------
+  await group('un archivo ilegible no se sobrescribe (regresion de pérdida de datos)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agentes-corrupto-'));
+    try {
+      estado.registrarCast('reviewer', { conversationId: 'conv-A' }, home);
+      estado.registrarCast('security', { conversationId: 'conv-B' }, home);
+      estado.registrarCast('planner', { conversationId: 'conv-C' }, home);
+      check('los tres agentes tienen hilo',
+        estado.hiloDe('reviewer', home) === 'conv-A' && estado.hiloDe('security', home) === 'conv-B');
+
+      // Exactamente lo que pasa si otro proceso lo tiene a medio escribir.
+      fs.writeFileSync(estado.rutaEstado(home), '{"agents": {"reviewer": {"conv', 'utf8');
+
+      check('un estado ilegible se lee como vacío, sin reventar el cast',
+        estado.hiloDe('reviewer', home) === null);
+
+      estado.registrarCast('planner', { conversationId: 'conv-D' }, home);
+
+      const respaldos = fs.readdirSync(path.join(home, '.claude')).filter(f => f.includes('.corrupto-'));
+      check('el archivo ilegible se aparta en vez de perderse', respaldos.length === 1, JSON.stringify(respaldos));
+      check('lo apartado conserva el contenido original',
+        fs.readFileSync(path.join(home, '.claude', respaldos[0]), 'utf8').includes('reviewer'));
+      check('el estado nuevo queda utilizable', estado.hiloDe('planner', home) === 'conv-D');
+    } finally {
+      borrar(home);
+    }
+  });
+
+  await group('almacen: lectura y escritura de los JSON de agentes', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'almacen-'));
+    try {
+      const ruta = path.join(dir, 'sub', 'datos.json');
+
+      const ausente = almacen.leerJson(ruta);
+      check('un archivo que no existe no es ilegible',
+        ausente.datos === null && ausente.ilegible === false);
+
+      almacen.guardarJson(ruta, { agents: { a: 1 } }, {});
+      check('crea el directorio que falte', fs.existsSync(ruta));
+      check('lo escrito se relee', almacen.leerJson(ruta).datos.agents.a === 1);
+
+      fs.writeFileSync(ruta, '', 'utf8');
+      const vacio = almacen.leerJson(ruta);
+      check('un archivo vacío tampoco es ilegible (es el caso de primera vez)',
+        vacio.datos === null && vacio.ilegible === false);
+
+      fs.writeFileSync(ruta, '{roto', 'utf8');
+      check('un archivo que no parsea sí es ilegible', almacen.leerJson(ruta).ilegible === true);
+
+      // Sin la marca, guardar pisa el archivo roto y se pierde lo que hubiera.
+      almacen.guardarJson(ruta, { agents: { b: 2 } }, { ilegible: true });
+      const apartados = fs.readdirSync(path.dirname(ruta)).filter(f => f.includes('.corrupto-'));
+      check('con la marca, el roto se aparta', apartados.length === 1);
+
+      // El temporal no puede ser fijo: dos escrituras concurrentes se pisan.
+      const sobrantes = fs.readdirSync(path.dirname(ruta)).filter(f => f.includes('.tmp'));
+      check('no deja temporales colgados', sobrantes.length === 0, JSON.stringify(sobrantes));
+    } finally {
+      borrar(dir);
     }
   });
 

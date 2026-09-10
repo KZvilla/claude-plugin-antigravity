@@ -23,6 +23,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
+const { leerJson, guardarJson } = require('./almacen.js');
 
 /**
  * Inventario nativo observado (built-in `code-writer` de agy, 2026-09-10).
@@ -67,23 +68,21 @@ function dirSkills(homeDir = os.homedir()) {
   return path.join(homeDir, '.gemini', 'config', 'skills');
 }
 
+/**
+ * Igual que `estado.js`: marca `_ilegible` para que quien escriba no pise un
+ * archivo que no entendió. Perder el registro es peor que perder el estado —
+ * un agente sin entrada deja de resolver y `cast_agent` lo rechaza (falla
+ * cerrado, que es lo correcto), pero el usuario se queda sin sus registros.
+ */
 function leerRegistro(homeDir = os.homedir()) {
-  try {
-    const datos = JSON.parse(fs.readFileSync(rutaRegistro(homeDir), 'utf8'));
-    return datos && typeof datos.agents === 'object' && datos.agents ? datos : { agents: {} };
-  } catch {
-    return { agents: {} };
-  }
+  const { datos, ilegible } = leerJson(rutaRegistro(homeDir));
+  const registro = datos && typeof datos.agents === 'object' && datos.agents ? datos : { agents: {} };
+  Object.defineProperty(registro, '_ilegible', { value: ilegible, enumerable: false });
+  return registro;
 }
 
 function guardarRegistro(registro, homeDir = os.homedir()) {
-  const ruta = rutaRegistro(homeDir);
-  fs.mkdirSync(path.dirname(ruta), { recursive: true });
-  // Escritura atomica: un registro a medio escribir deja agentes irresolubles,
-  // y un agente irresoluble falla abierto.
-  const temporal = `${ruta}.tmp`;
-  fs.writeFileSync(temporal, JSON.stringify(registro, null, 2), 'utf8');
-  fs.renameSync(temporal, ruta);
+  guardarJson(rutaRegistro(homeDir), { agents: registro.agents }, { ilegible: registro._ilegible });
 }
 
 /** Un nombre de agente es un segmento de path: nunca puede escaparse del directorio. */

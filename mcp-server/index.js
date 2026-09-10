@@ -2969,10 +2969,14 @@ async function handleToolCall(name, args) {
         // `mistake_note_add`, que no recibe `agent_id`, y el bootstrap
         // comparte las notas sin dueño con TODOS los agentes: mandar los
         // errores de este agente por ahí se los mete en el perfil a los demás.
+        // El `outcome` estaba fijo en 'success' aunque el turno no hubiera
+        // producido nada. Un turno sin criterio capturado no es un fracaso,
+        // pero tampoco un éxito del que valga la pena aprender: marcarlo
+        // 'partial' evita ensuciar el historial del agente con sesiones vacías.
         await memoriaAgentes.cerrarSesion(args.agent, {
           sessionId: hiloNuevo || undefined,
           taskSummary: args.prompt,
-          outcome: 'success',
+          outcome: aprendidas > 0 ? 'success' : 'partial',
           decisions: aprendido.decisions,
           userCorrections: aprendido.userCorrections
         });
