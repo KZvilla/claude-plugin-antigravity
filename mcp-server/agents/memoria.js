@@ -307,6 +307,76 @@ async function guardarObservacion(agentId, contenido, opciones = {}) {
 }
 
 /**
+ * FEAT-023 — El criterio que un agente fue acumulando, para el tablero.
+ *
+ * `commit_session_legacy` guarda las decisiones con tags `decision` y las
+ * correcciones con `user-correction`, y mete el `agent_id` en la metadata (no
+ * en los tags). El servicio no ofrece filtrar por metadata, asi que se pagina
+ * por tag y se filtra acá. Es aceptable porque el universo es chico: son las
+ * conclusiones de un agente, no un log.
+ *
+ * Cota dura de paginas: sin ella, una base grande convierte una carga del
+ * tablero en decenas de round-trips. Si se corta, se avisa en `truncado`.
+ */
+const MAX_PAGINAS_CRITERIO = 3;
+const TAGS_CRITERIO = 'decision,user-correction';
+
+async function criterioDeAgente(agentId, opciones = {}) {
+  // `config: null` explicito no puede caer de vuelta al home real: los tests
+  // dependen de que un home sin configuracion signifique "no hay servicio".
+  const config = opciones.config
+    || (opciones.homeDir ? descubrirConfig(opciones.homeDir) : descubrirConfig());
+  if (!config) return { ok: false, motivo: 'no hay servicio de memoria configurado' };
+
+  const cliente = new ClienteMemoria(config, { timeoutMs: opciones.timeoutMs });
+  const entradas = [];
+  let truncado = false;
+
+  for (let pagina = 1; pagina <= MAX_PAGINAS_CRITERIO; pagina++) {
+    const resultado = await cliente.llamar('memory_list', {
+      page: pagina,
+      page_size: 100,
+      tags: opciones.tags || TAGS_CRITERIO,
+      tag_match: 'any'
+    });
+    if (!resultado) {
+      // Si ya juntamos algo, se devuelve lo que hay: media lista es mas util
+      // que un error.
+      if (entradas.length) break;
+      return { ok: false, motivo: cliente.ultimoError || 'sin respuesta' };
+    }
+
+    let sobre;
+    try {
+      sobre = JSON.parse(textoDeResultado(resultado));
+    } catch {
+      return { ok: false, motivo: 'respuesta ilegible del servicio' };
+    }
+
+    for (const memoria of sobre.memories || []) {
+      const meta = memoria.metadata || {};
+      if (meta.agent_id !== agentId) continue;
+      entradas.push({
+        contenido: memoria.content || '',
+        tipo: meta.observation_type || memoria.memory_type || 'observation',
+        sessionId: meta.session_id || null,
+        // Cuantas veces esta memoria se uso de verdad para rehidratar. Es lo
+        // que separa el criterio vivo del que quedo ahi ocupando lugar.
+        usos: typeof meta.access_count === 'number' ? meta.access_count : 0,
+        creado: memoria.created_at_iso || null,
+        hash: memoria.content_hash || null
+      });
+    }
+
+    if (!sobre.has_more) break;
+    if (pagina === MAX_PAGINAS_CRITERIO) truncado = true;
+  }
+
+  entradas.sort((a, b) => String(b.creado || '').localeCompare(String(a.creado || '')));
+  return { ok: true, entradas, truncado };
+}
+
+/**
  * SEC-010 — Que servidores MCP alcanza un agente, sea read-only o no.
  * `call_mcp_tool` se inyecta siempre, asi que esta lista es el limite real de
  * la garantia de "solo lectura" y se le muestra al usuario en cada cast.
@@ -328,6 +398,7 @@ function serversMcpDelUsuario(homeDir = os.homedir()) {
 module.exports = {
   descubrirConfig,
   serversMcpDelUsuario,
+  criterioDeAgente,
   rehidratar,
   cerrarSesion,
   guardarObservacion,

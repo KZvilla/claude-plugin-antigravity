@@ -14,7 +14,7 @@ const os = require('node:os');
 const http = require('node:http');
 const { check, group, report } = require('./lib/assert');
 
-const { crearServidor, descubrirLotes, crearVigilante, paginaHtml } = require('../mcp-server/fanout-watch.js');
+const { crearServidor, descubrirLotes, crearVigilante, paginaHtml, paginaAgentes } = require('../mcp-server/fanout-watch.js');
 const { crearEscritorDeEstado, rutaProgreso, rutaControl, rutaEstado } = require('../mcp-server/fanout-estado.js');
 
 const borrar = d => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch {} };
@@ -111,6 +111,24 @@ function opciones(puerto, ruta) {
   });
 }
 
+/**
+ * FEAT-023. El visor lee el registro de agentes del home, asi que los tests le
+ * pasan uno falso: sin eso mirarian los agentes reales del usuario y le
+ * pegarian a su servicio de memoria.
+ */
+function levantarConHome(repo, slug, homeDir) {
+  return new Promise((resolve) => {
+    // `agyBin` apunta a un binario inexistente a proposito: es el escenario
+    // "no se pudo consultar agy", que el tablero tiene que saber contar.
+    const servidor = crearServidor(repo, slug, {
+      intervaloMs: 40, homeDir, agyBin: 'agy-que-no-existe-xyz'
+    });
+    servidor.listen(0, '127.0.0.1', () => resolve({
+      servidor, puerto: servidor.address().port, token: servidor.tokenAcceso
+    }));
+  });
+}
+
 function levantar(repo, slug) {
   return new Promise((resolve) => {
     const servidor = crearServidor(repo, slug, { intervaloMs: 40 });
@@ -201,6 +219,29 @@ async function main() {
       error = err.message;
     }
     check('el script del cliente es sintácticamente válido', error === null, String(error));
+
+    // Mismo punto ciego para la página de agentes (FEAT-023): también vive
+    // dentro de un template literal, también levantaría el servidor rota.
+    const htmlAgentes = paginaAgentes('tok3n', true);
+    const scriptAgentes = (htmlAgentes.match(/<script>([\s\S]*?)<\/script>/) || [])[1];
+    check('la página de agentes trae un bloque de script',
+      typeof scriptAgentes === 'string' && scriptAgentes.length > 100);
+
+    let errorAgentes = null;
+    try {
+      // eslint-disable-next-line no-new-func
+      new Function(scriptAgentes);
+    } catch (err) {
+      errorAgentes = err.message;
+    }
+    check('el script de agentes es sintácticamente válido', errorAgentes === null, String(errorAgentes));
+
+    // El token tiene que quedar como literal JS, no como el texto de la
+    // interpolación sin resolver: fue exactamente el bug que tuvo esta página.
+    check('el token se interpola de verdad en el script',
+      scriptAgentes.includes('const TOKEN = "tok3n"'), scriptAgentes.slice(0, 120));
+    check('y el link al fan-out lleva el token resuelto',
+      htmlAgentes.includes('/?t=tok3n'));
   });
 
   await group('servidor: sirve la página y transmite estado + eventos por SSE', async () => {
@@ -495,7 +536,110 @@ async function main() {
     }
   });
 
+
+  // ------------------------------------------------------------------
+  // FEAT-023 — la vista de agentes persistidos. Lo que se prueba es lo que la
+  // pagina promete y lo que NO: no hay decision gates (FEAT-019 se descarto) ni
+  // estado "corriendo" (cast_agent es sincronico y no deja rastro en disco).
+  // ------------------------------------------------------------------
+  await group('FEAT-023: vista de agentes persistidos', async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-ag-'));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-home-'));
+    let servidor;
+    try {
+      // Un agente registrado, otro con hilo pero sin registro (huerfano).
+      fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+      fs.writeFileSync(path.join(home, '.claude', 'antigravity-agents.json'), JSON.stringify({
+        agents: { reviewer: { skill: 'agency-code-reviewer', read_only: true, tools: ['view_file'], project_id: null } }
+      }), 'utf8');
+      fs.writeFileSync(path.join(home, '.claude', 'antigravity-agents-state.json'), JSON.stringify({
+        agents: {
+          reviewer: { conversation_id: 'conv-abcdef123', casts: 3, ultimo_cast: '2026-09-10T05:00:00.000Z' },
+          fantasma: { conversation_id: 'conv-viejo', casts: 1 }
+        }
+      }), 'utf8');
+
+      crearEscritorDeEstado(repo, 'lote-ag', [{ id: 'solo' }]).iniciar({ ramaBase: 'x', concurrencia: 1 });
+      const lanzado = await levantarConHome(repo, 'lote-ag', home);
+      servidor = lanzado.servidor;
+      const { puerto, token } = lanzado;
+
+      // --- la pagina ---
+      check('GET /agents sin token es 403', (await pedir(puerto, '/agents')).status === 403);
+
+      const pagina = await pedir(puerto, '/agents', token);
+      check('GET /agents con token responde html',
+        pagina.status === 200 && /text\/html/.test(pagina.headers['content-type']));
+      check('la página lleva el token', pagina.cuerpo.includes(token));
+      check('con lote, ofrece volver a la vista de fan-out', pagina.cuerpo.includes('>fan-out</a>'));
+      check('no promete decision gates, que ya no existen',
+        !/decision gate/i.test(pagina.cuerpo) && !/aprobar/i.test(pagina.cuerpo));
+
+      // --- la matriz ---
+      check('GET /api/agentes sin token es 403', (await pedir(puerto, '/api/agentes')).status === 403);
+      const matriz = JSON.parse((await pedir(puerto, '/api/agentes', token)).cuerpo);
+      const porNombre = Object.fromEntries(matriz.agentes.map(a => [a.nombre, a]));
+
+      check('lista los agentes del registro y del estado', matriz.agentes.length === 2);
+      check('trae el SKILL del registrado', porNombre.reviewer.skill === 'agency-code-reviewer');
+      check('marca read-only', porNombre.reviewer.readOnly === true);
+      check('trae el hilo y la cuenta de casts',
+        porNombre.reviewer.conversationId === 'conv-abcdef123' && porNombre.reviewer.casts === 3);
+      check('un agente con hilo pero sin registro sale como huérfano',
+        porNombre.fantasma.enRegistro === false && porNombre.fantasma.estado === 'huerfano');
+
+      // Que no se pueda consultar agy no puede pintar a todos en rojo como si
+      // no resolvieran: es una mentira alarmante. Se informa aparte.
+      check('avisa que no se pudo consultar agy', matriz.agyDisponible === false);
+      check('y explica por qué', typeof matriz.motivoAgy === 'string' && matriz.motivoAgy.length > 0);
+
+      // --- el criterio ---
+      check('GET /api/agentes/criterio sin token es 403',
+        (await pedir(puerto, '/api/agentes/criterio?agente=reviewer')).status === 403);
+
+      const malo = await pedir(puerto, '/api/agentes/criterio?agente=' + encodeURIComponent('../../evil'), token);
+      check('rechaza un nombre de agente que se escapa', malo.status === 400, String(malo.status));
+
+      // Sin servicio de memoria en el home falso, degrada en vez de romper.
+      const criterio = JSON.parse((await pedir(puerto, '/api/agentes/criterio?agente=reviewer', token)).cuerpo);
+      check('sin servicio de memoria responde ok:false, no un 500', criterio.ok === false);
+      check('y dice por qué', /memoria/i.test(criterio.motivo || ''));
+    } finally {
+      if (servidor) await new Promise(r => servidor.close(r));
+      borrar(repo);
+      borrar(home);
+    }
+  });
+
+  await group('FEAT-023: el visor arranca aunque no haya ningún lote de fan-out', async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-sinlote-'));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-sinhome-'));
+    let servidor;
+    try {
+      const lanzado = await levantarConHome(repo, null, home);
+      servidor = lanzado.servidor;
+      const { puerto, token } = lanzado;
+
+      // Antes de FEAT-023 esto era imposible: main() salía con error sin lote,
+      // así que la vista de agentes quedaba inalcanzable en un repo donde nunca
+      // se corrió un fan-out.
+      const raiz = await pedir(puerto, '/', token);
+      check('sin lote, la raíz sirve directamente los agentes',
+        raiz.status === 200 && raiz.cuerpo.includes('agentes persistidos'));
+      check('y no ofrece una pestaña de fan-out que no existe',
+        !raiz.cuerpo.includes('>fan-out</a>'));
+
+      const matriz = JSON.parse((await pedir(puerto, '/api/agentes', token)).cuerpo);
+      check('la matriz vacía no es un error', Array.isArray(matriz.agentes) && matriz.agentes.length === 0);
+    } finally {
+      if (servidor) await new Promise(r => servidor.close(r));
+      borrar(repo);
+      borrar(home);
+    }
+  });
+
   process.exit(report() ? 0 : 1);
+
 
 }
 

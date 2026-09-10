@@ -316,6 +316,14 @@ Each subagent gets a card showing:
 
 The header reports the batch total, and distinguishes a finished batch (`terminado en 4m00s`) from one that has simply gone quiet (`sin novedad hace 12m`) — useful because a crashed or cancelled fan-out otherwise looks identical to a running one forever.
 
+### The persistent-agents tab (`/agents`)
+
+The same viewer also lists your persistent agents — and, more usefully, **what each one has actually learned**. Click a row to expand its accumulated criteria: every decision and correction it committed to `mcp-memory`, with the date and how many times that memory has actually been used to rehydrate it. That last number is what separates criteria that earn their place in the token budget from criteria that just sit there.
+
+The viewer no longer needs a fan-out batch to start: in a repo where you never ran `agy_fanout`, it opens straight into `/agents`.
+
+What this view deliberately does **not** have: decision gates (there is no escalation protocol — that item was dropped after an adversarial audit) and a live "running" state (`cast_agent` runs synchronously inside the MCP server and leaves no on-disk trace while it does, so no other process can observe it). The states it shows are only the ones that can actually be read.
+
 ### Access control (`SEC-011`)
 
 Listening on loopback never protected you from your own browser: any page open in another tab can POST to `127.0.0.1` with a simple request that does not even trigger a CORS preflight. Before this, that was enough for an arbitrary site to stop one of your subagents — and the persistent-agent dashboard (`FEAT-023`) wants to put *approval gates* on the same surface.

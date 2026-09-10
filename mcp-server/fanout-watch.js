@@ -57,8 +57,11 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const os = require('node:os');
 
 const { rutaEstado, rutaProgreso, marcarDetencion, DIR_WORKTREES } = require('./fanout-estado.js');
+const tableroAgentes = require('./agents/tablero.js');
+const memoriaAgentes = require('./agents/memoria.js');
 const { interpretarEvento, crearSeguidor } = require('./fanout-tail.js');
 
 const PUERTO_POR_DEFECTO = 4517;
@@ -489,6 +492,199 @@ fuente.onerror = () => { resumen.textContent = 'desconectado (¿se cerró el vis
 </html>`;
 }
 
+/**
+ * FEAT-023 — La vista de agentes persistidos.
+ *
+ * Pagina aparte y no una SPA con la de fan-out: son dos cosas distintas que
+ * comparten servidor y token, no una sola vista con pestañas internas.
+ * Convertir la de fan-out en SPA habria significado reescribirle el cliente
+ * SSE para nada.
+ */
+function paginaAgentes(token, haySlug) {
+  return `<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>agentes persistidos</title>
+<style>
+  :root { color-scheme: dark light; }
+  html, body { height: 100%; }
+  body { margin: 0; font: 13px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace;
+         background: #11131a; color: #d7dae0; display: flex; flex-direction: column; }
+  header { padding: 10px 16px; border-bottom: 1px solid #2a2f3a; display: flex;
+           align-items: baseline; gap: 12px; background: #11131a; flex: none; }
+  h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  .meta { color: #7d8596; font-size: 12px; }
+  nav { margin-left: auto; display: flex; gap: 4px; }
+  nav a { color: #7d8596; text-decoration: none; font-size: 12px; padding: 2px 10px;
+          border: 1px solid #2a2f3a; border-radius: 999px; }
+  nav a.activa { color: #58a6ff; border-color: #58a6ff; }
+  nav a:hover { color: #d7dae0; }
+  main { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px; }
+  .aviso { border: 1px solid #d29922; color: #d29922; background: #221d10;
+           padding: 8px 10px; border-radius: 6px; margin-bottom: 12px; font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #1c2029; vertical-align: top; }
+  th { color: #7d8596; font-weight: 600; font-size: 11px; text-transform: uppercase;
+       letter-spacing: .04em; border-bottom-color: #2a2f3a; }
+  tr.fila { cursor: pointer; }
+  tr.fila:hover td { background: #161922; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid currentColor; }
+  .si { color: #3fb950; } .no { color: #f85149; } .tibio { color: #d29922; }
+  .apagado { color: #7d8596; }
+  .hilo { font-size: 11px; color: #6b7385; }
+  .criterio { background: #0d0f15; }
+  .criterio td { padding: 0 10px 12px; }
+  .entrada { border-left: 2px solid #2a2f3a; padding: 4px 0 4px 10px; margin-top: 8px; }
+  .entrada .cuerpo { white-space: pre-wrap; word-break: break-word; }
+  .entrada .pie { font-size: 11px; color: #6b7385; margin-top: 2px; }
+  .usos { color: #58a6ff; }
+  .frio { color: #6b7385; }
+  .vacio { color: #7d8596; font-style: italic; padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>agentes persistidos</h1>
+  <span class="meta" id="resumen">cargando…</span>
+  <nav>
+    ${haySlug ? `<a href="/?t=${token || ''}">fan-out</a>` : ''}
+    <a class="activa" href="#">agentes</a>
+  </nav>
+</header>
+<main>
+  <div id="avisos"></div>
+  <table>
+    <thead><tr>
+      <th>agente</th><th>skill</th><th>acceso</th><th>resuelve</th>
+      <th>hilo</th><th>casts</th><th>último cast</th>
+    </tr></thead>
+    <tbody id="cuerpo"></tbody>
+  </table>
+</main>
+<script>
+const TOKEN = ${JSON.stringify(token || '')};
+const resumen = document.getElementById('resumen');
+const avisos = document.getElementById('avisos');
+const cuerpo = document.getElementById('cuerpo');
+const abiertos = new Set();
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function fecha(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return '—';
+  return d.toLocaleString();
+}
+
+function pedir(ruta) {
+  return fetch(ruta + (ruta.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(TOKEN))
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)));
+}
+
+function pintarAvisos(datos) {
+  const lista = [];
+  if (!datos.agyDisponible) {
+    lista.push('No se pudo consultar <code>agy agents</code>, así que la columna '
+      + '"resuelve" no significa nada en esta carga: ' + esc(datos.motivoAgy || ''));
+  }
+  if (datos.registroIlegible) lista.push('El registro de agentes está ilegible en disco.');
+  if (datos.estadoIlegible) lista.push('El estado de hilos está ilegible en disco.');
+  const rotos = (datos.agentes || []).filter(a => datos.agyDisponible && a.enRegistro && !a.resuelve);
+  if (rotos.length) {
+    lista.push('Antigravity no resuelve ' + rotos.map(a => '<code>' + esc(a.nombre) + '</code>').join(', ')
+      + '. Castearlos se aborta a propósito: <code>--agent</code> con un nombre inexistente '
+      + 'cae en silencio al agente por defecto, con escritura completa.');
+  }
+  avisos.innerHTML = lista.map(t => '<div class="aviso">' + t + '</div>').join('');
+}
+
+function pintarCriterio(celda, agente) {
+  celda.innerHTML = '<div class="vacio">buscando criterio acumulado…</div>';
+  pedir('/api/agentes/criterio?agente=' + encodeURIComponent(agente)).then(r => {
+    if (!r.ok) {
+      celda.innerHTML = '<div class="vacio">sin criterio disponible (' + esc(r.motivo) + ')</div>';
+      return;
+    }
+    if (!r.entradas.length) {
+      celda.innerHTML = '<div class="vacio">todavía no acumuló criterio. '
+        + 'Se llena solo cuando el agente emite su bloque de memoria al terminar un cast.</div>';
+      return;
+    }
+    celda.innerHTML = r.entradas.map(e =>
+      '<div class="entrada"><div class="cuerpo">' + esc(e.contenido) + '</div>'
+      + '<div class="pie">' + esc(e.tipo) + ' · ' + esc(fecha(e.creado))
+      // access_count es lo que separa el criterio que se usa del que quedó
+      // ocupando lugar en el budget de rehidratación.
+      + ' · <span class="' + (e.usos > 0 ? 'usos' : 'frio') + '">'
+      + (e.usos > 0 ? ('usado ' + e.usos + '×') : 'nunca usado') + '</span></div></div>'
+    ).join('') + (r.truncado ? '<div class="vacio">(lista truncada)</div>' : '');
+  }).catch(err => {
+    celda.innerHTML = '<div class="vacio">error: ' + esc(err.message) + '</div>';
+  });
+}
+
+function alternar(nombre, fila) {
+  const siguiente = fila.nextElementSibling;
+  if (abiertos.has(nombre)) {
+    abiertos.delete(nombre);
+    siguiente.hidden = true;
+    return;
+  }
+  abiertos.add(nombre);
+  siguiente.hidden = false;
+  pintarCriterio(siguiente.querySelector('td'), nombre);
+}
+
+function pintar(datos) {
+  pintarAvisos(datos);
+  const agentes = datos.agentes || [];
+  resumen.textContent = agentes.length
+    ? agentes.length + ' agente(s) · clic en una fila para ver su criterio acumulado'
+    : 'ningún agente registrado todavía';
+
+  cuerpo.innerHTML = '';
+  for (const a of agentes) {
+    const fila = document.createElement('tr');
+    fila.className = 'fila';
+    const acceso = a.readOnly === null
+      ? '<span class="pill apagado">huérfano</span>'
+      : (a.readOnly ? '<span class="pill si">read-only</span>' : '<span class="pill tibio">read/write</span>');
+    const resuelve = !datos.agyDisponible
+      ? '<span class="apagado">?</span>'
+      : (a.resuelve ? '<span class="si">sí</span>' : '<span class="no">no</span>');
+    fila.innerHTML = '<td><strong>' + esc(a.nombre) + '</strong></td>'
+      + '<td class="apagado">' + esc(a.skill || '—') + '</td>'
+      + '<td>' + acceso + '</td>'
+      + '<td>' + resuelve + '</td>'
+      + '<td class="hilo">' + (a.conversationId ? esc(a.conversationId.slice(0, 8)) + '…' : '—') + '</td>'
+      + '<td>' + a.casts + '</td>'
+      + '<td class="apagado">' + esc(fecha(a.ultimoCast)) + '</td>';
+    cuerpo.appendChild(fila);
+
+    const detalle = document.createElement('tr');
+    detalle.className = 'criterio';
+    detalle.hidden = true;
+    detalle.innerHTML = '<td colspan="7"></td>';
+    cuerpo.appendChild(detalle);
+
+    fila.addEventListener('click', () => alternar(a.nombre, fila));
+  }
+}
+
+pedir('/api/agentes').then(pintar).catch(err => {
+  resumen.textContent = 'no se pudo cargar: ' + err.message;
+});
+</script>
+</body>
+</html>`;
+}
+
 function escapar(s) {
   return String(s).replace(/[&<>"']/g, c => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
@@ -540,7 +736,14 @@ function origenAceptable(req) {
   }
 }
 
-function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, token } = {}) {
+/**
+ * El visor no resuelve el binario de agy como lo hace el servidor MCP: acá
+ * alcanza con el nombre, porque solo se usa para `agy agents` y un fallo se
+ * refleja en la página como "no se pudo consultar" en vez de tumbar nada.
+ */
+const AGY_BIN_VISOR = process.env.AGY_BIN || (process.platform === 'win32' ? 'agy.exe' : 'agy');
+
+function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, token, agyBin = AGY_BIN_VISOR, homeDir = os.homedir() } = {}) {
   // Un token por sesión del visor. No se persiste: si el proceso se cae, el
   // que quedó en una pestaña abierta deja de servir, que es lo correcto.
   const tokenAcceso = token || crypto.randomBytes(24).toString('hex');
@@ -561,6 +764,68 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, toke
     // cabecera `x-lagrange-token` cruzando orígenes.
     if (req.method === 'OPTIONS') {
       return rechazar(405, 'No.');
+    }
+
+    // FEAT-023. Sin lote de fan-out la raíz muestra directamente los agentes:
+    // el visor dejó de ser solo el mirador de un fan-out, y exigir un lote para
+    // arrancar dejaba la vista de agentes inalcanzable en un repo donde nunca
+    // se corrió `agy_fanout`.
+    const rutaAgentes = url.pathname === '/agents' || (url.pathname === '/' && !slug);
+
+    if (req.method === 'GET' && rutaAgentes) {
+      if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
+        return rechazar(403,
+          'Falta el token de esta sesión del visor.\n\n'
+          + 'Abrí la URL completa que imprimió la terminal, la que termina en "?t=...".');
+      }
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'referrer-policy': 'no-referrer'
+      });
+      res.end(paginaAgentes(tokenAcceso, Boolean(slug)));
+      return;
+    }
+
+    // La matriz sale de disco y de un `agy agents`: barata, se pide de una.
+    if (req.method === 'GET' && url.pathname === '/api/agentes') {
+      if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
+        return rechazar(403, 'token invalido');
+      }
+      tableroAgentes.matriz(agyBin, homeDir).then(datos => {
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify(datos));
+      }).catch(err => {
+        res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: err.message }));
+      });
+      return;
+    }
+
+    // El criterio es una llamada de red con timeout, así que va aparte y bajo
+    // demanda: no se paga al abrir la página, se paga al desplegar un agente.
+    if (req.method === 'GET' && url.pathname === '/api/agentes/criterio') {
+      if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
+        return rechazar(403, 'token invalido');
+      }
+      const agente = url.searchParams.get('agente');
+      if (!agente || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(agente)) {
+        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, motivo: 'agente invalido' }));
+        return;
+      }
+      // El homeDir se propaga para que los tests no le peguen al servicio de
+      // memoria real del usuario.
+      memoriaAgentes.criterioDeAgente(agente, { homeDir }).then(datos => {
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify(datos));
+      }).catch(err => {
+        // criterioDeAgente no debería lanzar nunca, pero si lo hace no puede
+        // tumbar el servidor del visor.
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, motivo: err.message }));
+      });
+      return;
     }
 
     if (req.method === 'GET' && url.pathname === '/') {
@@ -715,19 +980,22 @@ function main() {
   const lotes = descubrirLotes(repoPath);
   const slug = slugPedido || (lotes[0] && lotes[0].slug);
 
+  // Antes de FEAT-023 esto salía con error: el visor era solo el mirador de un
+  // fan-out. Ahora también muestra los agentes persistidos, que no dependen de
+  // ningún lote ni de ningún repo, así que no tener lote deja de ser fatal.
   if (!slug) {
     process.stderr.write(
-      `No hay ningún lote de fan-out en ${path.join(repoPath, DIR_WORKTREES)}.\n` +
-      'Corré un agy_fanout primero, o pasá --slug si sabés cuál querés mirar.\n'
+      `No hay ningún lote de fan-out en ${path.join(repoPath, DIR_WORKTREES)}: `
+      + 'se abre solo la vista de agentes persistidos.\n'
     );
-    process.exitCode = 1;
-    return;
   }
 
   const servidor = crearServidor(repoPath, slug);
   // Solo loopback, a propósito: estos logs traen prompts y código.
   servidor.listen(puerto, '127.0.0.1', () => {
-    process.stdout.write(`\nVisor de fan-out para "${slug}"\n`);
+    process.stdout.write(slug
+      ? `\nVisor de fan-out para "${slug}" (+ agentes persistidos en /agents)\n`
+      : '\nVisor de agentes persistidos\n');
     // La URL SIN el token no sirve para nada: es a propósito (SEC-011).
     process.stdout.write(`  http://127.0.0.1:${puerto}/?t=${servidor.tokenAcceso}\n\n`);
     if (lotes.length > 1) {
@@ -748,4 +1016,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { crearServidor, descubrirLotes, crearVigilante, paginaHtml, ultimaSenal };
+module.exports = { crearServidor, descubrirLotes, crearVigilante, paginaHtml, paginaAgentes, ultimaSenal };
