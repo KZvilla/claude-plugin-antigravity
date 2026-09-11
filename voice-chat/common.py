@@ -34,6 +34,68 @@ USO_DIR = os.path.join(STATE_DIR, "uso")
 PIN_PATH = os.path.join(STATE_DIR, "pin.json")
 INTERVALO_TOQUE_S = 10
 
+# OmniVoice (segundo proveedor, plan de OmniVoice). La config y la cache de
+# voces las escribe el MCP; aca solo se leen.
+_HOME = os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+CONFIG_PATH = os.path.join(_HOME, ".claude", "antigravity.json")
+CACHE_VOCES = os.path.join(STATE_DIR, "voces-cache.json")
+VOICEBOX_DATA_DIR = os.environ.get("VOICEBOX_DIR") or os.path.join(
+    os.environ.get("APPDATA", os.path.join(_HOME, "AppData", "Roaming")), "sh.voicebox.app")
+# Dos oraciones a la vez se serializan en el lock de la GPU del server de
+# OmniVoice: la segunda espera a la primera. 90 s, como el MCP.
+TIMEOUT_OMNI_S = 90
+
+
+def leer_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def omnivoice_url():
+    puerto = leer_config().get("omnivoice_port")
+    return os.environ.get("OMNIVOICE_URL") or f"http://127.0.0.1:{puerto if isinstance(puerto, int) else 17494}"
+
+
+def omnivoice_request(path, payload, timeout=TIMEOUT_OMNI_S):
+    req = urllib.request.Request(omnivoice_url() + path, data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            return json.loads(res.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as err:
+        try:
+            detalle = json.loads(err.read().decode("utf-8")).get("detail")
+        except ValueError:
+            detalle = None
+        raise RuntimeError(f"OmniVoice respondio HTTP {err.code}: {detalle or err.reason}")
+    except urllib.error.URLError as err:
+        raise RuntimeError(f"No se pudo contactar OmniVoice en {omnivoice_url()}{path} ({err}).")
+
+
+def muestra_de_perfil(profile):
+    """Muestra de voz del perfil: de Voicebox (fuente de verdad) o, si no
+    responde, de la cache que escribe el MCP. None si el perfil no tiene
+    muestra (preset): OmniVoice necesita una para clonar."""
+    try:
+        lista = voicebox_request(f"/profiles/{profile['id']}/samples", timeout=5)
+        lista = lista if isinstance(lista, list) else []
+        s = next((x for x in lista if x.get("reference_text")), lista[0] if lista else None)
+        if not s or not s.get("audio_path"):
+            return None
+        ruta = s["audio_path"] if os.path.isabs(s["audio_path"]) else os.path.join(VOICEBOX_DATA_DIR, s["audio_path"])
+        return {"audio_path": ruta, "ref_text": s.get("reference_text")}
+    except Exception:
+        pass
+    try:
+        with open(CACHE_VOCES, encoding="utf-8") as f:
+            m = (json.load(f).get("muestras") or {}).get(profile["id"])
+        return {"audio_path": m["audioPath"], "ref_text": m.get("refText")} if m else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
 
 def tocar_uso(model_name):
     """Marca el modelo como en uso para el keeper y para la regla de swap."""
@@ -265,7 +327,42 @@ def wait_for_generation_wav(generation_id, before_files, timeout=90, on_tick=Non
     return None
 
 
-def synthesize_sentence(text, profile, language, engine, model_size=None):
+def activar_motor_chat(mcp, profile, engine, model_size, pedido=None):
+    """Elige el proveedor de la charla y deja la VRAM lista via el MCP (que
+    levanta el server y coordina los dos proveedores). Regla del usuario: la
+    charla en vivo va por OmniVoice si la voz tiene muestra, salvo que
+    voz_por_perfil la fije a Voicebox o se pida --motor. Devuelve
+    (proveedor, muestra); lanza RuntimeError si no se puede empezar."""
+    if pedido is None and (leer_config().get("voz_por_perfil") or {}).get(profile["name"]) == "voicebox":
+        pedido = "voicebox"
+    if pedido != "voicebox":
+        muestra = muestra_de_perfil(profile)
+        if muestra and os.path.isfile(muestra["audio_path"]):
+            try:
+                mcp.call_tool("agy_voice_model", {"action": "activate", "engine": "omnivoice", "voice": profile["name"]})
+                return "omnivoice", muestra
+            except RuntimeError as err:
+                if pedido == "omnivoice":
+                    raise
+                print(f"[voice-loop] OmniVoice no disponible ({err}); sigo con Voicebox.")
+        elif pedido == "omnivoice":
+            raise RuntimeError(f"{profile['name']} no tiene muestra en disco: OmniVoice necesita una para clonar.")
+    activate_args = {"action": "activate", "engine": engine}
+    if model_size:
+        activate_args["model_size"] = model_size
+    mcp.call_tool("agy_voice_model", activate_args)
+    return "voicebox", None
+
+
+def synthesize_sentence(text, profile, language, engine, model_size=None, proveedor="voicebox", muestra=None):
+    # Parametros nuevos con default: los dos loops y el ThreadPoolExecutor
+    # siguen llamando igual cuando la charla va por Voicebox.
+    if proveedor == "omnivoice":
+        tocar_uso("omnivoice")
+        res = omnivoice_request("/generate", {"text": text, "ref_audio": muestra["audio_path"],
+                                              "ref_text": muestra.get("ref_text")})
+        tocar_uso("omnivoice")
+        return res.get("id"), res.get("audio_path")
     # POST /generate, no /generate/stream: mcp-server/index.js ya documenta que
     # /generate/stream dispara un bug de doble reproduccion en Voicebox y usa
     # /generate a proposito (ver index.js linea ~2810). Seguimos el camino probado.

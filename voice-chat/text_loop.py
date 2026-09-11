@@ -29,7 +29,7 @@ from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
     resolve_voice_profile, synthesize_sentence, voicebox_cancel,
     get_model_status, resolve_engine_and_model, unload_all_loaded_models,
-    LatidoUso, tts_model_name
+    LatidoUso, tts_model_name, activar_motor_chat
 )
 
 
@@ -46,6 +46,8 @@ def main():
                          help="Descargar TODO lo que Voicebox tenga cargado ahora mismo (de cualquier corrida previa) y salir.")
     parser.add_argument("--soltar-pin", action="store_true",
                          help="Soltar el modelo fijado antes de empezar (si choca con el motor de la voz elegida).")
+    parser.add_argument("--motor", default=None, choices=["omnivoice", "voicebox"],
+                         help="Proveedor de voz. Por defecto OmniVoice si la voz tiene muestra, salvo voz_por_perfil.")
     args = parser.parse_args()
 
     if args.unload_all:
@@ -73,22 +75,21 @@ def main():
 
     # El modelo de esta voz pasa a ser el activo antes de empezar: si hay otro
     # fijado, o no hay VRAM, se dice ahora y no a mitad de la charla.
-    activate_args = {"action": "activate", "engine": engine}
-    if model_size:
-        activate_args["model_size"] = model_size
+    # La charla va por OmniVoice si la voz tiene muestra (regla del usuario).
     try:
-        mcp.call_tool("agy_voice_model", activate_args)
+        proveedor, muestra = activar_motor_chat(mcp, profile, engine, model_size, args.motor)
     except RuntimeError as err:
         print(f"[voice-loop] {err}")
         print("[voice-loop] Si hay un modelo fijado de otra voz, volve a correr con --soltar-pin.")
         mcp.close()
         return
-    latido = LatidoUso([tts_model_name(engine, model_size)])
+    print(f"[voice-loop] Proveedor de voz: {'OmniVoice' if proveedor == 'omnivoice' else 'Voicebox'}")
+    latido = LatidoUso(["omnivoice" if proveedor == "omnivoice" else tts_model_name(engine, model_size)])
 
     print("[voice-loop] Iniciando sesion agy_voice_stream (con pre-warm de Voicebox en paralelo)...")
     start_text = mcp.call_tool("agy_voice_stream", {
         "action": "start", "effort": args.effort, "mode": "plan",
-        "prewarm_voicebox": True, "voicebox_model_size": "1.7B"
+        "prewarm_voicebox": proveedor == "voicebox", "voicebox_model_size": "1.7B"
     })
     stream_id = start_text.split("stream_id: `")[1].split("`")[0]
     print(f"[voice-loop] Sesion lista: {stream_id}\n")
@@ -125,7 +126,8 @@ def main():
                 turn_complete = drain["turn_complete"]
                 for sentence in drain["sentences"]:
                     print(f"Agy> {sentence}")
-                    future = executor.submit(synthesize_sentence, sentence, profile, args.language, engine, model_size)
+                    future = executor.submit(synthesize_sentence, sentence, profile, args.language, engine, model_size,
+                                             proveedor, muestra)
                     sequencer.submit(future, sentence)
     except KeyboardInterrupt:
         print("\n[voice-loop] Interrumpido por teclado.")
