@@ -32,6 +32,7 @@ const aprendizajeAgentes = require('./agents/aprendizaje.js');
 const castAgentes = require('./agents/cast.js');
 // BE-015 — Reglas de `--model`/`--effort` compartidas con el bot de Telegram.
 const { esfuerzoParaCli, validarModeloEsfuerzo } = require('./lib/cli-compat.js');
+const vb = require('./voicebox-server.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -88,6 +89,7 @@ function loadConfig(cwd = process.cwd()) {
     defaultTimeoutMinutes: parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     voiceboxUrl: process.env.VOICEBOX_URL || null,
     voiceboxPort: parseInt(process.env.VOICEBOX_PORT, 10) || null,
+    ...vb.CONFIG_POR_DEFECTO,
     fanoutStatusline: true,
     fanoutStatuslineDelegate: null,
     fanoutControl: true,
@@ -123,6 +125,7 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
+      vb.aplicarClavesVoicebox(config, parsed);
       config.configFile = globalPath;
     } catch {}
   }
@@ -143,12 +146,22 @@ function loadConfig(cwd = process.cwd()) {
       if (parsed.permissions) {
         config.permissions = { ...config.permissions, ...parsed.permissions };
       }
+      vb.aplicarClavesVoicebox(config, parsed);
       config.configFile = projectPath;
     } catch {}
   }
 
   return config;
 }
+
+// Claves de Voicebox headless que agy_set_config persiste (plan G).
+const CLAVES_VOICEBOX_CONFIG = [
+  'voicebox_autostart',
+  'voicebox_server_exe',
+  'voicebox_idle_unload_minutes',
+  'voicebox_idle_shutdown_minutes',
+  'statusline_voicebox'
+];
 
 function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
   const homeDir = process.env.HOME || process.env.USERPROFILE || '';
@@ -175,6 +188,9 @@ function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
   if (updates.fanout_statusline_delegate !== undefined) existing.fanout_statusline_delegate = updates.fanout_statusline_delegate;
   if (updates.fanout_control !== undefined) existing.fanout_control = updates.fanout_control;
   if (updates.fanout_progress_log !== undefined) existing.fanout_progress_log = updates.fanout_progress_log;
+  for (const clave of CLAVES_VOICEBOX_CONFIG) {
+    if (updates[clave] !== undefined) existing[clave] = updates[clave];
+  }
   if (updates.permissions !== undefined) {
     existing.permissions = {
       ...(existing.permissions || {}),
@@ -943,6 +959,34 @@ const TOOLS = [
         fanout_progress_log: {
           type: 'boolean',
           description: 'Whether agy_fanout writes a live per-subagent NDJSON progress log (.claude/worktrees/.agy-progress-<slug>-<taskId>.jsonl), one line per stream-json event as it arrives. Default true; set false to skip writing it (agy_fanout still runs in streaming mode either way). This log is what /lagrange:watch renders.'
+        },
+        voicebox_url: {
+          type: 'string',
+          description: 'Default Voicebox HTTP endpoint (e.g. "http://127.0.0.1:17493").'
+        },
+        voicebox_port: {
+          type: 'number',
+          description: 'Default Voicebox port on 127.0.0.1.'
+        },
+        voicebox_autostart: {
+          type: 'boolean',
+          description: 'Start Voicebox headless (no desktop app) when a voice tool needs it and it is not running. Windows only. Default true.'
+        },
+        voicebox_server_exe: {
+          type: 'string',
+          description: 'Explicit path to the Voicebox server binary. Default: the CUDA backend under %APPDATA%\\sh.voicebox.app\\backends\\cuda, then the CPU one in Program Files.'
+        },
+        voicebox_idle_unload_minutes: {
+          type: 'number',
+          description: 'Minutes without use before an unpinned model is freed from GPU memory (only for a Voicebox the plugin started). Default 10.'
+        },
+        voicebox_idle_shutdown_minutes: {
+          type: 'number',
+          description: 'Minutes without use, with nothing loaded or pinned, before the headless Voicebox is shut down. 0 = never. Default 30.'
+        },
+        statusline_voicebox: {
+          type: 'boolean',
+          description: 'Show the Voicebox/VRAM segment in the statusline while Voicebox is running. Default true.'
         }
       }
     }
@@ -1120,6 +1164,10 @@ const TOOLS = [
         local_playback: {
           type: 'boolean',
           description: 'When true, plays the audio aloud through your PC speakers (synthesized via POST /generate, then played with the native OS player — never Voicebox /speak, which double-plays). Defaults to false: silent generation, delivered to Telegram without scaring anyone. The /lagrange:narrate slash command sets this to true, since asking for narration out loud implies hearing it.'
+        },
+        keep_model: {
+          type: 'boolean',
+          description: 'When true, pins this voice\'s TTS model in GPU memory until released with agy_voice_model (action "release"). Use it when the user says the interaction will go on with this voice, on PC or Telegram. Defaults to false: the model is freed after the idle timeout.'
         }
       }
     }
@@ -1137,6 +1185,10 @@ const TOOLS = [
         polish: {
           type: 'boolean',
           description: 'When true, agy (Gemini) rewrites the text into a short spoken-style update before synthesis. Costs an extra round-trip of a few seconds, so leave it off for text that is already short and conversational. Worth it for raw logs, long output, or notes that were written to be read rather than heard.'
+        },
+        keep_model: {
+          type: 'boolean',
+          description: 'When true, pins this voice\'s TTS model in GPU memory until released with agy_voice_model (action "release"). Use it when the user says the interaction will go on with this voice, on PC or Telegram. Defaults to false: the model is freed after the idle timeout.'
         },
         voice: {
           type: 'string',
@@ -1212,6 +1264,50 @@ const TOOLS = [
           description: 'Custom Voicebox port number if running on a non-default port.'
         }
       }
+    }
+  },
+  {
+    name: 'agy_voice_model',
+    description: 'Manage which Voicebox TTS model occupies GPU memory, and start Voicebox without its desktop app. Only one TTS model stays resident: switching to a voice that uses another model frees the previous one (unless it is pinned or was used in the last 30 s). Actions: "status" (read-only: server, loaded models, pinned model, free VRAM — never starts anything), "start" (start Voicebox headless if it is not running), "activate" (make a voice\'s model the active one; refuses if another model is pinned or VRAM is short), "pin" (keep a voice\'s model loaded until released — use it when the user says the conversation will go on with that voice, on PC or Telegram), "release" (unpin; the model is freed after the idle timeout), "unload" (unpin and free every TTS model now).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['status', 'start', 'activate', 'pin', 'release', 'unload'],
+          description: 'Operation to perform.'
+        },
+        voice: {
+          type: 'string',
+          description: 'For "activate"/"pin": voice profile name; its model is resolved from the profile\'s default engine.'
+        },
+        language: {
+          type: 'string',
+          enum: ['en', 'es'],
+          description: 'For "activate"/"pin": language hint when resolving `voice`.'
+        },
+        engine: {
+          type: 'string',
+          description: 'For "activate"/"pin": explicit engine (qwen, qwen_custom_voice, kokoro, …) instead of a voice.'
+        },
+        model_size: {
+          type: 'string',
+          description: 'For "activate"/"pin": Qwen model size ("1.7B" or "0.6B").'
+        },
+        force: {
+          type: 'boolean',
+          description: 'For "unload": also unload models from a Voicebox the plugin did not start (the desktop app).'
+        },
+        voicebox_url: {
+          type: 'string',
+          description: 'Custom Voicebox HTTP endpoint URL.'
+        },
+        voicebox_port: {
+          type: 'number',
+          description: 'Custom Voicebox port.'
+        }
+      },
+      required: ['action']
     }
   },
   {
@@ -1636,18 +1732,41 @@ function resolveVoiceboxUrl(args = {}, config = {}) {
   return `http://127.0.0.1:${port}`;
 }
 
-async function checkVoiceboxHealth(baseUrl) {
-  try {
-    const res = await httpRequest(`${baseUrl}/health`, { timeout: 3000 });
-    if (res.statusCode >= 200 && res.statusCode < 300) {
-      let info = {};
-      try { info = JSON.parse(res.body); } catch {}
-      return { ok: true, info };
-    }
-    return { ok: false, error: `Voicebox health endpoint returned HTTP ${res.statusCode}: ${res.body.slice(0, 150)}` };
-  } catch (err) {
-    return { ok: false, error: `Cannot reach Voicebox at ${baseUrl} (${err.message})` };
+/**
+ * `agy_voice_model` action "status". Solo lee: nunca levanta Voicebox.
+ */
+async function describirEstadoVoicebox(voiceboxUrl, config) {
+  const h = await vb.salud(voiceboxUrl);
+  const k = vb.leerKeeper();
+  const pin = vb.leerPin();
+  const vram = vb.vramNvidia();
+  let out = '### 🎙️ Voicebox\n\n';
+  if (!h.ok) {
+    out += `- **Servidor**: apagado (${h.error})\n`;
+    out += `- **Autoarranque**: ${config.voiceboxAutostart === false ? 'desactivado' : 'se levanta solo, sin GUI, al primer uso de voz'}\n`;
+  } else {
+    out += `- **Servidor**: \`${voiceboxUrl}\` · ${h.info.backend_variant || '?'}${h.info.gpu_type ? ` (${h.info.gpu_type})` : ''}\n`;
+    let lanzadoPor = 'la GUI (sin keeper)';
+    if (k && k.vivo) lanzadoPor = k.ownsServer ? `el plugin (keeper ${k.pid})` : `la GUI (keeper ${k.pid} en solo lectura)`;
+    out += `- **Lanzado por**: ${lanzadoPor}\n`;
+    let modelos = [];
+    try { modelos = await vb.estadoModelos(voiceboxUrl); } catch {}
+    const usos = vb.leerUsos();
+    const ahora = Date.now();
+    const cargados = modelos.filter(m => m.loaded).map(m => {
+      let d = `\`${m.model_name}\``;
+      if (m.size_mb) d += ` (${Math.round(m.size_mb)} MB)`;
+      if (pin && pin.model === m.model_name) d += ' 📌';
+      if (usos[m.model_name]) d += `, usado hace ${Math.round((ahora - usos[m.model_name]) / 60000)} min`;
+      return d;
+    });
+    out += `- **Modelos cargados**: ${cargados.length ? cargados.join('; ') : 'ninguno'}\n`;
   }
+  out += `- **Fijado**: ${pin ? `\`${pin.model}\`${pin.voice ? ` (voz ${pin.voice})` : ''} desde ${pin.since}` : 'nada'}\n`;
+  out += `- **VRAM**: ${vram ? `${(vram.libreMb / 1024).toFixed(1)} GB libres de ${(vram.totalMb / 1024).toFixed(1)} GB` : 'sin nvidia-smi'}\n`;
+  out += `- **Inactividad**: descarga a los ${config.voiceboxIdleUnloadMinutes} min y apaga a los ${config.voiceboxIdleShutdownMinutes || '∞'} min (solo si lo levantó el plugin)\n`;
+  out += `- **Estado y logs**: \`${vb.dirEstado()}\`\n`;
+  return out;
 }
 
 async function getVoiceboxProfiles(baseUrl) {
@@ -1688,14 +1807,31 @@ async function voiceboxModelsLoad(baseUrl, modelSize) {
  * del log de sesion, la otra lo recibe-, y mantener dos copias garantizaba que
  * una arreglara un fallo que la otra conservase.
  */
-async function emitNarration({
+async function emitNarration(opciones) {
+  // El modelo queda marcado en uso durante toda la emisión: al empezar, cada
+  // 10 s mientras se espera el .wav (acá o en el bridge) y al terminar. Así
+  // otro proceso nunca lo descarga a mitad de una síntesis (plan C.2).
+  const motor = opciones.motor || { engine: 'qwen', modelSize: '1.7B' };
+  const modelo = vb.ttsModelName(motor.engine, motor.modelSize);
+  vb.tocarUso(modelo);
+  const parar = vb.iniciarToquesPeriodicos(modelo);
+  try {
+    return await emitirNarracionInterna({ ...opciones, motor });
+  } finally {
+    parar();
+    vb.tocarUso(modelo);
+  }
+}
+
+async function emitirNarracionInterna({
   spokenText,
   voiceboxUrl,
   profile,
   language,
   personality = false,
   localPlayback = false,
-  sendTelegram = true
+  sendTelegram = true,
+  motor
 }) {
   const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Roaming');
   const genDir = path.join(appData, 'sh.voicebox.app', 'generations');
@@ -1703,7 +1839,11 @@ async function emitNarration({
 
   let speakRes;
   try {
-    speakRes = await sendVoiceboxGenerate(voiceboxUrl, spokenText, profile.id, language, { personality });
+    speakRes = await sendVoiceboxGenerate(voiceboxUrl, spokenText, profile.id, language, {
+      personality,
+      engine: motor.engine,
+      modelSize: motor.modelSize
+    });
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -1774,7 +1914,7 @@ async function emitNarration({
 /**
  * Bloque de salida comun a las dos herramientas de narracion.
  */
-function formatNarrationOutput({ spokenText, profile, language, personality, localPlayback, emision, voiceboxUrl, voiceResolution }) {
+function formatNarrationOutput({ spokenText, profile, language, personality, localPlayback, emision, voiceboxUrl, voiceResolution, destino = {} }) {
   const langLabel = language === 'es' ? 'Español' : 'Inglés';
   const fallbackNotice = voiceResolution.isFallback
     ? ` *(Fallback: ${voiceResolution.reason})*`
@@ -1783,6 +1923,16 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
   let out = `**Texto narrado:**\n> "${spokenText}"\n\n`;
   out += `**Detalles de la emisión:**\n`;
   out += `- **Perfil de voz**: \`${profile.name}\` (${profile.voice_type || 'cloned'})${fallbackNotice}\n`;
+  if (destino.motor) {
+    const a = destino.activacion || {};
+    let linea = `- **Modelo TTS**: \`${vb.ttsModelName(destino.motor.engine, destino.motor.modelSize)}\``;
+    if (a.fijado) linea += ' 📌 fijado';
+    if (a.descargados && a.descargados.length) linea += ` (antes se descargó: ${a.descargados.join(', ')})`;
+    if (a.postergados && a.postergados.length) linea += ` (sigue cargado, en uso hace <30 s: ${a.postergados.join(', ')})`;
+    out += `${linea}\n`;
+  }
+  if (destino.health && destino.health.started) out += `- **Voicebox**: levantado sin GUI (${destino.health.variante})\n`;
+  if (destino.health && destino.health.aviso) out += `- ⚠️ ${destino.health.aviso}\n`;
   out += `- **Idioma**: \`${langLabel} (${language})\`\n`;
   out += `- **Modo de Personalidad**: ${personality ? `🎭 En personaje (\`${profile.personality || profile.description || 'expresivo'}\`)` : '👔 Neutral / Profesional'}\n`;
   out += `- **Reproducción Local en PC**: ${localPlayback ? (emision.localPlayed ? '🔊 Reproducido limpiamente en altavoces (sin eco)' : '⚠️ Solicitado pero falló el reproductor local') : '🤫 Silencioso en PC'}\n`;
@@ -1805,13 +1955,14 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
 async function prepareNarrationTarget(args, config) {
   const voiceboxUrl = resolveVoiceboxUrl(args, config);
 
-  const health = await checkVoiceboxHealth(voiceboxUrl);
+  // Si no corre, se levanta sin GUI (plan A). El error ya nombra la causa.
+  const health = await vb.ensureVoicebox(voiceboxUrl, { config });
   if (!health.ok) {
     return {
       error: {
         content: [{
           type: 'text',
-          text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}\n\n*Asegúrate de iniciar la aplicación Voicebox en tu equipo (o especifica un puerto/URL personalizado si corre en otra dirección).*`
+          text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}`
         }]
       }
     };
@@ -1839,11 +1990,42 @@ async function prepareNarrationTarget(args, config) {
     };
   }
 
+  // Motor del perfil (plan E) y VRAM (plan C): antes de generar, el modelo de
+  // esta voz pasa a ser el activo — respeta el pin y descarga los TTS ajenos
+  // que no estén en uso.
+  const modelos = {};
+  try {
+    for (const m of await vb.estadoModelos(voiceboxUrl)) modelos[m.model_name] = m;
+  } catch {}
+  const motor = vb.resolverMotor(voiceResolution.profile, modelos);
+  let activacion;
+  try {
+    activacion = await vb.aplicarModeloActivo(voiceboxUrl, {
+      ...motor,
+      voz: voiceResolution.profile.name,
+      fijar: Boolean(args.keep_model)
+    });
+  } catch (err) {
+    // Sin /models/status no se puede ordenar la VRAM, pero sí se puede hablar.
+    activacion = { ok: true, omitida: err.message };
+  }
+  if (!activacion.ok) {
+    return {
+      error: {
+        isError: true,
+        content: [{ type: 'text', text: `⚠️ ${activacion.error}` }]
+      }
+    };
+  }
+
   return {
     voiceboxUrl,
     voiceResolution,
     profile: voiceResolution.profile,
-    language: voiceResolution.language
+    language: voiceResolution.language,
+    motor,
+    activacion,
+    health
   };
 }
 
@@ -1926,7 +2108,8 @@ async function sendVoiceboxGenerate(baseUrl, text, profileId, language, options 
     profile_id: profileId,
     text,
     language: language || 'es',
-    model_size: '1.7B',
+    // null es válido en el schema de Voicebox: los motores no-Qwen no versionan por tamaño.
+    model_size: options.modelSize !== undefined ? options.modelSize : '1.7B',
     engine: options.engine || 'qwen',
     personality: Boolean(options.personality),
     normalize: true
@@ -2537,13 +2720,18 @@ async function handleToolCall(name, args) {
       if (args.permissions !== undefined) updates.permissions = args.permissions;
       if (args.fanout_statusline !== undefined) updates.fanout_statusline = args.fanout_statusline;
       if (args.fanout_statusline_delegate !== undefined) updates.fanout_statusline_delegate = args.fanout_statusline_delegate;
+      // voicebox_url/voicebox_port: saveConfig ya los aceptaba, pero nadie se
+      // los pasaba — la tool los ignoraba en silencio.
+      for (const clave of ['voicebox_url', 'voicebox_port', ...CLAVES_VOICEBOX_CONFIG]) {
+        if (args[clave] !== undefined) updates[clave] = args[clave];
+      }
 
       const result = saveConfig(updates, scope, args.cwd);
       return {
         content: [
           {
             type: 'text',
-            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || '(none: agy decides)'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Fanout statusline: ${result.config.fanout_statusline === false ? 'disabled' : 'enabled'}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
+            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || '(none: agy decides)'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Fanout statusline: ${result.config.fanout_statusline === false ? 'disabled' : 'enabled'}\n- Voicebox: autostart ${result.config.voicebox_autostart === false ? 'off' : 'on'}, idle unload ${result.config.voicebox_idle_unload_minutes ?? 10}m, idle shutdown ${result.config.voicebox_idle_shutdown_minutes ?? 30}m, statusline ${result.config.statusline_voicebox === false ? 'off' : 'on'}${result.config.voicebox_url ? `, url ${result.config.voicebox_url}` : ''}${result.config.voicebox_port ? `, port ${result.config.voicebox_port}` : ''}${result.config.voicebox_server_exe ? `, exe ${result.config.voicebox_server_exe}` : ''}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
           }
         ]
       };
@@ -2986,7 +3174,15 @@ async function handleToolCall(name, args) {
         if (args.prewarm_voicebox !== false) {
           const voiceboxUrl = resolveVoiceboxUrl(args, config);
           const modelSize = args.voicebox_model_size || '1.7B';
-          voiceboxModelsLoad(voiceboxUrl, modelSize)
+          // Además de precargar: levanta Voicebox si no corre, y respeta el pin
+          // y la regla de un solo TTS residente antes de cargar (plan A y C).
+          (async () => {
+            const s = await vb.ensureVoicebox(voiceboxUrl, { config });
+            if (!s.ok) return { ok: false, error: s.error };
+            const a = await vb.aplicarModeloActivo(voiceboxUrl, { engine: 'qwen', modelSize });
+            if (!a.ok) return { ok: false, error: a.error };
+            return voiceboxModelsLoad(voiceboxUrl, modelSize);
+          })()
             .then((r) => {
               if (!r.ok) {
                 process.stderr.write(`[antigravity-mcp] Voicebox pre-warm failed for session ${session.id}: ${r.error}\n`);
@@ -3864,7 +4060,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         language: targetLang,
         personality: enablePersonality,
         localPlayback: playLocally,
-        sendTelegram: args.send_telegram !== false
+        sendTelegram: args.send_telegram !== false,
+        motor: destino.motor
       });
 
       if (!emision.ok) {
@@ -3887,7 +4084,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         localPlayback: playLocally,
         emision,
         voiceboxUrl,
-        voiceResolution
+        voiceResolution,
+        destino
       });
       out += `\n**Contexto del Checkpoint detectado:**\n`;
       out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
@@ -3987,7 +4185,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         language: targetLang,
         personality: enablePersonality,
         localPlayback: playLocally,
-        sendTelegram: args.send_telegram !== false
+        sendTelegram: args.send_telegram !== false,
+        motor: destino.motor
       });
 
       if (!emision.ok) {
@@ -4008,7 +4207,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         localPlayback: playLocally,
         emision,
         voiceboxUrl,
-        voiceResolution
+        voiceResolution,
+        destino
       });
       out += `- **Origen del guión**: ${polishApplied ? `✨ Pulido por agy (${polishDuration.toFixed(1)}s)` : '📝 Texto del llamante, saneado localmente'}\n`;
       if (truncated) {
@@ -4020,6 +4220,86 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       return {
         content: [{ type: 'text', text: out }]
       };
+    }
+
+    case 'agy_voice_model': {
+      const voiceboxUrl = resolveVoiceboxUrl(args, config);
+      const responder = (texto, isError = false) => ({
+        ...(isError ? { isError: true } : {}),
+        content: [{ type: 'text', text: texto }]
+      });
+      const action = args.action;
+
+      if (action === 'status') return responder(await describirEstadoVoicebox(voiceboxUrl, config));
+
+      if (action === 'release') {
+        const pin = vb.leerPin();
+        vb.escribirPin(null);
+        return responder(pin
+          ? `Pin liberado (\`${pin.model}\`). Se descarga tras ${config.voiceboxIdleUnloadMinutes} min sin uso.`
+          : 'No había ningún modelo fijado.');
+      }
+
+      if (!['start', 'activate', 'pin', 'unload'].includes(action)) {
+        return responder(`Acción desconocida: \`${action}\`.`, true);
+      }
+
+      const health = await vb.ensureVoicebox(voiceboxUrl, { config });
+      if (!health.ok) return responder(`⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}`, true);
+
+      if (action === 'start') {
+        let out = health.started
+          ? `✅ Voicebox levantado sin GUI (${health.variante}, \`${health.exe}\`).`
+          : `✅ Voicebox ya estaba corriendo en \`${voiceboxUrl}\`.`;
+        if (health.aviso) out += `\n\n⚠️ ${health.aviso}`;
+        return responder(out);
+      }
+
+      if (action === 'unload') {
+        const k = vb.leerKeeper();
+        if (!(k && k.vivo && k.ownsServer) && !args.force) {
+          return responder('Este Voicebox no lo levantó el plugin (probablemente la GUI): no descargo sus modelos. Pasá `force: true` para hacerlo igual.', true);
+        }
+        vb.escribirPin(null);
+        const tts = (await vb.estadoModelos(voiceboxUrl)).filter(m => m.loaded && vb.esModeloTts(m.model_name));
+        const liberados = [];
+        for (const m of tts) {
+          try {
+            await vb.descargarModelo(voiceboxUrl, m.model_name);
+            liberados.push(`\`${m.model_name}\`${m.size_mb ? ` (${Math.round(m.size_mb)} MB)` : ''}`);
+          } catch (err) {
+            process.stderr.write(`[antigravity-mcp] unload de ${m.model_name} falló: ${err.message}\n`);
+          }
+        }
+        return responder(liberados.length ? `🗑️ Descargados: ${liberados.join(', ')}. Pin liberado.` : 'No había modelos TTS cargados. Pin liberado.');
+      }
+
+      // activate / pin
+      let perfil = null;
+      if (args.voice) {
+        try {
+          perfil = resolveVoiceProfile(await getVoiceboxProfiles(voiceboxUrl), args.voice, args.language).profile;
+        } catch (err) {
+          return responder(`⚠️ ${err.message}`, true);
+        }
+      }
+      if (!perfil && !args.engine) return responder('Indicá `voice` o `engine` (y opcionalmente `model_size`).', true);
+
+      const mapa = {};
+      for (const m of await vb.estadoModelos(voiceboxUrl)) mapa[m.model_name] = m;
+      const motor = vb.resolverMotor(perfil || {}, mapa, args.engine || null, args.model_size || null);
+      const r = await vb.aplicarModeloActivo(voiceboxUrl, { ...motor, voz: perfil ? perfil.name : null, fijar: action === 'pin' });
+      if (!r.ok) return responder(`⚠️ ${r.error}`, true);
+
+      const deVoz = perfil ? ` (voz ${perfil.name})` : '';
+      let out = action === 'pin'
+        ? `📌 \`${r.objetivo}\` fijado${deVoz}: queda cargado hasta \`release\` o \`unload\`.`
+        : `✅ Modelo activo: \`${r.objetivo}\`${deVoz}.`;
+      if (r.descargados.length) out += `\n- Descargados antes: ${r.descargados.map(n => `\`${n}\``).join(', ')}`;
+      if (r.postergados.length) out += `\n- Siguen cargados (en uso hace <30 s, los descarga el keeper): ${r.postergados.map(n => `\`${n}\``).join(', ')}`;
+      if (r.guarda === 'ok') out += '\n- Guarda de VRAM: hay espacio.';
+      else if (r.guarda === 'omitida') out += '\n- Guarda de VRAM: omitida (sin nvidia-smi o sin tamaño del modelo).';
+      return responder(out);
     }
 
     case 'telegram_bridge_status': {
@@ -4198,13 +4478,13 @@ Be thorough but concise. Prioritize primary sources and official documentation o
     case 'agy_narrate_voices': {
       const voiceboxUrl = resolveVoiceboxUrl(args, config);
 
-      // 1. Verify Voicebox health
-      const health = await checkVoiceboxHealth(voiceboxUrl);
+      // 1. Voicebox arriba (se levanta sin GUI si hace falta)
+      const health = await vb.ensureVoicebox(voiceboxUrl, { config });
       if (!health.ok) {
         return {
           content: [{
             type: 'text',
-            text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}\n\n*Asegúrate de que la aplicación Voicebox esté iniciada en tu equipo (o especifica un puerto/URL personalizado si corre en otra dirección).*`
+            text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}`
           }]
         };
       }

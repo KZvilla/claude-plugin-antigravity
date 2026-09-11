@@ -21,6 +21,62 @@ GENERATIONS_DIR = os.path.join(
     "sh.voicebox.app", "generations"
 )
 
+# Estado compartido con el MCP (mcp-server/voicebox-server.js, dirEstado): misma
+# regla de resolucion. Python solo TOCA archivos de uso (sin contenido) y LEE el
+# pin; nunca escribe pin.json -- asi Node y Python no se pisan sin necesitar un
+# lock entre lenguajes.
+STATE_DIR = (
+    os.environ.get("LAGRANGE_VOICEBOX_DIR")
+    or os.path.join(os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~"),
+                    ".claude", "lagrange-voicebox")
+)
+USO_DIR = os.path.join(STATE_DIR, "uso")
+PIN_PATH = os.path.join(STATE_DIR, "pin.json")
+INTERVALO_TOQUE_S = 10
+
+
+def tocar_uso(model_name):
+    """Marca el modelo como en uso para el keeper y para la regla de swap."""
+    if not model_name:
+        return
+    try:
+        os.makedirs(USO_DIR, exist_ok=True)
+        ruta = os.path.join(USO_DIR, "".join(c if (c.isalnum() or c in "_.-") else "_" for c in model_name))
+        with open(ruta, "a"):
+            pass
+        os.utime(ruta, None)
+    except OSError:
+        pass
+
+
+def leer_pin():
+    try:
+        with open(PIN_PATH, encoding="utf-8") as f:
+            pin = json.load(f)
+        return pin if pin and pin.get("model") else None
+    except (OSError, ValueError):
+        return None
+
+
+class LatidoUso:
+    """Toca los modelos de la sesion cada 60 s mientras la charla sigue abierta:
+    una pausa larga no debe dejar que el keeper los descargue a mitad."""
+
+    def __init__(self, modelos, intervalo=60):
+        self._modelos = [m for m in modelos if m]
+        self._intervalo = intervalo
+        self._parar = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while not self._parar.is_set():
+            for m in self._modelos:
+                tocar_uso(m)
+            self._parar.wait(self._intervalo)
+
+    def stop(self):
+        self._parar.set()
+
 
 class McpClient:
     """Habla JSON-RPC 2.0 con un mcp-server/index.js recien spawneado, sobre stdio -
@@ -104,7 +160,7 @@ def voicebox_request(path, method="GET", payload=None, timeout=15, raw_body=None
     except urllib.error.URLError as err:
         raise RuntimeError(
             f"No se pudo contactar Voicebox en {VOICEBOX_URL}{path} ({err}). "
-            "¿Esta la app Voicebox corriendo?"
+            "El MCP lo levanta sin GUI con agy_voice_model action 'start'; si no, abri la app."
         )
 
 
@@ -168,12 +224,22 @@ def resolve_engine_and_model(profile, model_status, engine_override=None, model_
     return engine, "1.7B"  # default del schema si no encontramos nada ya descargado
 
 
-def wait_for_generation_wav(generation_id, before_files, timeout=90):
+def wait_for_generation_wav(generation_id, before_files, timeout=90, on_tick=None):
     # Si tenemos un generation_id, NUNCA usar el fallback de "cualquier archivo
     # nuevo": con sintesis en paralelo (varias oraciones a la vez), el fallback
     # puede agarrar el .wav de OTRA generacion concurrente que broto primero,
     # encolando el mismo audio dos veces bajo dos oraciones distintas. El
     # fallback por snapshot solo es seguro cuando no hay id para apuntar.
+    #
+    # on_tick se llama cada INTERVALO_TOQUE_S mientras se espera: una sintesis
+    # larga (CPU, texto extenso) no debe parecer inactiva a la regla de swap.
+    ultimo_tick = [time.time()]
+
+    def tick():
+        if on_tick and time.time() - ultimo_tick[0] >= INTERVALO_TOQUE_S:
+            ultimo_tick[0] = time.time()
+            on_tick()
+
     if generation_id:
         target = os.path.join(GENERATIONS_DIR, f"{generation_id}.wav")
         deadline = time.time() + timeout
@@ -181,11 +247,13 @@ def wait_for_generation_wav(generation_id, before_files, timeout=90):
             if os.path.exists(target) and os.path.getsize(target) > 2000:
                 time.sleep(0.2)
                 return target
+            tick()
             time.sleep(0.3)
         return None
 
     deadline = time.time() + timeout
     while time.time() < deadline:
+        tick()
         if os.path.isdir(GENERATIONS_DIR):
             for f in os.listdir(GENERATIONS_DIR):
                 if f not in before_files and f.endswith((".wav", ".ogg", ".mp3")):
@@ -212,9 +280,12 @@ def synthesize_sentence(text, profile, language, engine, model_size=None):
     }
     if model_size:
         payload["model_size"] = model_size
+    modelo = tts_model_name(engine, model_size)
+    tocar_uso(modelo)
     res = voicebox_request("/generate", method="POST", payload=payload)
     gen_id = res.get("id")
-    wav_path = wait_for_generation_wav(gen_id, before)
+    wav_path = wait_for_generation_wav(gen_id, before, on_tick=lambda: tocar_uso(modelo))
+    tocar_uso(modelo)
     if not wav_path:
         raise RuntimeError(f"Voicebox nunca escribio el .wav de la generacion {gen_id}")
     return gen_id, wav_path
@@ -277,7 +348,13 @@ def stt_full_model_name(short_name):
     return f"whisper-{short_name}"
 
 
-def unload_model(model_name):
+def unload_model(model_name, respetar_pin=True):
+    # El usuario fijo ese modelo para que quede en VRAM: salir de la charla no
+    # es "indicar lo contrario".
+    pin = leer_pin() if respetar_pin else None
+    if pin and pin.get("model") == model_name:
+        print(f"  📌 {model_name} esta fijado: no se descarga (agy_voice_model action 'release' para soltarlo).")
+        return False
     try:
         voicebox_request(f"/models/{model_name}/unload", method="POST", payload={})
         return True
@@ -290,12 +367,18 @@ def unload_all_loaded_models():
     """A diferencia de unload_model() (que descarga UN modelo puntual), esto
     descarga TODO lo que Voicebox tenga marcado como loaded en este momento -
     util porque --unload-on-exit solo limpia lo que ESA corrida del script uso,
-    no lo que quedo cargado de corridas anteriores (perfiles/motores distintos)."""
+    no lo que quedo cargado de corridas anteriores (perfiles/motores distintos).
+    El modelo fijado se respeta."""
     status = get_model_status()
+    pin = leer_pin()
     loaded = [m for m in status.values() if m.get("loaded")]
+    if pin:
+        if any(m["model_name"] == pin["model"] for m in loaded):
+            print(f"  📌 {pin['model']} esta fijado: se deja cargado.")
+        loaded = [m for m in loaded if m["model_name"] != pin["model"]]
     freed_mb = 0
     for m in loaded:
-        if unload_model(m["model_name"]):
+        if unload_model(m["model_name"], respetar_pin=False):
             freed_mb += m.get("size_mb") or 0
             print(f"  🗑️ {m['model_name']} descargado ({(m.get('size_mb') or 0) / 1024:.2f} GB)")
     return freed_mb / 1024

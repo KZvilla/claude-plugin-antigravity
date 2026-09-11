@@ -28,7 +28,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
     resolve_voice_profile, synthesize_sentence, voicebox_cancel,
-    get_model_status, resolve_engine_and_model, unload_all_loaded_models
+    get_model_status, resolve_engine_and_model, unload_all_loaded_models,
+    LatidoUso, tts_model_name
 )
 
 
@@ -43,6 +44,8 @@ def main():
     parser.add_argument("--model-size", default=None, help='Forzar tamano de modelo (ej. "1.7B", "0.6B") - solo aplica a motores Qwen.')
     parser.add_argument("--unload-all", action="store_true",
                          help="Descargar TODO lo que Voicebox tenga cargado ahora mismo (de cualquier corrida previa) y salir.")
+    parser.add_argument("--soltar-pin", action="store_true",
+                         help="Soltar el modelo fijado antes de empezar (si choca con el motor de la voz elegida).")
     args = parser.parse_args()
 
     if args.unload_all:
@@ -53,6 +56,11 @@ def main():
     print("[voice-loop] Conectando al servidor MCP real (mcp-server/index.js)...")
     mcp = McpClient()
 
+    # Voicebox arriba sin depender de la GUI: el MCP lo levanta si hace falta.
+    print("[voice-loop] " + mcp.call_tool("agy_voice_model", {"action": "start"}).splitlines()[0])
+    if args.soltar_pin:
+        print("[voice-loop] " + mcp.call_tool("agy_voice_model", {"action": "release"}))
+
     print(f"[voice-loop] Resolviendo perfil de voz en Voicebox (preferido: {args.voice or 'default'})...")
     profile = resolve_voice_profile(args.voice, args.language)
     print(f"[voice-loop] Perfil elegido: {profile['name']}")
@@ -62,6 +70,20 @@ def main():
     model_status = get_model_status()
     engine, model_size = resolve_engine_and_model(profile, model_status, args.engine, args.model_size)
     print(f"[voice-loop] Motor TTS: {engine}" + (f" ({model_size})" if model_size else ""))
+
+    # El modelo de esta voz pasa a ser el activo antes de empezar: si hay otro
+    # fijado, o no hay VRAM, se dice ahora y no a mitad de la charla.
+    activate_args = {"action": "activate", "engine": engine}
+    if model_size:
+        activate_args["model_size"] = model_size
+    try:
+        mcp.call_tool("agy_voice_model", activate_args)
+    except RuntimeError as err:
+        print(f"[voice-loop] {err}")
+        print("[voice-loop] Si hay un modelo fijado de otra voz, volve a correr con --soltar-pin.")
+        mcp.close()
+        return
+    latido = LatidoUso([tts_model_name(engine, model_size)])
 
     print("[voice-loop] Iniciando sesion agy_voice_stream (con pre-warm de Voicebox en paralelo)...")
     start_text = mcp.call_tool("agy_voice_stream", {
@@ -122,6 +144,7 @@ def main():
             pass
         mcp.close()
         executor.shutdown(wait=False)
+        latido.stop()
 
 
 if __name__ == "__main__":
