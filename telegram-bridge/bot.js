@@ -10,6 +10,14 @@ import { runAgyTask, runAgyArgs, AGY_BIN, getAgyStatus, resolveWorkspace, resolv
 import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk, formatElapsed, finalProgressLabel } from './formatter.js';
 import { redactSecrets } from './policy.js';
 import { startLogRotation } from './logrotate.js';
+import {
+  resolverRutaEnWorkspace,
+  resumenDeCambios,
+  diffDeArchivo,
+  parsearLineasLogs,
+  logsDelDaemon,
+  componerRespuesta
+} from './lectura.js';
 import { resolveDataFile, legacyDataFile, loadBridgeEnv, describeEnvSearch, bridgeDataDirPath } from './paths.js';
 import {
   getConversationId,
@@ -377,7 +385,11 @@ async function processTaskQueue() {
           .text('✅ Ejecutar cambios', `exec_plan:${result.conversationId}`)
           .text('❌ Descartar', 'cancel_plan');
 
-        await replyWithSmartChunks(ctx, fullResponse, { reply_markup: keyboard });
+        // FEAT-027 — Ajustar un plan ya se puede: el `setConversationId` de
+        // arriba deja este plan como sesión del chat, y el texto suelto va en
+        // modo plan sobre ella. Solo faltaba decirlo.
+        const ayudaAjuste = '\n\n_¿Quieres ajustarlo? Responde con los cambios: sigue sobre este mismo plan._';
+        await replyWithSmartChunks(ctx, fullResponse + ayudaAjuste, { reply_markup: keyboard });
       } else {
         await replyWithSmartChunks(ctx, fullResponse);
       }
@@ -646,7 +658,9 @@ export function buildStopMessageAndKeyboard(
  */
 export function createBot({
   token = process.env.TELEGRAM_BOT_TOKEN,
-  allowedUserIds = parseAllowedUserIds()
+  allowedUserIds = parseAllowedUserIds(),
+  // Inyectable para que los tests de /logs no lean el log real de la máquina.
+  logFile = path.join(__dirname, 'daemon.log')
 } = {}) {
   const bot = new Bot(token);
   botRef = bot;
@@ -702,6 +716,8 @@ Puente móvil autónomo conectado a tu entorno local.
 • \`/cast <agente> <pedido>\` — Consulta a un agente persistido de solo lectura; eliges el proyecto con un botón.
 • \`/status\` — Consulta estado del binario, versión, sesión activa y política de permisos.
 • \`/queue\` — Muestra la tarea en curso y las encoladas.
+• \`/diff [archivo]\` — Cambios sin commitear del workspace. El contenido sale a Telegram; lo que esté en \`deny_paths\` no.
+• \`/logs [N]\` — Últimas líneas del log del daemon, para ver por qué falló algo. Si el bot está caído, esto tampoco responde.
 • \`/cancel\` — Aborta la tarea en curso y vacía la cola.
 • \`/reset\` — Reinicia la conversación y olvida el contexto actual.
 
@@ -1015,6 +1031,37 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
     await sendSafeChunk(ctx, lineas.join('\n'));
   });
 
+  // FEAT-028 — Instantáneo, como /status: no pasa por la cola. Mira el mismo
+  // workspace donde escribe /run. Los controles de ruta viven en lectura.js.
+  bot.command('diff', async (ctx) => {
+    const arg = (ctx.match || '').trim();
+    const cwd = resolveWorkspace();
+    try {
+      let resultado;
+      if (!arg) {
+        resultado = resumenDeCambios({ cwd });
+      } else {
+        const ruta = resolverRutaEnWorkspace(arg, cwd);
+        resultado = ruta.ok ? diffDeArchivo({ cwd, ...ruta }) : { aviso: `⚠️ ${ruta.motivo}` };
+      }
+      await replyWithSmartChunks(ctx, componerRespuesta(resultado));
+    } catch (err) {
+      await ctx.reply(`❌ No se pudo obtener el diff: ${redactSecrets(err.message)}`);
+    }
+  });
+
+  // FEAT-029 — Sirve cuando el bot responde pero algo falló en silencio; si el
+  // bot está caído, este comando tampoco llega.
+  bot.command('logs', async (ctx) => {
+    const { lineas, aviso } = parsearLineasLogs(ctx.match);
+    try {
+      const cuerpo = componerRespuesta(logsDelDaemon({ lineas, logFile }));
+      await replyWithSmartChunks(ctx, aviso ? `⚠️ ${aviso}\n\n${cuerpo}` : cuerpo);
+    } catch (err) {
+      await ctx.reply(`❌ No se pudo leer el log: ${redactSecrets(err.message)}`);
+    }
+  });
+
   // ==============================================================================
   // Botones interactivos (Inline Keyboards)
   // ==============================================================================
@@ -1060,6 +1107,16 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
       const askId = parts[1];
       const optionIndex = parseInt(parts[2], 10);
       const pending = getPendingAsk(askId);
+
+      // FEAT-035 (hardening) — Solo el chat al que se mandó la pregunta puede
+      // responderla: el `callback_data` lo puede fabricar un cliente propio.
+      // Va antes del chequeo de estado para no revelar si un ask ajeno sigue
+      // abierto, y sin `chatId` guardado no hay dueño contra el cual comparar.
+      if (pending && (!pending.chatId || !ctx.chat?.id || String(pending.chatId) !== String(ctx.chat.id))) {
+        console.warn(`[SEGURIDAD] Callback del ask ${askId} desde el chat ${ctx.chat?.id ?? '?'}, que no es el suyo. Ignorado.`);
+        await ctx.answerCallbackQuery({ text: 'Esta consulta no pertenece a este chat.' });
+        return;
+      }
 
       if (pending && pending.status !== 'pending') {
         await ctx.answerCallbackQuery({

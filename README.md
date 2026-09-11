@@ -858,6 +858,8 @@ When running the bidirectional daemon (`bot.js`), your private Telegram chat bec
 | `/run <task>` | Start a new Antigravity subagent session with direct edit permissions |
 | `/resume <task>` | Continue the current active conversation thread (`conversation_id`) |
 | `/status` | Report active `agy` binary, version, current model/effort, and permission policies |
+| `/diff [file]` | Uncommitted changes in the workspace (untracked files included); with a file, its patch. Answers instantly, never queued. Paths are confined to the workspace, git runs with `--literal-pathspecs`, and files matching `deny_paths` are never shown — the rest of the content does reach Telegram |
+| `/logs [N]` | Last N lines (default 30, max 100) of the daemon log: `daemon.log` on Windows, the journal on Linux. For finding out why something failed — if the bot is down, this cannot answer either |
 | `/queue` / `/cancel` | Inspect or abort queued tasks |
 | `/reset` | Clear the current conversation context and start fresh |
 

@@ -8,11 +8,12 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { registerPendingAsk, getPendingAsk, expirePendingAsk } from './state.js';
 import { splitMessage, markdownToTelegramHtml, escapeHtml } from './formatter.js';
 import { assertPathAllowed, PolicyViolationError, redactSecrets } from './policy.js';
-import { loadBridgeEnv, describeEnvSearch } from './paths.js';
+import { loadBridgeEnv, describeEnvSearch, estadoDaemon } from './paths.js';
 
 // Límite propio del caption de Telegram, muy por debajo de los 4096 del texto.
 const CAPTION_LIMIT = 1024;
@@ -331,6 +332,17 @@ export async function sendTelegramVoice(options = {}) {
 }
 
 /**
+ * Identificador de un ask. Aleatorio de verdad: el anterior (`Date.now()` más
+ * cuatro caracteres de `Math.random()`) se podía adivinar sabiendo más o menos
+ * la hora, y el `callback_data` lo puede fabricar un cliente propio. Queda en
+ * `ask:ask_<16 hex>:<i>`, lejos de los 64 bytes, y sin `:` que confunda el
+ * `split(':')` del handler.
+ */
+export function nuevoAskId() {
+  return 'ask_' + crypto.randomBytes(8).toString('hex');
+}
+
+/**
  * 3. Pregunta interactiva Human-in-the-Loop (Espera respuesta desde el móvil)
  */
 export async function askTelegramQuestion(options = {}) {
@@ -342,8 +354,21 @@ export async function askTelegramQuestion(options = {}) {
   } = options;
 
   if (!question) throw new Error('Se requiere el parámetro "question".');
+
+  // Antes de cualquier llamada a Telegram: sin daemon, la pregunta llegaría con
+  // botones que nadie puede atender y el usuario los tocaría en vano. Aquí, y
+  // no en el servidor MCP, porque este proceso ya cargó el .env: una
+  // TELEGRAM_BRIDGE_DATA_DIR definida ahí apunta al lock correcto.
+  const daemon = estadoDaemon();
+  if (!daemon.vivo) {
+    throw new Error(
+      `El bot de Telegram no está corriendo (${daemon.motivo}): la pregunta tendría botones que nadie puede atender. ` +
+      'Arráncalo con `npm run bridge:daemon:start` desde el clon, o revisa `npm run bridge:daemon:logs`.'
+    );
+  }
+
   const chatId = getDefaultChatId(targetChatId);
-  const askId = 'ask_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+  const askId = nuevoAskId();
 
   // Construir teclado en línea
   const inlineKeyboard = [
@@ -374,7 +399,10 @@ export async function askTelegramQuestion(options = {}) {
     timeoutSeconds
   });
 
-  console.log(`[notify] Esperando respuesta del usuario para consulta "${askId}" (${timeoutSeconds}s máx)...`);
+  // stderr: bajo `--ask-json` el stdout es un JSON que el servidor MCP parsea.
+  // En stdout, este aviso rompía ese parse y todo ask respondido volvía como
+  // «Process exited with code 0».
+  console.error(`[notify] Esperando respuesta del usuario para consulta "${askId}" (${timeoutSeconds}s máx)...`);
 
   // Bucle de espera no bloqueante
   const startTime = Date.now();

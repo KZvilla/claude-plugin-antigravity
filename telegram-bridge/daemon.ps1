@@ -117,14 +117,45 @@ function Test-Prerequisites {
     }
     Ok "Configuración en $envFile"
 
-    $modules = Join-Path $BridgeDir 'node_modules'
-    if (-not (Test-Path $modules)) {
-        Warn "Falta node_modules. Ejecutando npm install..."
-        Push-Location $BridgeDir
-        try { & npm install --omit=dev } finally { Pop-Location }
-    }
-
+    # Las dependencias NO se instalan aqui: Test-Prerequisites corre en install
+    # antes de parar el bot, y npm ci con el bot vivo choca contra los archivos
+    # abiertos de node_modules. Ver Assert-Dependencias.
     return $nodePath
+}
+
+<#
+    Dependencias REALES, paquete por paquete (deps.mjs). Antes solo se miraba
+    que existiera la carpeta node_modules: una incompleta pasaba y el bot moria
+    al arrancar con ERR_MODULE_NOT_FOUND, sin que install ni start lo notaran.
+#>
+function Get-DependenciasFaltantes {
+    $nodePath = Get-NodePath
+    # Sin `2>&1`: con $ErrorActionPreference = 'Stop', Windows PowerShell 5.1
+    # convierte el stderr redirigido de un nativo en un error terminante, y un
+    # package.json ilegible (deps.mjs sale con 2 y escribe en stderr) tumbaba
+    # el script en vez de llegar al Fail. El stderr se ve igual en la consola.
+    $salida = & $nodePath (Join-Path $BridgeDir 'deps.mjs') $BridgeDir
+    if ($LASTEXITCODE -eq 0) { return @() }
+    $lista = @($salida | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    if ($lista.Count -eq 0) { $lista = @('(no se pudo leer package.json)') }
+    return $lista
+}
+
+# Solo con el bot parado: npm ci borra node_modules antes de reinstalar.
+function Assert-Dependencias {
+    $faltan = @(Get-DependenciasFaltantes)
+    if ($faltan.Count -eq 0) { Ok 'Dependencias completas'; return }
+
+    Warn "Faltan dependencias: $($faltan -join ', '). Instalando..."
+    Push-Location $BridgeDir
+    try {
+        if (Test-Path (Join-Path $BridgeDir 'package-lock.json')) { & npm ci --omit=dev }
+        else { & npm install --omit=dev }
+    } finally { Pop-Location }
+
+    $faltan = @(Get-DependenciasFaltantes)
+    if ($faltan.Count -gt 0) { Fail "Siguen faltando dependencias: $($faltan -join ', '). Revisa la salida de npm." }
+    Ok 'Dependencias instaladas'
 }
 
 function Get-BridgeTask {
@@ -261,6 +292,15 @@ function Invoke-Install {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
 
+    # Parada la tarea, un bot que siga vivo no es suyo: se lanzo a mano. No se
+    # mata sin avisar; se pide detenerlo, porque npm ci no puede reemplazar
+    # node_modules con ese proceso usando sus archivos.
+    $lock = Get-LockInfo
+    if ($lock -and (Get-Process -Id $lock.pid -ErrorAction SilentlyContinue)) {
+        Fail "Hay un bot vivo (PID $($lock.pid)) que no es de la tarea. Detenlo antes de instalar."
+    }
+    Assert-Dependencias
+
     # Task Scheduler no redirige la salida, así que se envuelve en cmd.exe para
     # conservar un log: sin él, un daemon que falla no deja rastro alguno. Ese
     # cmd.exe es justo la ventana vacia que se ve en el escritorio, asi que por
@@ -357,6 +397,9 @@ function Invoke-Start {
         Info 'Para que tome código nuevo: .\daemon.ps1 stop y luego start.'
         return
     }
+    # Aqui ya no hay bot vivo, asi que reinstalar es seguro. Sin esto, un
+    # node_modules incompleto dejaba la tarea «arrancada» y el bot muerto.
+    Assert-Dependencias
     Invoke-RotateLog
     Start-ScheduledTask -TaskName $TaskName
     Ok 'Tarea arrancada.'
@@ -394,6 +437,12 @@ function Invoke-Status {
         } else {
             Warn "Lockfile huérfano del PID $($lock.pid): el proceso ya no existe."
         }
+    }
+
+    # Informativo: status no instala nada.
+    $faltan = @(Get-DependenciasFaltantes)
+    if ($faltan.Count -gt 0) {
+        Warn "Faltan dependencias: $($faltan -join ', '). El bot no arrancaria; .\daemon.ps1 start las instala."
     }
 
     if (Test-Path $LogFile) {
