@@ -159,14 +159,20 @@ function crearWorktrees(repoPath, { slug, cantidad, ramaBase }) {
  *
  * @returns {{ limpios: Array, sucios: Array }}
  */
-function inspeccionarWorktrees(repoPath, ramaBase) {
-  const resultado = { limpios: [], sucios: [] };
-  if (!esRepoGit(repoPath)) return resultado;
-
-  const base = ramaBase || ramaActual(repoPath);
+/**
+ * Todos los worktrees del repo, como `{ ruta, rama }`, leídos de
+ * `git worktree list --porcelain`. Sin filtrar: quién es de quién lo decide
+ * cada llamador. Es el único parser de ese formato en el servidor; lo usan
+ * `inspeccionarWorktrees` y el diff del visor (FEAT-033).
+ *
+ * @returns {Array<{ ruta: string, rama: string }>}
+ */
+function listarWorktrees(repoPath) {
+  if (!esRepoGit(repoPath)) return [];
   const bruto = git(repoPath, ['worktree', 'list', '--porcelain'], { permitirFallo: true });
-  if (bruto === null) return resultado;
+  if (bruto === null) return [];
 
+  const lista = [];
   const bloques = bruto.split(/\r?\n\r?\n/).map(b => b.trim()).filter(Boolean);
   for (const bloque of bloques) {
     let ruta = '';
@@ -175,7 +181,17 @@ function inspeccionarWorktrees(repoPath, ramaBase) {
       if (linea.startsWith('worktree ')) ruta = linea.slice(9).trim();
       else if (linea.startsWith('branch refs/heads/')) rama = linea.slice(18).trim();
     }
-    if (!ruta) continue;
+    if (ruta) lista.push({ ruta, rama });
+  }
+  return lista;
+}
+
+function inspeccionarWorktrees(repoPath, ramaBase) {
+  const resultado = { limpios: [], sucios: [] };
+  if (!esRepoGit(repoPath)) return resultado;
+
+  const base = ramaBase || ramaActual(repoPath);
+  for (const { ruta, rama } of listarWorktrees(repoPath)) {
 
     // Solo los nuestros. Los del bridge (`bridge-`) y el worktree principal
     // quedan fuera por construcción.
@@ -257,6 +273,7 @@ module.exports = {
   resolverRamaBase,
   prepararRamaBase,
   crearWorktrees,
+  listarWorktrees,
   inspeccionarWorktrees,
   limpiarWorktrees
 };

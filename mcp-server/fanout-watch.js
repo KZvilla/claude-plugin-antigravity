@@ -58,8 +58,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const os = require('node:os');
+const { execFileSync } = require('node:child_process');
+const { pathToFileURL } = require('node:url');
 
 const { rutaEstado, rutaProgreso, marcarDetencion, DIR_WORKTREES } = require('./fanout-estado.js');
+const { listarWorktrees } = require('./worktrees.js');
 const tableroAgentes = require('./agents/tablero.js');
 const memoriaAgentes = require('./agents/memoria.js');
 const { interpretarEvento, crearSeguidor } = require('./fanout-tail.js');
@@ -199,7 +202,9 @@ function paginaHtml(slug, token) {
   .meta { color: #7d8596; font-size: 12px; }
   /* Las tarjetas estiran para ocupar el alto disponible: con pocas tareas la
      ventana se llenaba de vacío y el log quedaba en una franja de 220px. */
-  #grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  /* min(100%, 360px): en una ventana de menos de 360px la tarjeta se achica en
+     vez de desbordar la grilla (FEAT-032). */
+  #grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
           grid-auto-rows: minmax(260px, 1fr); gap: 12px; padding: 12px;
           flex: 1; min-height: 0; overflow-y: auto; }
   .tarea { border: 1px solid #2a2f3a; border-radius: 6px; display: flex; flex-direction: column;
@@ -216,18 +221,28 @@ function paginaHtml(slug, token) {
   .tiempo.vivo { color: #58a6ff; }
   /* Scopeado a .tarea: la cabecera de la página ya usa .meta para su resumen
      y sin esto heredaba padding y borde de la fila de la tarjeta. */
-  .tarea .meta { padding: 4px 10px; font-size: 11px; color: #6b7385; border-bottom: 1px solid #2a2f3a;
+  .tarea .meta { padding: 4px 10px; font-size: 11px; color: #7d8596; border-bottom: 1px solid #2a2f3a;
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .tarea .meta:empty { display: none; }
   .porque { padding: 5px 10px; font-size: 12px; color: #f0a58a; background: #241a1a;
             border-bottom: 1px solid #2a2f3a; white-space: pre-wrap; word-break: break-word; }
-  .stop { margin-left: auto; background: none; border: 1px solid #3d4350; color: #d7dae0;
+  .acciones { margin-left: auto; display: flex; gap: 6px; }
+  .stop, .dif { background: none; border: 1px solid #3d4350; color: #d7dae0;
           border-radius: 4px; padding: 2px 9px; cursor: pointer; font: inherit; font-size: 11px; }
   .stop:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
-  .stop:disabled { opacity: .35; cursor: default; }
+  .dif:hover:not(:disabled) { border-color: #58a6ff; color: #58a6ff; }
+  .stop:disabled, .dif:disabled { opacity: .35; cursor: default; }
+  .stop:focus-visible, .dif:focus-visible, .diff:focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
+  /* FEAT-033: el diff ocupa el lugar del log, que se oculta pero sigue en el
+     DOM (pintarEvento lo necesita en cada evento). */
+  .diff { margin: 0; overflow: auto; padding: 8px 10px; white-space: pre; flex: 1; font: inherit; font-size: 12px; }
+  .d-mas { color: #3fb950; } .d-menos { color: #f85149; } .d-hunk { color: #58a6ff; } .dh { color: #7d8596; }
+  /* Visualmente oculto pero leído por lectores de pantalla. */
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+             overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
   .log { overflow-y: auto; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; flex: 1; }
   .linea { padding: 1px 0; border-bottom: 1px solid #1c2029; }
-  .hora { color: #4d5566; }
+  .hora { color: #7d8596; }
   .marca { color: #7d8596; }
   /* La llamada a herramienta es lo que dice qué está HACIENDO el subagente:
      tiene que saltar por encima de la prosa, no perderse dentro de ella. */
@@ -244,6 +259,10 @@ function paginaHtml(slug, token) {
 <header>
   <h1>fanout · ${escapar(slug)}</h1>
   <span class="meta" id="resumen">conectando…</span>
+  <!-- #resumen se reescribe cada segundo (el reloj de "sin novedad"): con
+       aria-live el lector de pantalla no pararía de hablar. Este span solo
+       cambia cuando cambian los conteos o termina el lote (FEAT-032). -->
+  <span class="sr-only" aria-live="polite" id="anuncio"></span>
 </header>
 <div id="grid"></div>
 <div id="vacio" hidden>Sin tareas todavía.</div>
@@ -261,9 +280,40 @@ function tarjeta(taskId) {
   el.className = 'tarea';
   el.innerHTML = '<div class="cab"><span class="nombre"></span>' +
     '<span class="estado"></span><span class="tiempo"></span>' +
-    '<button class="stop">Detener</button></div>' +
-    '<div class="meta"></div><div class="porque"></div><div class="log"></div>';
+    '<span class="acciones"><button class="dif" disabled aria-pressed="false">Diff</button>' +
+    '<button class="stop">Detener</button></span></div>' +
+    '<div class="meta"></div><div class="porque"></div><div class="log"></div>' +
+    '<pre class="diff" tabindex="0" hidden></pre>';
   el.querySelector('.nombre').textContent = taskId;
+  // FEAT-033 — Lo que dejó el subagente en su worktree. Alterna con el log:
+  // el log se oculta, nunca se quita (pintarEvento lo busca en cada evento).
+  el.querySelector('.dif').addEventListener('click', async (ev) => {
+    const boton = ev.currentTarget;
+    const log = el.querySelector('.log');
+    const pre = el.querySelector('.diff');
+    if (boton.getAttribute('aria-pressed') === 'true') {
+      pre.hidden = true;
+      log.hidden = false;
+      // Mientras estuvo oculto, asignar el scroll no hacía nada.
+      log.scrollTop = log.scrollHeight;
+      boton.setAttribute('aria-pressed', 'false');
+      boton.textContent = 'Diff';
+      return;
+    }
+    boton.disabled = true;
+    boton.textContent = 'Cargando…';
+    let r;
+    try {
+      const resp = await fetch('/api/diff?t=' + encodeURIComponent(TOKEN) + '&taskId=' + encodeURIComponent(taskId));
+      r = await resp.json();
+    } catch { r = { ok: false, motivo: 'no se pudo pedir el diff' }; }
+    pintarDiff(pre, r);
+    log.hidden = true;
+    pre.hidden = false;
+    boton.disabled = false;
+    boton.setAttribute('aria-pressed', 'true');
+    boton.textContent = 'Log';
+  });
   el.querySelector('.stop').addEventListener('click', async (ev) => {
     const boton = ev.currentTarget;
     boton.disabled = true;
@@ -325,6 +375,11 @@ function explicarFallo(t) {
   return '';
 }
 
+// Último texto anunciado al lector de pantalla (FEAT-032). Declarado antes de
+// pintarEstado, que lo usa: con un let más abajo, una llamada síncrona
+// anterior daría ReferenceError.
+let ultimoAnuncio = '';
+
 function pintarEstado(datos) {
   const tareas = datos.tareas || {};
   const ids = Object.keys(tareas);
@@ -341,6 +396,11 @@ function pintarEstado(datos) {
     badge.className = 'estado ' + estado;
     // Detener solo tiene sentido mientras siga en vuelo.
     el.querySelector('.stop').disabled = !(estado === 'corriendo' || estado === 'reintentando');
+    // El diff, solo con la tarea quieta: mientras corre, el worktree cambia.
+    const dif = el.querySelector('.dif');
+    if (dif.textContent !== 'Cargando…') {
+      dif.disabled = !(estado === 'ok' || estado === 'error' || estado === 'detenida');
+    }
 
     const meta = [];
     if (t.modelo) meta.push(t.modelo);
@@ -382,6 +442,14 @@ function pintarEstado(datos) {
   if (!loteTerminado) partes.push(corriendo + ' en vuelo');
   resumenBase = partes.join(' · ');
   refrescarCabecera();
+
+  // Lo que se anuncia al lector de pantalla: solo los conteos y el fin del
+  // lote, nunca el reloj que corre cada segundo.
+  const anuncio = resumenBase + (loteTerminado ? ' · terminado' : '');
+  if (anuncio !== ultimoAnuncio) {
+    ultimoAnuncio = anuncio;
+    document.getElementById('anuncio').textContent = anuncio;
+  }
 }
 
 // Estado del lote que necesita la cabecera entre repintados.
@@ -416,6 +484,32 @@ function refrescarCabecera() {
   }
   resumen.textContent = resumenBase + extra;
   resumen.className = 'meta' + (loteTerminado ? ' fin' : (extra ? ' quieto' : ''));
+}
+
+// FEAT-033 — Todo con textContent: el diff es contenido del worktree y jamás
+// pasa por innerHTML. Una línea, un span, con su color por el primer carácter.
+function pintarDiff(pre, r) {
+  pre.textContent = '';
+  const agregar = (texto, clase) => {
+    const s = document.createElement('span');
+    if (clase) s.className = clase;
+    s.textContent = texto + '\\n';
+    pre.appendChild(s);
+  };
+  if (!r || !r.ok) { agregar((r && r.motivo) || 'sin diff', 'dh'); return; }
+  if (r.aviso) agregar(r.aviso, 'dh');
+  if (r.status) {
+    agregar('$ git status', 'dh');
+    r.status.split('\\n').forEach((l) => agregar(l));
+  }
+  (r.ocultos || []).forEach((f) => agregar('# ' + f + ': oculto por deny_paths', 'dh'));
+  if (r.diff) {
+    r.diff.split('\\n').forEach((l) => agregar(l,
+      l.startsWith('@@') ? 'd-hunk' : (l.startsWith('+') ? 'd-mas' : (l.startsWith('-') ? 'd-menos' : ''))));
+  } else if (!r.aviso) {
+    agregar('(sin cambios contra la base)', 'dh');
+  }
+  if (r.truncado) agregar('… diff truncado', 'dh');
 }
 
 const MARCA = { inicio: '▶', prosa: '·', tool: '🔧', 'fin-ok': '✔', 'fin-error': '✘', raro: '？' };
@@ -528,25 +622,30 @@ function paginaAgentes(token, haySlug) {
   th { color: #7d8596; font-weight: 600; font-size: 11px; text-transform: uppercase;
        letter-spacing: .04em; border-bottom-color: #2a2f3a; }
   tr.fila { cursor: pointer; }
+  /* FEAT-032: el botón es lo que da foco, Enter y Espacio a la fila. */
+  .expandir { background: none; border: 0; padding: 0; color: inherit; font: inherit;
+              cursor: pointer; text-align: left; }
+  .expandir:focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
+  .tabla-scroll { overflow-x: auto; }
   tr.fila:hover td { background: #161922; }
   .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid currentColor; }
   .si { color: #3fb950; } .no { color: #f85149; } .tibio { color: #d29922; }
   .apagado { color: #7d8596; }
-  .hilo { font-size: 11px; color: #6b7385; }
+  .hilo { font-size: 11px; color: #7d8596; }
   .criterio { background: #0d0f15; }
   .criterio td { padding: 0 10px 12px; }
   .entrada { border-left: 2px solid #2a2f3a; padding: 4px 0 4px 10px; margin-top: 8px; }
   .entrada .cuerpo { white-space: pre-wrap; word-break: break-word; }
-  .entrada .pie { font-size: 11px; color: #6b7385; margin-top: 2px; }
+  .entrada .pie { font-size: 11px; color: #7d8596; margin-top: 2px; }
   .usos { color: #58a6ff; }
-  .frio { color: #6b7385; }
+  .frio { color: #7d8596; }
   .vacio { color: #7d8596; font-style: italic; padding: 8px 0; }
 </style>
 </head>
 <body>
 <header>
   <h1>agentes persistidos</h1>
-  <span class="meta" id="resumen">cargando…</span>
+  <span class="meta" id="resumen" aria-live="polite">cargando…</span>
   <nav>
     ${haySlug ? `<a href="/?t=${token || ''}">fan-out</a>` : ''}
     <a class="activa" href="#">agentes</a>
@@ -554,6 +653,7 @@ function paginaAgentes(token, haySlug) {
 </header>
 <main>
   <div id="avisos"></div>
+  <div class="tabla-scroll">
   <table>
     <thead><tr>
       <th>agente</th><th>skill</th><th>acceso</th><th>resuelve</th>
@@ -561,6 +661,7 @@ function paginaAgentes(token, haySlug) {
     </tr></thead>
     <tbody id="cuerpo"></tbody>
   </table>
+  </div>
 </main>
 <script>
 const TOKEN = ${JSON.stringify(token || '')};
@@ -631,13 +732,16 @@ function pintarCriterio(celda, agente) {
 
 function alternar(nombre, fila) {
   const siguiente = fila.nextElementSibling;
+  const boton = fila.querySelector('button.expandir');
   if (abiertos.has(nombre)) {
     abiertos.delete(nombre);
     siguiente.hidden = true;
+    if (boton) boton.setAttribute('aria-expanded', 'false');
     return;
   }
   abiertos.add(nombre);
   siguiente.hidden = false;
+  if (boton) boton.setAttribute('aria-expanded', 'true');
   pintarCriterio(siguiente.querySelector('td'), nombre);
 }
 
@@ -649,7 +753,7 @@ function pintar(datos) {
     : 'ningún agente registrado todavía';
 
   cuerpo.innerHTML = '';
-  for (const a of agentes) {
+  for (const [i, a] of agentes.entries()) {
     const fila = document.createElement('tr');
     fila.className = 'fila';
     const acceso = a.readOnly === null
@@ -658,7 +762,9 @@ function pintar(datos) {
     const resuelve = !datos.agyDisponible
       ? '<span class="apagado">?</span>'
       : (a.resuelve ? '<span class="si">sí</span>' : '<span class="no">no</span>');
-    fila.innerHTML = '<td><strong>' + esc(a.nombre) + '</strong></td>'
+    // El botón da a la fila foco, Enter y Espacio (FEAT-032).
+    fila.innerHTML = '<td><button type="button" class="expandir" aria-expanded="false" aria-controls="det-' + i + '">'
+      + '<strong>' + esc(a.nombre) + '</strong></button></td>'
       + '<td class="apagado">' + esc(a.skill || '—') + '</td>'
       + '<td>' + acceso + '</td>'
       + '<td>' + resuelve + '</td>'
@@ -669,11 +775,19 @@ function pintar(datos) {
 
     const detalle = document.createElement('tr');
     detalle.className = 'criterio';
+    detalle.id = 'det-' + i;
     detalle.hidden = true;
     detalle.innerHTML = '<td colspan="7"></td>';
     cuerpo.appendChild(detalle);
 
-    fila.addEventListener('click', () => alternar(a.nombre, fila));
+    // Un solo camino por click: el del botón. La fila atiende el resto de su
+    // superficie, pero ignora lo que viene del botón; si no, el mismo click
+    // burbujearía y abriría y cerraría a la vez.
+    fila.querySelector('button.expandir').addEventListener('click', () => alternar(a.nombre, fila));
+    fila.addEventListener('click', (ev) => {
+      if (ev.target.closest('button.expandir')) return;
+      alternar(a.nombre, fila);
+    });
   }
 }
 
@@ -741,7 +855,138 @@ function origenAceptable(req) {
  * alcanza con el nombre, porque solo se usa para `agy agents` y un fallo se
  * refleja en la página como "no se pudo consultar" en vez de tumbar nada.
  */
-const AGY_BIN_VISOR = process.env.AGY_BIN || (process.platform === 'win32' ? 'agy.exe' : 'agy');
+// ==============================================================================
+// FEAT-033 — Diff del worktree de una tarea
+// ==============================================================================
+
+// Del cliente solo llega el `taskId`, y se busca entre las tareas del estado.
+// La rama y la base salen del archivo de estado; como un subagente con
+// escritura podría tocarlo, se validan con la forma exacta que produce el
+// orquestador.
+const RAMA_VALIDA = /^wt\/[A-Za-z0-9._-]+$/;
+const BASE_VALIDA = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/;
+const DIFF_TOPE_BYTES = 200 * 1024;
+const DIFF_MAX_ARCHIVOS = 200;
+// Límite de argv de CreateProcessW: 32 767 caracteres en total. La mitad para
+// las rutas deja margen de sobra para git.exe y sus flags.
+const DIFF_MAX_CARACTERES_ARGS = 16000;
+
+/**
+ * `-c core.quotePath=false` y `--literal-pathspecs` en toda llamada: los nombres
+ * vuelven sin escapar y ningún nombre de archivo se interpreta como magia.
+ */
+function gitWt(cwd, args) {
+  return execFileSync('git', ['-c', 'core.quotePath=false', '--literal-pathspecs', '-C', cwd, ...args], {
+    encoding: 'utf8',
+    timeout: 10000,
+    maxBuffer: 5 * 1024 * 1024,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+}
+
+/**
+ * La política de `deny_paths` del bridge (ESM). Con `pathToFileURL`: en
+ * Windows, `import()` de una ruta absoluta falla con «Received protocol 'c:'».
+ */
+function cargarPolitica() {
+  return import(pathToFileURL(path.join(__dirname, '..', 'telegram-bridge', 'policy.js')).href);
+}
+
+/**
+ * @returns {Promise<{ codigo: number, cuerpo: object }>}
+ */
+async function diffDeTarea(repoPath, slug, taskId, { cargarPoliticaFn = cargarPolitica } = {}) {
+  const estado = slug ? leerEstado(repoPath, slug) : null;
+  const tareas = (estado && estado.tareas) || {};
+  if (!taskId || !Object.prototype.hasOwnProperty.call(tareas, taskId)) {
+    return { codigo: 404, cuerpo: { ok: false, motivo: 'tarea desconocida' } };
+  }
+  const rama = tareas[taskId].rama;
+  const ramaBase = estado.ramaBase;
+  if (typeof rama !== 'string' || !RAMA_VALIDA.test(rama)
+      || typeof ramaBase !== 'string' || !BASE_VALIDA.test(ramaBase)) {
+    return { codigo: 409, cuerpo: { ok: false, motivo: 'estado del lote inesperado' } };
+  }
+
+  // El worktree de esa rama, y solo si su ruta real queda bajo
+  // .claude/worktrees del repo.
+  let wt = null;
+  const entrada = listarWorktrees(repoPath).find((w) => w.rama === rama);
+  if (entrada && fs.existsSync(entrada.ruta)) {
+    try {
+      const dirReal = fs.realpathSync.native(path.join(repoPath, DIR_WORKTREES));
+      const wtReal = fs.realpathSync.native(entrada.ruta);
+      const rel = path.relative(dirReal, wtReal);
+      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) wt = wtReal;
+    } catch {}
+  }
+  if (!wt) return { codigo: 200, cuerpo: { ok: false, motivo: 'worktree no disponible o ya limpiado' } };
+
+  // Contra el merge-base y no contra la base a secas: si la base avanzó
+  // durante el fan-out, sus commits nuevos se verían como borrados del
+  // subagente.
+  let base;
+  try {
+    base = gitWt(wt, ['merge-base', '--end-of-options', ramaBase, 'HEAD']).trim();
+  } catch {
+    return { codigo: 200, cuerpo: { ok: false, motivo: 'no se pudo determinar la base' } };
+  }
+
+  // Sin política no hay diff: falla cerrado.
+  let politica;
+  try {
+    politica = await cargarPoliticaFn();
+  } catch {
+    return { codigo: 200, cuerpo: { ok: false, motivo: 'no se pudo cargar la política' } };
+  }
+  // La del repo principal: `.claude/antigravity.json` está ignorado y el
+  // worktree no lo tiene.
+  const deny = politica.loadPolicy(repoPath).denyPaths;
+
+  try {
+    const status = gitWt(wt, ['status', '--porcelain=v1', '-uall']).replace(/\s+$/, '');
+
+    // deny_paths se aplica sobre la LISTA de archivos, no sobre el texto del
+    // diff: `-z` no escapa nombres y `--no-renames` separa cada renombre en
+    // una baja y un alta, así que cada ruta se juzga por sí misma.
+    const archivos = gitWt(wt, ['diff', '--name-only', '-z', '--no-renames', '--end-of-options', base, '--'])
+      .split('\0').filter(Boolean);
+    const ocultos = [];
+    const permitidos = [];
+    for (const f of archivos) {
+      (politica.matchDeniedPath(path.join(wt, f), deny) ? ocultos : permitidos).push(f);
+    }
+
+    let diff = '';
+    let truncado = false;
+    let aviso = null;
+    const caracteres = permitidos.reduce((n, f) => n + f.length + 3, 0);
+    if (permitidos.length >= DIFF_MAX_ARCHIVOS || caracteres > DIFF_MAX_CARACTERES_ARGS) {
+      aviso = 'demasiados archivos para el diff: usá la terminal';
+    } else if (permitidos.length > 0) {
+      try {
+        diff = gitWt(wt, ['diff', '--no-renames', '--end-of-options', base, '--', ...permitidos]);
+      } catch (err) {
+        // Más de 5 MB: execFileSync corta con ENOBUFS, pero lo que alcanzó a
+        // leer viene en err.stdout. Mejor el principio, truncado, que un error.
+        if (err.code !== 'ENOBUFS' || typeof err.stdout !== 'string') throw err;
+        diff = err.stdout;
+        truncado = true;
+      }
+      const bytes = Buffer.from(diff, 'utf8');
+      if (bytes.length > DIFF_TOPE_BYTES) {
+        diff = bytes.subarray(0, DIFF_TOPE_BYTES).toString('utf8');
+        truncado = true;
+      }
+    }
+    return { codigo: 200, cuerpo: { ok: true, status, diff, ocultos, truncado, aviso } };
+  } catch (err) {
+    return { codigo: 200, cuerpo: { ok: false, motivo: `git falló: ${String(err.message).split(/\r?\n/)[0]}` } };
+  }
+}
+
+const AGY_BIN_VISOR =process.env.AGY_BIN || (process.platform === 'win32' ? 'agy.exe' : 'agy');
 
 function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, token, agyBin = AGY_BIN_VISOR, homeDir = os.homedir() } = {}) {
   // Un token por sesión del visor. No se persiste: si el proceso se cae, el
@@ -918,6 +1163,22 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, toke
       return;
     }
 
+    // FEAT-033 — Solo lectura: token por query, como /api/eventos, que ya
+    // transmite prompts y código de los subagentes.
+    if (req.method === 'GET' && url.pathname === '/api/diff') {
+      if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
+        return rechazar(403, 'token invalido');
+      }
+      diffDeTarea(repoPath, slug, url.searchParams.get('taskId') || '').then(({ codigo, cuerpo }) => {
+        res.writeHead(codigo, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify(cuerpo));
+      }).catch((err) => {
+        res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, motivo: err.message }));
+      });
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/detener') {
       // Acá el token se exige en la cabecera, no en la query: una cabecera
       // propia no se puede mandar cruzando orígenes sin un preflight que este
@@ -1016,4 +1277,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { crearServidor, descubrirLotes, crearVigilante, paginaHtml, paginaAgentes, ultimaSenal };
+module.exports = { crearServidor, descubrirLotes, crearVigilante, paginaHtml, paginaAgentes, ultimaSenal, diffDeTarea };

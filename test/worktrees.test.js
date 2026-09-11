@@ -90,6 +90,17 @@ async function main() {
 
       check('cada worktree está parado en su rama',
         creados.every(c => git(c.ruta, 'rev-parse', '--abbrev-ref', 'HEAD') === c.rama));
+
+      // El único parser de `worktree list --porcelain` (FEAT-033: lo usa también
+      // el diff del visor). git devuelve barras `/` en Windows: se compara el
+      // realpath, no el texto.
+      const real = (p) => fs.realpathSync(p);
+      const lista = wt.listarWorktrees(repo);
+      check('listarWorktrees trae los 3 del lote con su rama',
+        creados.every(c => lista.some(w => w.rama === c.rama && real(w.ruta) === real(c.ruta))),
+        JSON.stringify(lista));
+      check('y también el worktree principal', lista.some(w => real(w.ruta) === real(repo)));
+      check('fuera de un repo, lista vacía', wt.listarWorktrees(os.tmpdir()).length === 0);
     });
 
     await group('clasificación limpio / sucio', () => {
