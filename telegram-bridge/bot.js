@@ -27,7 +27,7 @@ import {
   getPendingAsk,
   getStateFilePath
 } from './state.js';
-import { enqueueTask, dequeueTask, getQueueLength, getQueueSnapshot, clearQueue } from './queue.js';
+import { enqueueTask, dequeueTask, getQueueLength, getQueueSnapshot, clearQueue, CARRILES } from './queue.js';
 import {
   getKnownWorkspaces,
   launchClaudeRemoteSession,
@@ -194,14 +194,40 @@ function releaseLock() {
 }
 
 // ==============================================================================
-// 3. Estado de ejecución (Concurrency = 1)
+// 3. Estado de ejecución: un carril por clase de tarea (FEAT-026)
 // ==============================================================================
 
-let isProcessingTask = false;
-// Tarea en ejecución y forma de abortarla. `cancelCurrent` lo entrega el
-// executor al lanzar el proceso hijo.
-let currentTask = null;
-let cancelCurrent = null;
+// Cada carril tiene su tarea en curso y su forma de abortarla (`cancelar` lo
+// entrega el executor al lanzar el proceso hijo). Uno a la vez POR CARRIL:
+//   - `principal` (plan, run, resume, exec_plan, texto suelto) comparte la
+//     conversación del chat: dos a la vez lanzarían dos `agy --conversation`
+//     sobre el mismo hilo, y los dos harían `setConversationId` al terminar.
+//   - `cast` no toca la sesión del chat, así que corre al lado de un /run; pero
+//     dos casts al mismo agente compartirían su hilo, así que tampoco hay dos.
+const carriles = {
+  principal: { enCurso: null, cancelar: null },
+  cast: { enCurso: null, cancelar: null }
+};
+
+// Punto de inyección para los tests: la ejecución real lanza `agy`. Sin esto
+// la rama de ejecución no tenía un solo test de su camino feliz.
+const ejecutoresPorDefecto = Object.freeze({ runAgyTask, castear: castAgentes.castear });
+let ejecutores = ejecutoresPorDefecto;
+
+/** Solo para los tests. `resetRuntimeState()` siempre vuelve a los reales. */
+export function usarEjecutoresDePrueba(parciales = {}) {
+  ejecutores = { ...ejecutoresPorDefecto, ...parciales };
+}
+
+/** Solo para los tests: ¿se volvió a los ejecutores reales? */
+export function ejecutoresSonLosReales() {
+  return ejecutores === ejecutoresPorDefecto;
+}
+
+/** Solo lectura, para los tests: ¿el carril tiene una tarea en curso? */
+export function carrilOcupado(carril) {
+  return carriles[carril].enCurso !== null;
+}
 // Bot activo del proceso. Lo necesitan `notifyChat` y el consumidor de la cola,
 // que operan fuera de cualquier `Context` vivo.
 let botRef = null;
@@ -232,12 +258,15 @@ export function tomarCastPendiente(id, chatId, ahora = Date.now()) {
 
 /**
  * Reinicia el estado de ejecución. Solo para los tests: cada caso necesita
- * partir de una cola vacía y sin tarea en curso.
+ * partir de colas vacías, sin tarea en curso y con los ejecutores reales, así
+ * que un test que falla a mitad no contamina a los siguientes.
  */
 export function resetRuntimeState() {
-  isProcessingTask = false;
-  currentTask = null;
-  cancelCurrent = null;
+  for (const estado of Object.values(carriles)) {
+    estado.enCurso = null;
+    estado.cancelar = null;
+  }
+  ejecutores = ejecutoresPorDefecto;
   clearQueue();
   castsPendientes.clear();
 }
@@ -267,25 +296,28 @@ async function notifyChat(chatId, text, extra = {}) {
 }
 
 /**
- * Arranca el consumidor de la cola sin devolver una promesa pendiente al
- * llamante. Todo fallo queda contenido aquí.
+ * Arranca el consumidor de un carril (sin argumento, de los dos) sin devolver
+ * una promesa pendiente al llamante. Todo fallo queda contenido aquí.
  */
-function runQueue() {
-  processTaskQueue().catch((err) => {
-    console.error('[QUEUE ERROR]', redactSecrets(err?.stack || err?.message || String(err)));
-  });
+function runQueue(carril) {
+  for (const c of carril ? [carril] : CARRILES) {
+    processTaskQueue(c).catch((err) => {
+      console.error(`[QUEUE ERROR] carril ${c}:`, redactSecrets(err?.stack || err?.message || String(err)));
+    });
+  }
 }
 
 /**
- * Procesa la cola de tareas secuencialmente
+ * Procesa la cola de un carril, una tarea a la vez. Los dos carriles corren en
+ * paralelo; todo lo de abajo es local a la tarea salvo `carriles[carril]`.
  */
-async function processTaskQueue() {
-  if (isProcessingTask) return;
-  const task = dequeueTask();
+async function processTaskQueue(carril) {
+  const estado = carriles[carril];
+  if (estado.enCurso) return;
+  const task = dequeueTask(carril);
   if (!task) return;
 
-  isProcessingTask = true;
-  currentTask = task;
+  estado.enCurso = task;
   const { ctx, chatId, prompt, mode, conversationId } = task;
 
   // Intervalo de acción typing mientras piensa Antigravity
@@ -327,8 +359,8 @@ async function processTaskQueue() {
       // `agy agents` y rehidratar la memoria llevan segundos, y sin esto el
       // bot contestaba que no había nada en curso mientras el cast avanzaba.
       let canceladoAntesDelSpawn = false;
-      cancelCurrent = () => { canceladoAntesDelSpawn = true; return true; };
-      const cast = await castAgentes.castear({
+      estado.cancelar = () => { canceladoAntesDelSpawn = true; return true; };
+      const cast = await ejecutores.castear({
         agent: task.agent,
         prompt,
         cwd: task.cwd,
@@ -336,7 +368,7 @@ async function processTaskQueue() {
         ejecutar: (cliArgs, op) => (canceladoAntesDelSpawn
           ? Promise.resolve({ success: false, cancelled: true, data: null, error: 'Cast cancelado antes de lanzar agy.' })
           : runAgyArgs(cliArgs, op)),
-        opciones: { soloLectura: true, alcance: task.cwd, onSpawn: (cancel) => { cancelCurrent = cancel; } }
+        opciones: { soloLectura: true, alcance: task.cwd, onSpawn: (cancel) => { estado.cancelar = cancel; } }
       });
       clearInterval(typingInterval);
       typingInterval = null;
@@ -347,11 +379,11 @@ async function processTaskQueue() {
       return;
     }
 
-    const result = await runAgyTask({
+    const result = await ejecutores.runAgyTask({
       prompt,
       mode,
       conversationId,
-      onSpawn: (cancel) => { cancelCurrent = cancel; }
+      onSpawn: (cancel) => { estado.cancelar = cancel; }
     });
 
     clearInterval(typingInterval);
@@ -406,12 +438,11 @@ async function processTaskQueue() {
   } finally {
     if (typingInterval) clearInterval(typingInterval);
     if (progressInterval) clearInterval(progressInterval);
-    cancelCurrent = null;
-    currentTask = null;
-    isProcessingTask = false;
-    // Si quedan tareas en cola, procesar la siguiente
-    if (getQueueLength() > 0) {
-      setImmediate(runQueue);
+    // Solo este carril: el otro puede seguir con su tarea.
+    estado.cancelar = null;
+    estado.enCurso = null;
+    if (getQueueLength(carril) > 0) {
+      setImmediate(() => runQueue(carril));
     }
   }
 }
@@ -436,6 +467,10 @@ export function avisoDeDespacho({ habiaTareaEnCurso, posEnCola, mode }) {
       : '⚙️ Ejecutando tarea con Antigravity...';
   }
   const posicion = posEnCola + (habiaTareaEnCurso ? 1 : 0);
+  // Un cast ya no espera detrás de un /run (FEAT-026): si queda encolado es
+  // porque hay otro cast, y decir «Antigravity está ocupado» daría la razón
+  // equivocada.
+  if (mode === 'cast') return `⏳ Ya hay un cast en curso. El tuyo queda en la posición #${posicion}.`;
   return `⏳ Antigravity está ocupado con otra tarea. Tu solicitud queda en la posición #${posicion}.`;
 }
 
@@ -464,7 +499,7 @@ async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = nu
 
   const task = { ctx, chatId, prompt, mode, conversationId: activeConvId, statusMessageId: null };
 
-  const habiaTareaEnCurso = isProcessingTask;
+  const habiaTareaEnCurso = carriles.principal.enCurso !== null;
   const posEnCola = enqueueTask(task);
 
   // El mensaje inicial es el que luego se edita con el tiempo transcurrido, así
@@ -478,10 +513,10 @@ async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = nu
     console.error(`[dispatch] No se pudo enviar el aviso inicial: ${redactSecrets(err.message)}`);
   }
 
-  // Incondicional a propósito. `processTaskQueue` ya se protege con
-  // `if (isProcessingTask) return`, así que llamarlo de más no cuesta nada,
-  // mientras que llamarlo de menos deja la cola parada sin nadie que la drene.
-  runQueue();
+  // Incondicional a propósito. `processTaskQueue` ya se protege con el
+  // `enCurso` de su carril, así que llamarlo de más no cuesta nada, mientras
+  // que llamarlo de menos deja la cola parada sin nadie que la drene.
+  runQueue('principal');
 }
 
 // ==============================================================================
@@ -541,17 +576,22 @@ export function formatearPieDeCast(task, cast, segundos) {
 }
 
 /**
- * Encola un cast. No lee `getConversationId(chatId)`: el cast no hereda la
- * sesión del chat, su hilo lo resuelve `castear()` desde el estado del agente.
+ * Encola un cast en su carril. No lee `getConversationId(chatId)`: el cast no
+ * hereda la sesión del chat, su hilo lo resuelve `castear()` desde el estado
+ * del agente.
+ *
+ * Exportada solo para los tests de concurrencia: las validaciones de seguridad
+ * (agente read-only, workspace de la lista, pendiente del mismo chat) ocurren
+ * ANTES, en `/cast` y en el callback `cast_ws:`.
  */
-async function dispatchCast(ctx, { agent, prompt, cwd, workspaceName }) {
+export async function dispatchCast(ctx, { agent, prompt, cwd, workspaceName }) {
   const chatId = ctx.chat.id;
   const task = {
     ctx, chatId, kind: 'cast', agent, prompt, cwd, workspaceName,
     mode: 'cast', conversationId: null, statusMessageId: null
   };
 
-  const habiaTareaEnCurso = isProcessingTask;
+  const habiaTareaEnCurso = carriles.cast.enCurso !== null;
   const posEnCola = enqueueTask(task);
   try {
     const sent = await ctx.reply(avisoDeDespacho({ habiaTareaEnCurso, posEnCola, mode: 'cast' }));
@@ -559,7 +599,7 @@ async function dispatchCast(ctx, { agent, prompt, cwd, workspaceName }) {
   } catch (err) {
     console.error(`[cast] No se pudo enviar el aviso inicial: ${redactSecrets(err.message)}`);
   }
-  runQueue();
+  runQueue('cast');
 }
 
 /** Sin teclado y sin `setConversationId`: ver la rama `cast` de processTaskQueue. */
@@ -718,7 +758,7 @@ Puente móvil autónomo conectado a tu entorno local.
 • \`/queue\` — Muestra la tarea en curso y las encoladas.
 • \`/diff [archivo]\` — Cambios sin commitear del workspace. El contenido sale a Telegram; lo que esté en \`deny_paths\` no.
 • \`/logs [N]\` — Últimas líneas del log del daemon, para ver por qué falló algo. Si el bot está caído, esto tampoco responde.
-• \`/cancel\` — Aborta la tarea en curso y vacía la cola.
+• \`/cancel\` — Aborta lo que esté en curso y vacía las colas. \`/cancel cast\` corta solo el cast, sin tocar un /run.
 • \`/reset\` — Reinicia la conversación y olvida el contexto actual.
 
 *Sesión activa:* ${convId ? `\`${convId}\`` : '_Ninguna (el próximo mensaje abrirá una nueva)_'}
@@ -910,7 +950,7 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
   bot.command('status', async (ctx) => {
     const status = getAgyStatus();
     const convId = getConversationId(ctx.chat.id);
-    const queueLen = getQueueLength();
+    const lineaCarril = (c) => `${getQueueLength(c)} pendientes (en curso: ${carriles[c].enCurso ? 'Sí' : 'No'})`;
 
     const msg = `📊 *Estado del Sistema Antigravity*
 • *Binario:* \`${status.binPath}\`
@@ -919,7 +959,8 @@ _El texto suelto se ejecuta en modo \`plan\` sobre la sesión activa: primero ve
 ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.join(', ')}\`
 ` : ''}
 • *Sesión chat:* ${convId ? `\`${convId}\`` : '_Sin conversación activa_'}
-• *Cola de tareas:* ${queueLen} pendientes (Procesando: ${isProcessingTask ? 'Sí' : 'No'})
+• *Cola principal:* ${lineaCarril('principal')}
+• *Cola de casts:* ${lineaCarril('cast')}
 
 🔒 *Controles efectivos* (los impone el sistema)
 • *Chats:* solo conversaciones privadas con usuarios en la whitelist
@@ -996,37 +1037,63 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
     });
   });
 
+  // `/cancel` corta todo, en los dos carriles: es el comando de emergencia y su
+  // significado no cambia. `/cancel cast` corta solo el carril de casts, para
+  // «el reviewer tarda, pero el /run que siga». Un argumento que no se entiende
+  // NO cancela nada: ante la duda, no se hace la acción destructiva.
   bot.command('cancel', async (ctx) => {
-    const discarded = clearQueue();
-    const cancelled = typeof cancelCurrent === 'function' ? cancelCurrent() : false;
-
-    if (!cancelled && discarded === 0) {
-      return ctx.reply('No hay ninguna tarea en curso ni encolada que cancelar.');
+    const arg = (ctx.match || '').trim().toLowerCase();
+    if (arg && arg !== 'cast') {
+      return ctx.reply('Uso: /cancel corta todo (lo que está en curso y las colas); /cancel cast corta solo el cast. No se canceló nada.');
     }
 
+    const objetivo = arg === 'cast' ? ['cast'] : CARRILES;
+    let descartadas = 0;
+    const abortados = [];
+    for (const c of objetivo) {
+      descartadas += clearQueue(c);
+      const cancelar = carriles[c].cancelar;
+      if (typeof cancelar === 'function' && cancelar()) abortados.push(c);
+    }
+
+    if (abortados.length === 0 && descartadas === 0) {
+      return ctx.reply(arg === 'cast'
+        ? 'No hay ningún cast en curso ni encolado que cancelar.'
+        : 'No hay ninguna tarea en curso ni encolada que cancelar.');
+    }
+
+    const nombres = { principal: 'tarea en curso abortada', cast: 'cast en curso abortado' };
     const partes = [];
-    if (cancelled) partes.push('tarea en curso abortada (cierre del árbol de procesos, forzado si no responde)');
-    if (discarded > 0) partes.push(`${discarded} tarea(s) encolada(s) descartada(s)`);
+    if (abortados.length > 0) {
+      partes.push(`${abortados.map((c) => nombres[c]).join(' y ')} (cierre del árbol de procesos, forzado si no responde)`);
+    }
+    if (descartadas > 0) partes.push(`${descartadas} tarea(s) encolada(s) descartada(s)`);
     await ctx.reply(`🛑 Cancelado: ${partes.join(' y ')}.`);
   });
 
   bot.command('queue', async (ctx) => {
-    const pending = getQueueSnapshot();
-
-    if (!currentTask && pending.length === 0) {
+    if (!CARRILES.some((c) => carriles[c].enCurso || getQueueLength(c) > 0)) {
       return ctx.reply('📭 No hay nada en curso ni en cola.');
     }
 
+    const titulos = { principal: '*Principal* (plan, run, resume)', cast: '*Casts*' };
+    const que = (t) => (t.kind === 'cast' ? `agente \`${t.agent}\`` : `modo \`${t.mode}\``);
     const lineas = [];
-    if (currentTask) {
-      lineas.push(`▶️ *En curso* (modo \`${currentTask.mode}\`, desde ${currentTask.enqueuedAt})`);
-      lineas.push(`   ${currentTask.prompt.slice(0, 80)}`);
+    for (const c of CARRILES) {
+      const enCurso = carriles[c].enCurso;
+      const pendientes = getQueueSnapshot(c);
+      if (!enCurso && pendientes.length === 0) continue;
+      lineas.push(titulos[c]);
+      if (enCurso) {
+        lineas.push(`▶️ En curso (${que(enCurso)}, desde ${enCurso.enqueuedAt})`);
+        lineas.push(`   ${enCurso.prompt.slice(0, 80)}`);
+      }
+      pendientes.forEach((t, i) => {
+        lineas.push(`${i + 1}. ${que(t)} — ${t.promptPreview}`);
+      });
+      lineas.push('');
     }
-    pending.forEach((t, i) => {
-      lineas.push(`${i + 1}. modo \`${t.mode}\` — ${t.promptPreview}`);
-    });
-    lineas.push('');
-    lineas.push("_Usa_ `/cancel` _para abortar lo actual y vaciar la cola._");
+    lineas.push('_Usa_ `/cancel` _para abortar todo, o_ `/cancel cast` _solo el cast._');
 
     await sendSafeChunk(ctx, lineas.join('\n'));
   });
