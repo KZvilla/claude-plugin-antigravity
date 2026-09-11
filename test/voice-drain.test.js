@@ -36,9 +36,9 @@ async function main() {
     check('sin oraciones', r.sentences.length === 0, JSON.stringify(r.sentences));
   });
 
-  await group('priming con aviso previo', () => {
-    check('pide anunciar antes de la herramienta', /antes decí una sola frase corta/.test(PRIMING_CHARLA));
-    check('mínimo cuatro palabras (minWords del chunker)', /al menos cuatro palabras/.test(PRIMING_CHARLA));
+  await group('priming sin narración (v2)', () => {
+    check('pide no anunciar ni narrar los pasos', /no anuncies lo que vas a hacer/.test(PRIMING_CHARLA) && /ni narres tus pasos/.test(PRIMING_CHARLA));
+    check('ya no pide avisar antes de la herramienta', !/antes decí/.test(PRIMING_CHARLA));
     check('mantiene la confirmación OK', /OK\.$/.test(PRIMING_CHARLA));
   });
 

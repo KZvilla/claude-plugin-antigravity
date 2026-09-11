@@ -505,7 +505,7 @@ class AudioPlayer:
         self._thread.start()
 
     def enqueue(self, wav_path, label, borrar=True, al_empezar=None):
-        # borrar=False para las muletillas: viven en una cache entre sesiones.
+        # borrar=False para las senales: viven en una cache entre sesiones.
         # al_empezar se llama justo antes de reproducir (medicion por turno).
         self._queue.put((wav_path, label, borrar, al_empezar))
 
@@ -568,17 +568,32 @@ class SentenceSequencer:
         self._last_generation_id = last_generation_id
         threading.Thread(target=self._run, daemon=True).start()
 
-    def submit(self, future, text, al_empezar=None):
-        self._queue.put((future, text, al_empezar))
+    def submit(self, future, text, al_empezar=None, vigente=None):
+        # vigente(): False si el turno de esta oracion ya fue cortado. La
+        # sintesis no se puede cancelar, pero su audio no debe sonar despues
+        # del corte (visto en vivo: una oracion vieja tras el barge-in).
+        self._queue.put((future, text, al_empezar, vigente))
 
     def _run(self):
         while True:
             item = self._queue.get()
             if item is None:
                 return
-            future, text, al_empezar = item
+            future, text, al_empezar, vigente = item
+            if vigente is not None and not vigente():
+                # No esperar una sintesis de un turno cortado: trabaria al turno
+                # nuevo detras (auditoria del plan v2). Si todavia no empezo se
+                # cancela; si ya corre, su .wav se borra cuando termine.
+                if not future.cancel():
+                    future.add_done_callback(_borrar_resultado)
+                print(f"  ✋ Descartada (turno cortado): {text[:40]!r}")
+                continue
             try:
                 gen_id, wav_path = future.result()
+                if vigente is not None and not vigente():
+                    _delete_generation(wav_path)
+                    print(f"  ✋ Descartada (turno cortado): {text[:40]!r}")
+                    continue
                 print(f"  [debug] enqueue gen_id={gen_id} wav={os.path.basename(wav_path)} text={text[:40]!r}")
                 self._last_generation_id["id"] = gen_id
                 self._player.enqueue(wav_path, text, al_empezar=al_empezar)
@@ -586,43 +601,69 @@ class SentenceSequencer:
                 print(f"  ⚠️ Error sintetizando \"{text}\": {err}")
 
 
-# Muletillas (plan-charla-latencia, C y D): frases cortas pregrabadas con la
-# voz de la charla, para cuando agy tarda en emitir el primer texto. Sin
-# puntos suspensivos ni exclamaciones: con Qwen, la puntuacion forzada hizo
-# alucinar la voz (evaluacion del 2026-09-11).
-FRASES_MULETILLA = {
-    "es": ["A ver, dame un segundo.", "Mmm, dejame ver eso.", "Buena pregunta, ya te digo."],
-    "en": ["Let me see, one second.", "Hmm, let me check that.", "Good question, give me a moment."],
+# Senales (plan-charla-latencia, v2 H): frases cortas pregrabadas con la voz
+# de la charla, que dicen que agy sigue trabajando y, si la hay, que
+# herramienta usa. Una clave por categoria; el orden es la prioridad de
+# generacion. Sin puntos suspensivos ni exclamaciones: con Qwen, la
+# puntuacion forzada hizo alucinar la voz (evaluacion del 2026-09-11).
+# Cuatro claves y no una por herramienta (auditoria del plan v2): en la charla
+# no se editan archivos, y cada clave extra es GPU al arrancar con la cache fria.
+ORDEN_SENALES = ["pensando", "web", "pagina", "herramienta"]
+FRASES_SENAL = {
+    "es": {"pensando": "Pensando.", "web": "Buscando en la web.", "pagina": "Leyendo la página.",
+           "herramienta": "Usando una herramienta."},
+    "en": {"pensando": "Thinking.", "web": "Searching the web.", "pagina": "Reading the page.",
+           "herramienta": "Using a tool."},
 }
-MULETILLAS_DIR = os.path.join(STATE_DIR, "muletillas")
+# Inventario de agy observado (mcp-server/agents/registry.js); el resto cae en "herramienta".
+CATEGORIA_HERRAMIENTA = {"search_web": "web", "read_url_content": "pagina"}
+SENALES_DIR = os.path.join(STATE_DIR, "senales")
+SEPARACION_SENALES_MS = 8000
+# Tras "Pensando", nombrar la herramienta no espera los 8 s: es informacion nueva.
+SEPARACION_TRAS_PENSANDO_MS = 3000
+MAX_SENALES_TURNO = 3
+
+
+def _borrar_resultado(future):
+    """Callback para una sintesis descartada que ya estaba en curso."""
+    try:
+        _, wav_path = future.result()
+        _delete_generation(wav_path)
+    except Exception:
+        pass
+
+
+def clave_de_herramienta(nombre):
+    return CATEGORIA_HERRAMIENTA.get(nombre or "", "herramienta")
 
 
 def _slug(texto):
     return "".join(c if (c.isalnum() or c in "_.-") else "_" for c in (texto or ""))
 
 
-class Muletillas:
-    """Genera en segundo plano las muletillas de una voz y las guarda en una
-    cache entre sesiones (MULETILLAS_DIR). Una muestra de voz mas nueva que el
-    .wav invalida la cache. Si algo falla, la charla sigue sin muletillas."""
+class Senales:
+    """Genera en segundo plano las senales de una voz, en orden de prioridad,
+    y las guarda en una cache entre sesiones (SENALES_DIR). Una muestra de voz
+    mas nueva que el .wav invalida la cache. Si algo falla, la charla sigue
+    sin esa senal."""
 
     def __init__(self, profile, language, engine, model_size, proveedor, muestra,
                  sintetizar=None, ocupado=None, directorio=None, arrancar=True):
         self._sintetizar = sintetizar or synthesize_sentence
         self._ocupado = ocupado or (lambda: False)
         self._args = (profile, language, engine, model_size, proveedor, muestra)
-        self._frases = FRASES_MULETILLA.get(language) or FRASES_MULETILLA["en"]
+        frases = FRASES_SENAL.get(language) or FRASES_SENAL["en"]
         base = f"{_slug(profile['name'])}-{language}-{proveedor}"
         if proveedor != "omnivoice":
             base += f"-{_slug(tts_model_name(engine, model_size))}"
-        carpeta = directorio or MULETILLAS_DIR
-        self._rutas = [os.path.join(carpeta, f"{base}-{i}.wav") for i in range(len(self._frases))]
+        carpeta = directorio or SENALES_DIR
+        self._items = [(clave, frases[clave], os.path.join(carpeta, f"{base}-{clave}.wav"))
+                       for clave in ORDEN_SENALES]
         try:
             self._mtime_muestra = os.path.getmtime(muestra["audio_path"]) if muestra else None
         except OSError:
             self._mtime_muestra = None
-        self._listas = []
-        self._siguiente = 0
+        self._listas = {}
         self._lock = threading.Lock()
         self._parar = threading.Event()
         self._hilo = threading.Thread(target=self._generar, daemon=True)
@@ -638,10 +679,10 @@ class Muletillas:
 
     def _generar(self):
         try:
-            os.makedirs(os.path.dirname(self._rutas[0]), exist_ok=True)
+            os.makedirs(os.path.dirname(self._items[0][2]), exist_ok=True)
         except OSError:
             return
-        for frase, ruta in zip(self._frases, self._rutas):
+        for clave, frase, ruta in self._items:
             if self._parar.is_set():
                 return
             if not self._vigente(ruta):
@@ -655,33 +696,46 @@ class Muletillas:
                     shutil.copyfile(wav, ruta)
                     _delete_generation(wav)
                 except Exception as err:
-                    print(f"  ⚠️ Muletilla \"{frase}\" no se pudo generar: {err}")
+                    print(f"  ⚠️ Señal \"{frase}\" no se pudo generar: {err}")
                     continue
             with self._lock:
-                self._listas.append(ruta)
+                self._listas[clave] = ruta
 
     def esperar(self, timeout=None):
         self._hilo.join(timeout)
 
-    def elegir(self):
-        """Siguiente muletilla lista, rotando; None si todavia no hay ninguna."""
+    def elegir(self, clave):
+        """Ruta de la senal pedida; None si todavia no esta lista."""
         with self._lock:
-            if not self._listas:
-                return None
-            ruta = self._listas[self._siguiente % len(self._listas)]
-            self._siguiente += 1
-            return ruta
+            return self._listas.get(clave)
 
     def stop(self):
         self._parar.set()
 
 
-def decidir_muletilla(ya_sono, hubo_texto, reproduciendo, vigente, hubo_herramienta, transcurrido_ms, umbral_ms):
-    """Una muletilla por turno, solo mientras agy no emitio texto. Se adelanta
-    si agy informo una herramienta. umbral_ms <= 0 las desactiva."""
-    if umbral_ms <= 0 or ya_sono or hubo_texto or reproduciendo or not vigente:
-        return False
-    return hubo_herramienta or transcurrido_ms >= umbral_ms
+def decidir_senal(hubo_texto, reproduciendo, vigente, herramienta, ultima_clave, desde_ultima_ms,
+                  transcurrido_ms, umbral_ms, sonaron=0,
+                  separacion_ms=SEPARACION_SENALES_MS, maximo=MAX_SENALES_TURNO,
+                  separacion_tras_pensando_ms=SEPARACION_TRAS_PENSANDO_MS):
+    """Que senal suena ahora, o None. Nunca con texto de la respuesta, audio
+    sonando, turno cortado o umbral <= 0. La primera herramienta del turno
+    suena ya; otra categoria, solo con separacion_ms desde la anterior; la
+    misma categoria no se repite. "pensando" una sola vez, si no hubo
+    herramienta ni texto en umbral_ms. Tope de `maximo` por turno: al usuario
+    la quinta ya le sonaba a disco rayado."""
+    if umbral_ms <= 0 or hubo_texto or reproduciendo or not vigente or sonaron >= maximo:
+        return None
+    if herramienta:
+        clave = clave_de_herramienta(herramienta)
+        if clave == ultima_clave:
+            return None
+        separacion = separacion_tras_pensando_ms if ultima_clave == "pensando" else separacion_ms
+        if ultima_clave is None or desde_ultima_ms >= separacion:
+            return clave
+        return None
+    if ultima_clave is None and transcurrido_ms >= umbral_ms:
+        return "pensando"
+    return None
 
 
 class TiemposTurno:
@@ -689,7 +743,7 @@ class TiemposTurno:
     vez; t0 es el fin de lo que dijo el usuario (VAD) o el Enter."""
 
     ETIQUETAS = [("transcripcion", "transcripción"), ("envio", "envío"), ("herramienta", "herramienta"),
-                 ("muletilla", "muletilla"), ("primer_texto", "primer texto"),
+                 ("senal", "señal"), ("primer_texto", "primer texto"),
                  ("primera_oracion", "primera oración"), ("primer_audio", "primer audio")]
 
     def __init__(self, t0=None, reloj=time.monotonic):

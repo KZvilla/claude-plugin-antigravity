@@ -4,20 +4,17 @@
  * Separado de index.js para poder testearlo sin lanzar agy.
  */
 
-// Regla del aviso previo (plan-charla-latencia, A): cuando agy tiene que
-// buscar o usar herramientas, el primer texto llega recien al terminar y la
-// charla queda en silencio. Una frase corta antes de la herramienta sale por
-// streaming y suena en ~1.5 s. "Al menos cuatro palabras": el SentenceChunker
-// exige minWords = 3, y un "Lo busco." quedaria pegado a la oracion siguiente,
-// que llega despues de la busqueda.
+// Sin narracion (plan-charla-latencia, v2 G): pedirle a Gemini que anuncie
+// sus pasos lo volvia un "disco rayado" (siete frases en una busqueda, prueba
+// del usuario). La charla avisa sola con senales pregrabadas que nombran la
+// herramienta en curso (drain informa `herramientas`), asi que Gemini trabaja
+// en silencio y responde al final.
 const PRIMING_CHARLA = 'A partir de ahora estamos en una conversación de voz en tiempo real, no en una sesión de código. ' +
   'Respondé siempre en 1 a 3 oraciones breves, en lenguaje hablado natural. ' +
   'No uses markdown, listas, enlaces ni bloques de código. No escribas, edites ni planifiques archivos — ' +
   'es una charla, no una tarea de programación, salvo que te pida explícitamente hacer algo en el proyecto. ' +
-  'Si para responder tenés que buscar en la web, leer archivos o usar cualquier herramienta, antes decí una sola ' +
-  'frase corta de al menos cuatro palabras que anticipe lo que vas a hacer, terminada en punto ' +
-  '(por ejemplo: Dale, ya lo busco en la web.), y recién después usá la herramienta. ' +
-  'Si podés responder sin herramientas, respondé directo sin anunciar nada. ' +
+  'Si necesitás buscar en la web, leer archivos o usar herramientas, hacelo en silencio: no anuncies lo que vas a hacer ' +
+  'ni narres tus pasos, la charla ya avisa por vos. Respondé cuando tengas la respuesta. ' +
   'Confirmá que entendiste respondiendo con una sola palabra: OK.';
 
 /**

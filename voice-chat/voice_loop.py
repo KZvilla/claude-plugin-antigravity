@@ -51,7 +51,7 @@ from common import (  # noqa: E402
     resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
     get_model_status, resolve_engine_and_model, tts_model_name, unload_model, stt_full_model_name,
     unload_all_loaded_models, LatidoUso, activar_motor_chat,
-    Muletillas, TiemposTurno, decidir_muletilla
+    Senales, TiemposTurno, decidir_senal, clave_de_herramienta
 )
 
 SAMPLE_RATE = 16000
@@ -193,10 +193,11 @@ def main():
                          help="Soltar el modelo fijado antes de empezar (si choca con el motor de la voz elegida).")
     parser.add_argument("--motor", default=None, choices=["omnivoice", "voicebox"],
                          help="Proveedor de voz. Por defecto OmniVoice si la voz tiene muestra, salvo voz_por_perfil.")
-    # 3000: en vivo, Gemini tarda ~2 s en emitir texto incluso para un "hola";
-    # con 1500 la muletilla sonaba en todos los turnos.
-    parser.add_argument("--muletilla-ms", type=int, default=3000,
-                         help="Si agy no emite texto en este tiempo, suena una muletilla pregrabada (solo OmniVoice). 0 las desactiva.")
+    # 2500: en vivo, Gemini tarda ~2.1-2.3 s en emitir texto para un "hola";
+    # "Pensando" no debe sonar en un turno trivial.
+    parser.add_argument("--senal-ms", type=int, default=2500,
+                         help='Si agy no emite texto ni usa una herramienta en este tiempo, suena "Pensando" '
+                              "(senales pregrabadas, solo OmniVoice). 0 desactiva todas las senales.")
     args = parser.parse_args()
 
     if args.list_devices:
@@ -259,17 +260,17 @@ def main():
     last_generation_id = {"id": None}
     sequencer = SentenceSequencer(player, last_generation_id)
 
-    # Muletillas solo con OmniVoice: una sintesis ya enviada no se interrumpe,
+    # Senales solo con OmniVoice: una sintesis ya enviada no se interrumpe,
     # y con Qwen (~10 s) taparia la primera respuesta (auditoria del plan).
     # Se generan mientras arranca la sesion de agy; "ocupado" las frena
     # durante un turno o una sintesis de la charla.
     turno_en_curso = {"activo": False}
     futuros = []
-    muletillas = None
-    if proveedor == "omnivoice" and args.muletilla_ms > 0:
-        muletillas = Muletillas(profile, args.language, engine, model_size, proveedor, muestra,
-                                ocupado=lambda: turno_en_curso["activo"] or player.is_active()
-                                or any(not f.done() for f in list(futuros)))
+    senales = None
+    if proveedor == "omnivoice" and args.senal_ms > 0:
+        senales = Senales(profile, args.language, engine, model_size, proveedor, muestra,
+                          ocupado=lambda: turno_en_curso["activo"] or player.is_active()
+                          or any(not f.done() for f in list(futuros)))
 
     # /models/load solo carga el modelo TTS "Qwen" (su propio schema no acepta
     # un engine) -- precalentarlo cuando el perfil resolvio a Kokoro/otro motor
@@ -353,7 +354,13 @@ def main():
                 mcp.call_tool("agy_voice_stream", {"action": "send", "stream_id": stream_id, "text": text})
                 t_envio = time.monotonic()
                 tiempos.marcar("envio")
-                muletilla_sono = False
+                # Estado de senales del turno. `pendiente`: la ultima herramienta
+                # de otra categoria que la que ya sono; espera la separacion y no
+                # la pisa una herramienta de la categoria ya dicha (auditoria v2).
+                pendiente = None
+                ultima_clave = None
+                t_ultima = None
+                sonaron = 0
 
                 turn_complete = False
                 while not turn_complete:
@@ -362,18 +369,25 @@ def main():
                     turn_complete = drain["turn_complete"]
                     if drain.get("deltas"):
                         tiempos.marcar("primer_texto")
-                    hubo_herramienta = bool(drain.get("herramientas"))
-                    if hubo_herramienta:
+                    for h in drain.get("herramientas") or []:
                         tiempos.marcar("herramienta")
-                    if muletillas and decidir_muletilla(
-                            muletilla_sono, tiempos.marca("primer_texto") is not None, player.is_active(),
-                            generation_token["value"] == my_token, hubo_herramienta,
-                            (time.monotonic() - t_envio) * 1000, args.muletilla_ms):
-                        ruta = muletillas.elegir()
+                        if clave_de_herramienta(h) != ultima_clave:
+                            pendiente = h
+                    if senales:
+                        ahora = time.monotonic()
+                        clave = decidir_senal(
+                            tiempos.marca("primer_texto") is not None, player.is_active(),
+                            generation_token["value"] == my_token, pendiente, ultima_clave,
+                            (ahora - t_ultima) * 1000 if t_ultima else 0,
+                            (ahora - t_envio) * 1000, args.senal_ms, sonaron)
+                        ruta = senales.elegir(clave) if clave else None
                         if ruta:
-                            player.enqueue(ruta, "(muletilla)", borrar=False)
-                            tiempos.marcar("muletilla")
-                            muletilla_sono = True
+                            player.enqueue(ruta, f"(señal: {clave})", borrar=False)
+                            tiempos.marcar("senal")
+                            ultima_clave, t_ultima = clave, ahora
+                            sonaron += 1
+                            if clave != "pensando":
+                                pendiente = None
                     for sentence in drain["sentences"]:
                         if generation_token["value"] != my_token:
                             continue  # barge-in ocurrio mientras agy seguia respondiendo
@@ -384,12 +398,14 @@ def main():
                                                  model_size, proveedor, muestra)
                         futuros.append(future)
                         del futuros[:-8]
-                        sequencer.submit(future, sentence, al_empezar=al_primer_audio)
+                        sequencer.submit(future, sentence, al_empezar=al_primer_audio,
+                                         vigente=lambda t=my_token: generation_token["value"] == t)
             except Exception as err:
                 print(f"  ⚠️ Error en el turno: {err}")
             finally:
                 turno_en_curso["activo"] = False
-            if not hubo_oracion:
+            # Un turno cortado no llega a primer_audio: la linea se imprime igual.
+            if not hubo_oracion or generation_token["value"] != my_token:
                 tiempos.imprimir_una_vez()
 
     threading.Thread(target=turn_worker, daemon=True).start()
@@ -421,8 +437,8 @@ def main():
         mcp.close()
         executor.shutdown(wait=False)
         latido.stop()
-        if muletillas:
-            muletillas.stop()
+        if senales:
+            senales.stop()
 
         if args.unload_all_on_exit:
             print("[voice-loop] Descargando TODO lo que Voicebox tenga cargado...")

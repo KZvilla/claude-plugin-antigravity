@@ -30,7 +30,7 @@ from common import (  # noqa: E402
     resolve_voice_profile, synthesize_sentence, voicebox_cancel,
     get_model_status, resolve_engine_and_model, unload_all_loaded_models,
     LatidoUso, tts_model_name, activar_motor_chat,
-    Muletillas, TiemposTurno, decidir_muletilla
+    Senales, TiemposTurno, decidir_senal, clave_de_herramienta
 )
 
 
@@ -49,9 +49,10 @@ def main():
                          help="Soltar el modelo fijado antes de empezar (si choca con el motor de la voz elegida).")
     parser.add_argument("--motor", default=None, choices=["omnivoice", "voicebox"],
                          help="Proveedor de voz. Por defecto OmniVoice si la voz tiene muestra, salvo voz_por_perfil.")
-    # 3000: ver voice_loop.py (Gemini tarda ~2 s incluso sin herramientas).
-    parser.add_argument("--muletilla-ms", type=int, default=3000,
-                         help="Si agy no emite texto en este tiempo, suena una muletilla pregrabada (solo OmniVoice). 0 las desactiva.")
+    # 2500: ver voice_loop.py ("Pensando" no debe sonar en un turno trivial).
+    parser.add_argument("--senal-ms", type=int, default=2500,
+                         help='Si agy no emite texto ni usa una herramienta en este tiempo, suena "Pensando" '
+                              "(senales pregrabadas, solo OmniVoice). 0 desactiva todas las senales.")
     args = parser.parse_args()
 
     if args.unload_all:
@@ -95,15 +96,18 @@ def main():
     last_generation_id = {"id": None}
     sequencer = SentenceSequencer(player, last_generation_id)
 
-    # Muletillas solo con OmniVoice (ver voice_loop.py). Se generan mientras
+    # Senales solo con OmniVoice (ver voice_loop.py). Se generan mientras
     # arranca la sesion de agy.
     turno_en_curso = {"activo": False}
     futuros = []
-    muletillas = None
-    if proveedor == "omnivoice" and args.muletilla_ms > 0:
-        muletillas = Muletillas(profile, args.language, engine, model_size, proveedor, muestra,
-                                ocupado=lambda: turno_en_curso["activo"] or player.is_active()
-                                or any(not f.done() for f in list(futuros)))
+    senales = None
+    if proveedor == "omnivoice" and args.senal_ms > 0:
+        senales = Senales(profile, args.language, engine, model_size, proveedor, muestra,
+                          ocupado=lambda: turno_en_curso["activo"] or player.is_active()
+                          or any(not f.done() for f in list(futuros)))
+    # Sin VAD no hay token de barge-in: cada Enter abre un turno nuevo y las
+    # oraciones de los anteriores se descartan al terminar de sintetizarse.
+    turno = {"n": 0}
 
     con_prewarm = proveedor == "voicebox" and engine in ("qwen", "qwen_custom_voice")
     print("[voice-loop] Iniciando sesion agy_voice_stream" +
@@ -130,6 +134,10 @@ def main():
                 break
 
             # Barge-in: si todavia hay audio sonando o en cola de un turno anterior, cortarlo.
+            # El turno sube antes, para que una sintesis vieja que termine justo
+            # ahora ya se descarte.
+            turno["n"] += 1
+            mi_turno = turno["n"]
             player.barge_in()
             voicebox_cancel(last_generation_id["id"])
 
@@ -147,7 +155,10 @@ def main():
                 mcp.call_tool("agy_voice_stream", {"action": "send", "stream_id": stream_id, "text": user_text})
                 t_envio = time.monotonic()
                 tiempos.marcar("envio")
-                muletilla_sono = False
+                pendiente = None  # ver voice_loop.py
+                ultima_clave = None
+                t_ultima = None
+                sonaron = 0
 
                 turn_complete = False
                 while not turn_complete:
@@ -156,17 +167,25 @@ def main():
                     turn_complete = drain["turn_complete"]
                     if drain.get("deltas"):
                         tiempos.marcar("primer_texto")
-                    hubo_herramienta = bool(drain.get("herramientas"))
-                    if hubo_herramienta:
+                    for h in drain.get("herramientas") or []:
                         tiempos.marcar("herramienta")
-                    if muletillas and decidir_muletilla(
-                            muletilla_sono, tiempos.marca("primer_texto") is not None, player.is_active(),
-                            True, hubo_herramienta, (time.monotonic() - t_envio) * 1000, args.muletilla_ms):
-                        ruta = muletillas.elegir()
+                        if clave_de_herramienta(h) != ultima_clave:
+                            pendiente = h
+                    if senales:
+                        ahora = time.monotonic()
+                        clave = decidir_senal(
+                            tiempos.marca("primer_texto") is not None, player.is_active(),
+                            turno["n"] == mi_turno, pendiente, ultima_clave,
+                            (ahora - t_ultima) * 1000 if t_ultima else 0,
+                            (ahora - t_envio) * 1000, args.senal_ms, sonaron)
+                        ruta = senales.elegir(clave) if clave else None
                         if ruta:
-                            player.enqueue(ruta, "(muletilla)", borrar=False)
-                            tiempos.marcar("muletilla")
-                            muletilla_sono = True
+                            player.enqueue(ruta, f"(señal: {clave})", borrar=False)
+                            tiempos.marcar("senal")
+                            ultima_clave, t_ultima = clave, ahora
+                            sonaron += 1
+                            if clave != "pensando":
+                                pendiente = None
                     for sentence in drain["sentences"]:
                         print(f"Agy> {sentence}")
                         tiempos.marcar("primera_oracion")
@@ -175,7 +194,8 @@ def main():
                                                  model_size, proveedor, muestra)
                         futuros.append(future)
                         del futuros[:-8]
-                        sequencer.submit(future, sentence, al_empezar=al_primer_audio)
+                        sequencer.submit(future, sentence, al_empezar=al_primer_audio,
+                                         vigente=lambda n=mi_turno: turno["n"] == n)
             except Exception as err:
                 print(f"  ⚠️ Error en el turno: {err}")
             finally:
@@ -200,8 +220,8 @@ def main():
         mcp.close()
         executor.shutdown(wait=False)
         latido.stop()
-        if muletillas:
-            muletillas.stop()
+        if senales:
+            senales.stop()
 
 
 if __name__ == "__main__":
