@@ -806,6 +806,27 @@ The Telegram bridge does need one (`npm install --prefix telegram-bridge`).
 }
 ```
 
+#### Repo-local opencode integration
+
+This repository ships an `.opencode/` directory plus a committed `opencode.json`,
+so running `opencode` **inside a clone** gives you close to the Claude Code
+experience, not just the raw tools:
+
+| Claude Code | opencode in this repo |
+|---|---|
+| `/lagrange:run`, `/lagrange:plan`, … | `/lagrange/run`, `/lagrange/plan`, … (13 commands in `.opencode/commands/lagrange/`) |
+| `agents/agy.md` subagent | `@lagrange` (`.opencode/agents/lagrange.md`) |
+| `skills/*/SKILL.md` | `.opencode/skills/*/SKILL.md` |
+| `mcp__lagrange__agy_run` | `lagrange_agy_run` (server name is prefixed) |
+
+The committed `opencode.json` registers the MCP server with a **relative** path,
+so no absolute path is needed when the opencode workspace is the clone. Outside
+the clone, register the server with the absolute-path config shown above.
+
+Because opencode namespaces MCP tools by server name, the ported commands,
+subagent and skills use `lagrange_<tool>` names (e.g. `lagrange_agy_run`) instead
+of Claude Code's `mcp__lagrange__agy_run`.
+
 **Codex** (`~/.codex/config.toml`):
 
 ```toml
@@ -828,8 +849,9 @@ as in Claude Code. `agy` has to be installed either way.
 
 **What does not carry over:**
 
-- **Slash commands and skills** (`/lagrange:*`) are Claude Code features. In
-  another client you call the tools directly.
+- **Slash commands and skills** (`/lagrange:*`) are Claude Code features with no
+  automatic port to arbitrary clients. opencode is covered by the `.opencode/`
+  integration above; in any other client you call the tools directly.
 - **Config and state stay in `~/.claude/`** (`antigravity.json`, usage, the agent
   registry), even if you never use Claude Code. This is deliberate: one
   directory per client would split the persistent agents' memory.

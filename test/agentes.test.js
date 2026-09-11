@@ -643,6 +643,74 @@ async function main() {
     }
   });
 
+  // ------------------------------------------------------------------
+  await group('compatibilidad de modelo y --effort en cast (BE-015)', async () => {
+    const cast = require('../mcp-server/agents/cast.js');
+    const compat = require('../mcp-server/lib/cli-compat.js');
+    // Sin modelo agy usa el de su settings.json (el incidente: Opus + --effort).
+    check('modeloAdmiteEsfuerzo rechaza null (sin modelo)', compat.modeloAdmiteEsfuerzo(null) === false);
+    check('modeloAdmiteEsfuerzo rechaza una familia desconocida (lista blanca)', compat.modeloAdmiteEsfuerzo('mistral-large') === false);
+    check('modeloAdmiteEsfuerzo rechaza Claude Opus', compat.modeloAdmiteEsfuerzo('claude-opus-4-6-thinking') === false);
+    check('modeloAdmiteEsfuerzo rechaza Claude Sonnet', compat.modeloAdmiteEsfuerzo('claude-sonnet-4-6') === false);
+    check('modeloAdmiteEsfuerzo rechaza GPT-OSS', compat.modeloAdmiteEsfuerzo('gpt-oss-120b-medium') === false);
+    check('modeloAdmiteEsfuerzo rechaza modelos sufijados (-high)', compat.modeloAdmiteEsfuerzo('gemini-3.8-flash-high') === false);
+    check('modeloAdmiteEsfuerzo rechaza modelos sufijados (-low)', compat.modeloAdmiteEsfuerzo('gemini-3.1-pro-low') === false);
+    check('modeloAdmiteEsfuerzo acepta modelos base Gemini', compat.modeloAdmiteEsfuerzo('gemini-3.8-flash') === true);
+    check('modeloAdmiteEsfuerzo acepta Gemini Pro', compat.modeloAdmiteEsfuerzo('gemini-3.1-pro') === true);
+
+    const v = compat.validarModeloEsfuerzo;
+    check('validar: Claude con effort explícito se rechaza', /no admite effort/.test(v(['--model', 'claude-sonnet-4-6', '--effort', 'high']) || ''));
+    check('validar: sufijado con effort se rechaza', /ya fija el esfuerzo/.test(v(['--model', 'gemini-3.8-flash-low', '--effort', 'low']) || ''));
+    check('validar: Pro con medium se rechaza', /Disponibles/.test(v(['--model', 'gemini-3.1-pro', '--effort', 'medium']) || ''));
+    check('validar: Gemini base con effort pasa', v(['--model', 'gemini-3.8-flash', '--effort', 'medium']) === null);
+    check('validar: effort sin model no se puede validar (límite documentado)', v(['--effort', 'high']) === null);
+
+    const e = compat.esfuerzoParaCli;
+    check('esfuerzoParaCli: defecto sin modelo no manda nada', e({ modelo: null, porDefecto: 'high' }) === null);
+    check('esfuerzoParaCli: defecto con Claude no manda nada', e({ modelo: 'claude-opus-4-6-thinking', porDefecto: 'high' }) === null);
+    check('esfuerzoParaCli: defecto con Gemini base se aplica', e({ modelo: 'gemini-3.8-flash', porDefecto: 'high' }) === 'high');
+    check('esfuerzoParaCli: un pedido explicito nunca se descarta', e({ modelo: 'claude-sonnet-4-6', pedido: 'low', porDefecto: 'high' }) === 'low');
+    check('esfuerzoParaCli: sin pedido ni defecto, null', e({ modelo: 'gemini-3.8-flash' }) === null);
+
+    const home = crearHome();
+    try {
+      registro.instalarAgente('lector', { skill: 'agency-code-reviewer' }, home);
+      salidaAgy = { err: null, stdout: 'lector\n' };
+      const llamadas = [];
+      const ejecutar = async (args) => {
+        llamadas.push(args);
+        return { success: true, data: { response: 'ok', conversation_id: 'h-1' } };
+      };
+      const base = { cwd: home, agyBin: 'agy', ejecutar, homeDir: home };
+
+      // Sin esfuerzo especificado: no se agrega --effort
+      await cast.castear({ ...base, agent: 'lector', prompt: 'test', opciones: { memory: false } });
+      check('por defecto sin effort no incluye --effort en cliArgs', !llamadas.at(-1).includes('--effort'));
+
+      // El incidente: esfuerzo por defecto (config) y ningún modelo resuelto.
+      await cast.castear({ ...base, agent: 'lector', prompt: 'test', opciones: { memory: false, effortPorDefecto: 'high' } });
+      check('defecto sin modelo no incluye --effort (agy podría resolver Opus)', !llamadas.at(-1).includes('--effort'));
+
+      // Esfuerzo por defecto y modelo Claude: se omite --effort
+      await cast.castear({ ...base, agent: 'lector', prompt: 'test', opciones: { memory: false, effortPorDefecto: 'high', model: 'claude-opus-4-6-thinking' } });
+      check('defecto con modelo Claude omite --effort', !llamadas.at(-1).includes('--effort'));
+      check('pero sí pasa --model con el modelo', llamadas.at(-1).includes('--model'));
+
+      // Pedido explícito con Claude: llega a cliArgs y lo rechaza validarModeloEsfuerzo
+      // en el MCP, con mensaje, en vez de desaparecer en silencio.
+      const rClaude = await cast.castear({ ...base, agent: 'lector', prompt: 'test', opciones: { memory: false, effort: 'high', model: 'claude-opus-4-6-thinking' } });
+      check('pedido explícito con Claude no se descarta en silencio', llamadas.at(-1).includes('--effort'));
+      check('el cast informa el esfuerzo que realmente mandó', rClaude.effort === 'high');
+
+      // Esfuerzo por defecto y modelo Gemini: sí se incluye --effort
+      await cast.castear({ ...base, agent: 'lector', prompt: 'test', opciones: { memory: false, effortPorDefecto: 'high', model: 'gemini-3.8-flash' } });
+      check('defecto con modelo base Gemini sí incluye --effort', llamadas.at(-1).includes('--effort'));
+      check('y también incluye --model', llamadas.at(-1).includes('--model'));
+    } finally {
+      borrar(home);
+    }
+  });
+
   report();
 }
 

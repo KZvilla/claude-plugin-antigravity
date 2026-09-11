@@ -23,6 +23,7 @@ const registro = require('./registry.js');
 const estado = require('./estado.js');
 const memoria = require('./memoria.js');
 const aprendizaje = require('./aprendizaje.js');
+const { esfuerzoParaCli } = require('../lib/cli-compat.js');
 
 /**
  * ¿Este `conversation_id` es el hilo de algun agente persistido?
@@ -88,15 +89,15 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
   }
 
   const hiloGuardado = opciones.fresh ? null : estado.hiloDe(agent, homeDir);
-  const effort = opciones.effort || 'high';
   const model = opciones.model || null;
+  const effort = esfuerzoParaCli({ modelo: model, pedido: opciones.effort, porDefecto: opciones.effortPorDefecto });
   const timeoutMinutes = opciones.timeoutMinutes || 15;
 
   const cliArgs = ['--output-format', 'json', '--agent', agent, '--dangerously-skip-permissions'];
   // Segunda capa para read-only: `--mode plan` si es un flag real del CLI. El
   // allowlist de tools y esto se cubren mutuamente; ninguno alcanza solo.
   if (entrada.read_only) cliArgs.push('--mode', 'plan');
-  cliArgs.push('--effort', effort);
+  if (effort) cliArgs.push('--effort', effort);
   if (model) cliArgs.push('--model', model);
   if (hiloGuardado) cliArgs.push('--conversation', hiloGuardado);
 

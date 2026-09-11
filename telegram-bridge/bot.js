@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { Bot, InlineKeyboard } from 'grammy';
 import { autoRetry } from '@grammyjs/auto-retry';
-import { runAgyTask, runAgyArgs, AGY_BIN, getAgyStatus, resolveWorkspace, resolveExtraDirs } from './executor.js';
+import { runAgyTask, runAgyArgs, AGY_BIN, getAgyStatus, resolveWorkspace, resolveExtraDirs, modeloPorDefecto } from './executor.js';
 import { replyWithSmartChunks, formatExecutionMeta, sendSafeChunk, formatElapsed, finalProgressLabel } from './formatter.js';
 import { redactSecrets } from './policy.js';
 import { startLogRotation } from './logrotate.js';
@@ -374,7 +374,9 @@ async function processTaskQueue(carril) {
         ejecutar: (cliArgs, op) => (canceladoAntesDelSpawn
           ? Promise.resolve({ success: false, cancelled: true, data: null, error: 'Cast cancelado antes de lanzar agy.' })
           : runAgyArgs(cliArgs, op)),
-        opciones: { soloLectura: true, alcance: task.cwd, onSpawn: (cancel) => { estado.cancelar = cancel; } }
+        // BE-015 — El mismo modelo que los mensajes sueltos (del .env), no el
+        // último `/model` interactivo de agy.
+        opciones: { ...modeloPorDefecto(), soloLectura: true, alcance: task.cwd, onSpawn: (cancel) => { estado.cancelar = cancel; } }
       });
       clearInterval(typingInterval);
       typingInterval = null;
