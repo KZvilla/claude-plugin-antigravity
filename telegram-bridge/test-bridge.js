@@ -2799,6 +2799,48 @@ console.log('✔ Test 68 [FEAT-025]: el favorito se guarda por chat y sobrevive 
 }
 console.log('✔ Test 69 [FEAT-025]: el workspace del último cast aparece primero en el siguiente');
 
+// Test 70 [BE-015]: compatibilidad de --effort y modelos en executor
+{
+  const executor = await import('./executor.js');
+  const { spawn: spawnReal } = await import('node:child_process');
+
+  assert.strictEqual(executor.modeloAdmiteEsfuerzo(null), true, 'sin modelo admite effort');
+  assert.strictEqual(executor.modeloAdmiteEsfuerzo('claude-opus-4-6-thinking'), false, 'rechaza Claude Opus');
+  assert.strictEqual(executor.modeloAdmiteEsfuerzo('claude-sonnet-4-6'), false, 'rechaza Claude Sonnet');
+  assert.strictEqual(executor.modeloAdmiteEsfuerzo('gpt-oss-120b-medium'), false, 'rechaza GPT-OSS');
+  assert.strictEqual(executor.modeloAdmiteEsfuerzo('gemini-3.8-flash-high'), false, 'rechaza sufijado');
+  assert.strictEqual(executor.modeloAdmiteEsfuerzo('gemini-3.8-flash'), true, 'acepta base');
+
+  let capturados = [];
+  const fakeSpawn = (bin, args) => {
+    capturados = args;
+    return spawnReal(process.execPath, ['-e', 'process.stdout.write(JSON.stringify({event:"result",result:{status:"SUCCESS",response:"ok"}})+"\\n")']);
+  };
+
+  const envPrevio = { ...process.env };
+  delete process.env.AGY_EFFORT;
+  delete process.env.AGY_MODEL;
+  try {
+    await executor.runAgyTask({ prompt: 'test', spawnFn: fakeSpawn });
+    assert(!capturados.includes('--effort'), 'sin AGY_EFFORT no se añade --effort');
+    assert(!capturados.includes('--model'), 'sin AGY_MODEL no se añade --model');
+
+    await executor.runAgyTask({ prompt: 'test', model: 'claude-opus-4-6-thinking', effort: 'high', spawnFn: fakeSpawn });
+    assert(!capturados.includes('--effort'), 'con modelo Claude se omite --effort');
+    assert(capturados.includes('--model'), 'pero sí se pasa --model');
+
+    await executor.runAgyTask({ prompt: 'test', model: 'gemini-3.8-flash', effort: 'high', spawnFn: fakeSpawn });
+    assert(capturados.includes('--effort'), 'con modelo Gemini se pasa --effort');
+    assert(capturados.includes('--model'), 'y también --model');
+  } finally {
+    for (const [k, v] of Object.entries(envPrevio)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+console.log('✔ Test 70 [BE-015]: compatibilidad de --effort y modelos en executor');
+
 // Limpieza: solo el directorio temporal de test
 try {
   fs.rmSync(path.dirname(TEST_STATE_FILE), { recursive: true, force: true });

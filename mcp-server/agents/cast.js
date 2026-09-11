@@ -38,6 +38,13 @@ function esHiloDeAgente(conversationId, homeDir = os.homedir()) {
   return Object.values(agentes).some(a => a && a.conversation_id === conversationId);
 }
 
+function modeloAdmiteEsfuerzo(modelo) {
+  if (!modelo || typeof modelo !== 'string') return true;
+  if (/^(claude|gpt-oss)/i.test(modelo)) return false;
+  if (/-(low|medium|high)$/i.test(modelo)) return false;
+  return true;
+}
+
 /**
  * Castea un agente registrado.
  *
@@ -88,7 +95,7 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
   }
 
   const hiloGuardado = opciones.fresh ? null : estado.hiloDe(agent, homeDir);
-  const effort = opciones.effort || 'high';
+  const effort = opciones.effort || null;
   const model = opciones.model || null;
   const timeoutMinutes = opciones.timeoutMinutes || 15;
 
@@ -96,7 +103,7 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
   // Segunda capa para read-only: `--mode plan` si es un flag real del CLI. El
   // allowlist de tools y esto se cubren mutuamente; ninguno alcanza solo.
   if (entrada.read_only) cliArgs.push('--mode', 'plan');
-  cliArgs.push('--effort', effort);
+  if (effort && modeloAdmiteEsfuerzo(model)) cliArgs.push('--effort', effort);
   if (model) cliArgs.push('--model', model);
   if (hiloGuardado) cliArgs.push('--conversation', hiloGuardado);
 
@@ -199,4 +206,4 @@ async function castear({ agent, prompt, cwd, agyBin, ejecutar, homeDir = os.home
   };
 }
 
-module.exports = { castear, esHiloDeAgente };
+module.exports = { castear, esHiloDeAgente, modeloAdmiteEsfuerzo };

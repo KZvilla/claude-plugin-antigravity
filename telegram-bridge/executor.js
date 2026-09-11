@@ -213,12 +213,19 @@ export function offloadLargePrompt(args) {
  *        herramienta que el agente abre («write_to_file → src/a.js»).
  * @param {Function} [options.spawnFn] Solo para los tests: lanza un agy falso.
  */
+export function modeloAdmiteEsfuerzo(modelo) {
+  if (!modelo || typeof modelo !== 'string') return true;
+  if (/^(claude|gpt-oss)/i.test(modelo)) return false;
+  if (/-(low|medium|high)$/i.test(modelo)) return false;
+  return true;
+}
+
 export function runAgyTask(options = {}) {
   const {
     prompt,
     mode = 'accept-edits',
     model = process.env.AGY_MODEL || null,
-    effort = process.env.AGY_EFFORT || 'high',
+    effort = process.env.AGY_EFFORT || null,
     timeoutMinutes = parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     conversationId = null,
     cwd = resolveWorkspace(),
@@ -238,9 +245,12 @@ export function runAgyTask(options = {}) {
     // final, y el progreso no podía decir qué estaba haciendo el agente.
     '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
-    '--mode', mode,
-    '--effort', effort
+    '--mode', mode
   ];
+
+  if (effort && modeloAdmiteEsfuerzo(model)) {
+    cliArgs.push('--effort', effort);
+  }
 
   // Restricciones de terminal, no de rutas: ver el comentario de loadPolicy().
   if (useSandbox) {

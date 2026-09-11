@@ -82,7 +82,7 @@ const AGY_BIN = resolveAgyBin();
 function loadConfig(cwd = process.cwd()) {
   const config = {
     defaultModel: process.env.AGY_MODEL || null,
-    defaultEffort: process.env.AGY_EFFORT || 'high',
+    defaultEffort: process.env.AGY_EFFORT || null,
     defaultTimeoutMinutes: parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     voiceboxUrl: process.env.VOICEBOX_URL || null,
     voiceboxPort: parseInt(process.env.VOICEBOX_PORT, 10) || null,
@@ -2109,6 +2109,13 @@ function terminateTree(child, graceMs = 5000) {
 // arrancar el proceso, con un mensaje que llega envuelto en JSON. Hoy no se
 // dispara porque el esfuerzo por defecto es `high`; en cuanto alguien pide
 // medium con un modelo Pro, si.
+function modeloAdmiteEsfuerzo(modelo) {
+  if (!modelo || typeof modelo !== 'string') return true;
+  if (/^(claude|gpt-oss)/i.test(modelo)) return false;
+  if (/-(low|medium|high)$/i.test(modelo)) return false;
+  return true;
+}
+
 const ESFUERZOS_POR_FAMILIA = [
   { patron: /pro/i, permitidos: ['low', 'high'] }
 ];
@@ -2120,8 +2127,22 @@ function validarModeloEsfuerzo(cliArgs) {
   const modelo = cliArgs[i + 1];
   const esfuerzo = cliArgs[j + 1];
   if (typeof modelo !== 'string' || typeof esfuerzo !== 'string') return null;
-  // Un id ya sufijado lo valida agy; aqui solo interesa el nombre corto.
-  if (/-(low|medium|high)$/i.test(modelo)) return null;
+
+  // Claude y GPT-OSS no admiten el flag --effort
+  if (/^(claude|gpt-oss)/i.test(modelo)) {
+    return `El modelo "${modelo}" no admite el parámetro --effort. `
+      + 'Elimina el parámetro effort o usa un modelo compatible (ej. familia Gemini).';
+  }
+
+  // Si el modelo ya tiene sufijo, agy rechaza si no coincide
+  const sufijoMatch = modelo.match(/-(low|medium|high)$/i);
+  if (sufijoMatch) {
+    const sufijo = sufijoMatch[1].toLowerCase();
+    if (sufijo !== esfuerzo.toLowerCase()) {
+      return `El modelo "${modelo}" ya fija el esfuerzo y entra en conflicto con --effort "${esfuerzo}".`;
+    }
+    return null;
+  }
 
   for (const { patron, permitidos } of ESFUERZOS_POR_FAMILIA) {
     if (patron.test(modelo) && !permitidos.includes(esfuerzo.toLowerCase())) {
@@ -2363,7 +2384,8 @@ function createVoiceStreamSession(options = {}) {
   const cwd = options.cwd || process.cwd();
 
   const cliArgs = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
-  cliArgs.push('--effort', options.effort || 'low');
+  const voiceEffort = options.effort || (options.model ? null : 'low');
+  if (voiceEffort && modeloAdmiteEsfuerzo(options.model)) cliArgs.push('--effort', voiceEffort);
   if (options.model) cliArgs.push('--model', options.model);
   if (options.mode) cliArgs.push('--mode', options.mode);
   if (options.conversation_id) cliArgs.push('--conversation', options.conversation_id);
@@ -2601,8 +2623,11 @@ async function handleToolCall(name, args) {
       const ejecutar = async (peticion) => {
         const cliArgs = ['--dangerously-skip-permissions'];
         cliArgs.push('--mode', peticion.mode || 'accept-edits');
-        cliArgs.push('--effort', peticion.effort || config.defaultEffort || 'high');
         const modelo = peticion.model || config.defaultModel;
+        const esfuerzo = peticion.effort || config.defaultEffort;
+        if (esfuerzo && modeloAdmiteEsfuerzo(modelo)) {
+          cliArgs.push('--effort', esfuerzo);
+        }
         if (modelo) cliArgs.push('--model', modelo);
         cliArgs.push('-p', peticion.prompt);
 
@@ -2917,10 +2942,11 @@ async function handleToolCall(name, args) {
         cliArgs.push('--sandbox');
       }
 
-      const effectiveEffort = args.effort || config.defaultEffort || 'high';
-      cliArgs.push('--effort', effectiveEffort);
-
+      const effectiveEffort = args.effort || config.defaultEffort;
       const effectiveModel = args.model || config.defaultModel;
+      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
+        cliArgs.push('--effort', effectiveEffort);
+      }
       if (effectiveModel) {
         cliArgs.push('--model', effectiveModel);
       }
@@ -3163,16 +3189,18 @@ ${args.task}
 Analyze the codebase and provide a thorough, structured step-by-step implementation plan.
 DO NOT execute code modifications. Outline files to create/modify, architectural choices, edge cases, tests to write, and verification steps.`;
 
-      const effectiveEffort = args.effort || config.defaultEffort || 'high';
+      const effectiveEffort = args.effort || config.defaultEffort || null;
       const effectiveModel = args.model || config.defaultModel;
       const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
         '--output-format', 'json',
         '--dangerously-skip-permissions',
-        '--mode', 'plan',
-        '--effort', effectiveEffort
+        '--mode', 'plan'
       ];
+      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
+        cliArgs.push('--effort', effectiveEffort);
+      }
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3248,16 +3276,18 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         auditPrompt += `Perform the full Mode 2 process: investigate the repository FIRST before judging. Search for existing flows, reconstruct current behavior, contrast with the plan, check for contradictions, evaluate integration points, evaluate testability, explicitly check for over-engineering, then assign severity and verdict.\n`;
       }
 
-      const effectiveEffort = args.effort || config.defaultEffort || 'high';
+      const effectiveEffort = args.effort || config.defaultEffort || null;
       const effectiveModel = args.model || config.defaultModel;
       const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
         '--output-format', 'json',
         '--dangerously-skip-permissions',
-        '--mode', 'plan',
-        '--effort', effectiveEffort
+        '--mode', 'plan'
       ];
+      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
+        cliArgs.push('--effort', effectiveEffort);
+      }
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3327,16 +3357,18 @@ Review the code changes or files with high rigor and precision. Focus on high-im
 4. Accessibility (WCAG) and error handling
 Provide specific findings with file paths, line numbers, issue descriptions, and concrete recommendations. Prioritize actionable findings over exhaustive repetition.`;
 
-      const effectiveEffort = args.effort || config.defaultEffort || 'high';
+      const effectiveEffort = args.effort || config.defaultEffort || null;
       const effectiveModel = args.model || config.defaultModel;
       const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
         '--output-format', 'json',
         '--dangerously-skip-permissions',
-        '--mode', 'plan',
-        '--effort', effectiveEffort
+        '--mode', 'plan'
       ];
+      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
+        cliArgs.push('--effort', effectiveEffort);
+      }
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3429,15 +3461,17 @@ If the research topic relates to the current codebase or project, explain how th
 
 Be thorough but concise. Prioritize primary sources and official documentation over blog posts. If searches return nothing usable on some sub-question, say so explicitly instead of filling the gap from memory.`;
 
-      const effectiveEffort = args.effort || config.defaultEffort || 'high';
+      const effectiveEffort = args.effort || config.defaultEffort || null;
       const effectiveModel = args.model || config.defaultModel;
 
       const cliArgs = [
         '--output-format', 'json',
         '--dangerously-skip-permissions',
-        '--mode', 'plan',
-        '--effort', effectiveEffort
+        '--mode', 'plan'
       ];
+      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
+        cliArgs.push('--effort', effectiveEffort);
+      }
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3595,9 +3629,11 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // dos veces deja a agy con dos formatos de salida contradictorios.
       const cliArgs = [
         '--dangerously-skip-permissions',
-        '--mode', 'plan',
-        '--effort', effectiveEffort
+        '--mode', 'plan'
       ];
+      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
+        cliArgs.push('--effort', effectiveEffort);
+      }
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3835,15 +3871,17 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // 5. Generate conversational spoken narration script via agy (Gemini)
       const enablePersonality = Boolean(args.personality);
       const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile, enablePersonality);
-      const effectiveEffort = args.effort || 'low';
       const effectiveModel = args.model || config.defaultModel;
+      const effectiveEffort = args.effort || (effectiveModel ? null : 'low');
 
       const cliArgs = [
         '--output-format', 'json',
         '--dangerously-skip-permissions',
-        '--mode', 'plan',
-        '--effort', effectiveEffort
+        '--mode', 'plan'
       ];
+      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
+        cliArgs.push('--effort', effectiveEffort);
+      }
 
       if (effectiveModel) {
         cliArgs.push('--model', effectiveModel);
@@ -3967,14 +4005,16 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // es, y mandarlos a un modelo solo anadiria latencia sin ganar nada —el
       // llamante YA tiene el texto, que es la premisa de agy_say.
       if (args.polish) {
-        const effectiveEffort = args.effort || 'low';
         const effectiveModel = args.model || config.defaultModel;
+        const effectiveEffort = args.effort || (effectiveModel ? null : 'low');
         const cliArgs = [
           '--output-format', 'json',
           '--dangerously-skip-permissions',
-          '--mode', 'plan',
-          '--effort', effectiveEffort
+          '--mode', 'plan'
         ];
+        if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
+          cliArgs.push('--effort', effectiveEffort);
+        }
         if (effectiveModel) cliArgs.push('--model', effectiveModel);
         cliArgs.push('-p', getPolishPrompt(rawText, targetLang, chosenProfile, enablePersonality));
 

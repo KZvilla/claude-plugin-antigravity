@@ -643,6 +643,47 @@ async function main() {
     }
   });
 
+  // ------------------------------------------------------------------
+  await group('compatibilidad de modelo y --effort en cast (BE-015)', async () => {
+    const cast = require('../mcp-server/agents/cast.js');
+    check('modeloAdmiteEsfuerzo acepta null (sin modelo)', cast.modeloAdmiteEsfuerzo(null) === true);
+    check('modeloAdmiteEsfuerzo rechaza Claude Opus', cast.modeloAdmiteEsfuerzo('claude-opus-4-6-thinking') === false);
+    check('modeloAdmiteEsfuerzo rechaza Claude Sonnet', cast.modeloAdmiteEsfuerzo('claude-sonnet-4-6') === false);
+    check('modeloAdmiteEsfuerzo rechaza GPT-OSS', cast.modeloAdmiteEsfuerzo('gpt-oss-120b-medium') === false);
+    check('modeloAdmiteEsfuerzo rechaza modelos sufijados (-high)', cast.modeloAdmiteEsfuerzo('gemini-3.8-flash-high') === false);
+    check('modeloAdmiteEsfuerzo rechaza modelos sufijados (-low)', cast.modeloAdmiteEsfuerzo('gemini-3.1-pro-low') === false);
+    check('modeloAdmiteEsfuerzo acepta modelos base Gemini', cast.modeloAdmiteEsfuerzo('gemini-3.8-flash') === true);
+    check('modeloAdmiteEsfuerzo acepta Gemini Pro', cast.modeloAdmiteEsfuerzo('gemini-3.1-pro') === true);
+
+    const home = crearHome();
+    try {
+      registro.instalarAgente('lector', { skill: 'agency-code-reviewer' }, home);
+      salidaAgy = { err: null, stdout: 'lector\n' };
+      const llamadas = [];
+      const ejecutar = async (args) => {
+        llamadas.push(args);
+        return { success: true, data: { response: 'ok', conversation_id: 'h-1' } };
+      };
+      const base = { cwd: home, agyBin: 'agy', ejecutar, homeDir: home };
+
+      // Sin esfuerzo especificado: no se agrega --effort
+      await cast.castear({ ...base, agent: 'lector', prompt: 'test', opciones: { memory: false } });
+      check('por defecto sin effort no incluye --effort en cliArgs', !llamadas.at(-1).includes('--effort'));
+
+      // Con esfuerzo especificado y modelo Claude: se omite --effort
+      await cast.castear({ ...base, agent: 'lector', prompt: 'test', opciones: { memory: false, effort: 'high', model: 'claude-opus-4-6-thinking' } });
+      check('con modelo Claude se omite --effort aunque se pida effort', !llamadas.at(-1).includes('--effort'));
+      check('pero sí pasa --model con el modelo', llamadas.at(-1).includes('--model'));
+
+      // Con esfuerzo especificado y modelo Gemini: sí se incluye --effort
+      await cast.castear({ ...base, agent: 'lector', prompt: 'test', opciones: { memory: false, effort: 'high', model: 'gemini-3.8-flash' } });
+      check('con modelo base Gemini sí incluye --effort', llamadas.at(-1).includes('--effort'));
+      check('y también incluye --model', llamadas.at(-1).includes('--model'));
+    } finally {
+      borrar(home);
+    }
+  });
+
   report();
 }
 
