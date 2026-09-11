@@ -23,6 +23,9 @@ export { loadPolicy, resolveWorkspace, resolveExtraDirs } from './policy.js';
 const requireCjs = createRequire(import.meta.url);
 const { crearAcumuladorStream } = requireCjs('../mcp-server/agy-stream.js');
 const { interpretarEvento } = requireCjs('../mcp-server/fanout-tail.js');
+// BE-015 — Las mismas reglas de `--model`/`--effort` que el servidor MCP.
+const { modeloAdmiteEsfuerzo, esfuerzoParaCli, validarModeloEsfuerzo } = requireCjs('../mcp-server/lib/cli-compat.js');
+export { modeloAdmiteEsfuerzo };
 
 /**
  * Resuelve la ruta del binario agy.exe de Antigravity
@@ -196,13 +199,30 @@ export function offloadLargePrompt(args) {
 
 
 /**
+ * BE-015 — Modelo y esfuerzo por defecto del bridge, leídos del `.env`.
+ *
+ * Sin esto, lo que no lleva `--model` hereda el último `/model` que se eligió
+ * en una sesión interactiva de agy (se guarda en su settings.json global): así
+ * el bot quedó corriendo en Opus sin que nadie lo pidiera. Es el único punto
+ * que conoce las variables; los mensajes sueltos y `/cast` pasan por acá, así
+ * que cambiar de proveedor es cambiar esta función.
+ */
+export function modeloPorDefecto() {
+  return {
+    model: process.env.AGY_MODEL || null,
+    effortPorDefecto: process.env.AGY_EFFORT || null
+  };
+}
+
+/**
  * Ejecuta una tarea en Antigravity CLI de forma segura y estructurada
  *
  * @param {Object} options
  * @param {string} options.prompt Tarea o instrucción a ejecutar
  * @param {'plan'|'accept-edits'} [options.mode='accept-edits'] Modo de ejecución
  * @param {string} [options.model] Modelo override (ej. gemini-3.8-flash)
- * @param {'low'|'medium'|'high'} [options.effort='high'] Esfuerzo de razonamiento
+ * @param {'low'|'medium'|'high'} [options.effort] Esfuerzo pedido explícitamente. Sin él,
+ *        `AGY_EFFORT` solo se aplica si el modelo lo admite (BE-015); si no, decide agy.
  * @param {number} [options.timeoutMinutes=15] Timeout en minutos
  * @param {string} [options.conversationId] ID para continuar conversación multiturno
  * @param {string} [options.cwd] Directorio de trabajo
@@ -213,19 +233,12 @@ export function offloadLargePrompt(args) {
  *        herramienta que el agente abre («write_to_file → src/a.js»).
  * @param {Function} [options.spawnFn] Solo para los tests: lanza un agy falso.
  */
-export function modeloAdmiteEsfuerzo(modelo) {
-  if (!modelo || typeof modelo !== 'string') return true;
-  if (/^(claude|gpt-oss)/i.test(modelo)) return false;
-  if (/-(low|medium|high)$/i.test(modelo)) return false;
-  return true;
-}
-
 export function runAgyTask(options = {}) {
   const {
     prompt,
     mode = 'accept-edits',
-    model = process.env.AGY_MODEL || null,
-    effort = process.env.AGY_EFFORT || null,
+    model = modeloPorDefecto().model,
+    effort: effortPedido = null,
     timeoutMinutes = parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
     conversationId = null,
     cwd = resolveWorkspace(),
@@ -248,9 +261,8 @@ export function runAgyTask(options = {}) {
     '--mode', mode
   ];
 
-  if (effort && modeloAdmiteEsfuerzo(model)) {
-    cliArgs.push('--effort', effort);
-  }
+  const effort = esfuerzoParaCli({ modelo: model, pedido: effortPedido, porDefecto: modeloPorDefecto().effortPorDefecto });
+  if (effort) cliArgs.push('--effort', effort);
 
   // Restricciones de terminal, no de rutas: ver el comentario de loadPolicy().
   if (useSandbox) {
@@ -273,6 +285,11 @@ export function runAgyTask(options = {}) {
   }
 
   cliArgs.push('-p', buildGuardrailedPrompt(policy, prompt));
+
+  // Cortar antes del spawn, con el mismo mensaje que el MCP, en vez de que agy
+  // aborte a mitad del stream.
+  const problema = validarModeloEsfuerzo(cliArgs);
+  if (problema) return Promise.resolve({ success: false, error: problema });
 
   return lanzarAgy(cliArgs, {
     cwd,
@@ -302,6 +319,9 @@ export async function runAgyArgs(cliArgs, {
   onSpawn = null,
   spawnFn = spawn
 } = {}) {
+  const problema = validarModeloEsfuerzo(cliArgs);
+  if (problema) return { success: false, cancelled: false, data: null, rawOutput: '', error: problema };
+
   // Sigue en json: los args los arma cast.js con `--output-format json`, y el
   // cast no muestra actividad (FEAT-034 lo dejó fuera a propósito).
   const r = await lanzarAgy(['--print-timeout', `${timeoutMinutes}m`, ...cliArgs], {

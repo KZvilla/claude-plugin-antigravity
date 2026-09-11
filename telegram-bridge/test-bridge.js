@@ -830,6 +830,12 @@ console.log('✔ Test 34 [BE-007]: TELEGRAM_BRIDGE_STATE_FILE tiene precedencia 
   for (const f of ['agy-stream.js', 'fanout-tail.js', 'prompt-offload.js']) {
     fs.copyFileSync(path.join(import.meta.dirname, '..', 'mcp-server', f), path.join(raiz, 'mcp-server', f));
   }
+  // BE-015: executor.js y agents/cast.js cargan las reglas de --effort de lib/.
+  fs.mkdirSync(path.join(raiz, 'mcp-server', 'lib'), { recursive: true });
+  fs.copyFileSync(
+    path.join(import.meta.dirname, '..', 'mcp-server', 'lib', 'cli-compat.js'),
+    path.join(raiz, 'mcp-server', 'lib', 'cli-compat.js')
+  );
   fs.symlinkSync(path.join(import.meta.dirname, 'node_modules'), path.join(codigo, 'node_modules'), 'junction');
   fs.writeFileSync(path.join(codigo, 'bridge.lock'), JSON.stringify({ pid: 999999, startedAt: null, bootId: null }));
   fs.writeFileSync(path.join(codigo, 'state.json'), '{"chats":{},"pendingAsks":{}}');
@@ -2449,6 +2455,7 @@ console.log('✔ Test 59 [FEAT-026]: una cola por carril, sin head-of-line block
   let cancelRun = 0;
   let llamadasCastear = 0;
   let cancelCast = 0;
+  const opcionesDelCast = [];
   botMod.usarEjecutoresDePrueba({
     runAgyTask: async ({ onSpawn }) => {
       runIniciado++;
@@ -2457,6 +2464,7 @@ console.log('✔ Test 59 [FEAT-026]: una cola por carril, sin head-of-line block
     },
     castear: async ({ opciones }) => {
       llamadasCastear++;
+      opcionesDelCast.push(opciones);
       const d = diferido();
       opciones.onSpawn(() => { cancelCast++; d.resolver({ ok: false, cancelled: true }); return true; });
       return d.promesa;
@@ -2475,8 +2483,22 @@ console.log('✔ Test 59 [FEAT-026]: una cola por carril, sin head-of-line block
     await bot.handleUpdate(comandoDe('/run correr la suite completa', 800));
     await esperarQue(() => runIniciado === 1, 'el run arranca');
 
-    await botMod.dispatchCast(ctxCast, cast);
-    await esperarQue(() => llamadasCastear === 1, 'el cast arranca');
+    // BE-015: el cast toma modelo y esfuerzo del .env, no del `/model` de agy.
+    const modeloPrevio = process.env.AGY_MODEL;
+    const effortPrevio = process.env.AGY_EFFORT;
+    process.env.AGY_MODEL = 'gemini-3.8-flash';
+    process.env.AGY_EFFORT = 'high';
+    try {
+      await botMod.dispatchCast(ctxCast, cast);
+      await esperarQue(() => llamadasCastear === 1, 'el cast arranca');
+    } finally {
+      if (modeloPrevio === undefined) delete process.env.AGY_MODEL; else process.env.AGY_MODEL = modeloPrevio;
+      if (effortPrevio === undefined) delete process.env.AGY_EFFORT; else process.env.AGY_EFFORT = effortPrevio;
+    }
+    assert.strictEqual(opcionesDelCast[0].model, 'gemini-3.8-flash', 'el cast recibe AGY_MODEL del .env');
+    assert.strictEqual(opcionesDelCast[0].effortPorDefecto, 'high', 'y AGY_EFFORT como esfuerzo por defecto, no como pedido');
+    assert.strictEqual(opcionesDelCast[0].effort, undefined, 'el esfuerzo del .env nunca se trata como pedido explícito');
+    assert.strictEqual(opcionesDelCast[0].soloLectura, true, 'sin perder soloLectura');
     assert(cancelRun === 0 && botMod.carrilOcupado('principal'), 'el cast arrancó CON el run todavía en curso');
     assert(avisosCast[0].includes('Casteando'), 'y su aviso no dice que está esperando');
 
@@ -2804,7 +2826,7 @@ console.log('✔ Test 69 [FEAT-025]: el workspace del último cast aparece prime
   const executor = await import('./executor.js');
   const { spawn: spawnReal } = await import('node:child_process');
 
-  assert.strictEqual(executor.modeloAdmiteEsfuerzo(null), true, 'sin modelo admite effort');
+  assert.strictEqual(executor.modeloAdmiteEsfuerzo(null), false, 'sin modelo no se arriesga effort');
   assert.strictEqual(executor.modeloAdmiteEsfuerzo('claude-opus-4-6-thinking'), false, 'rechaza Claude Opus');
   assert.strictEqual(executor.modeloAdmiteEsfuerzo('claude-sonnet-4-6'), false, 'rechaza Claude Sonnet');
   assert.strictEqual(executor.modeloAdmiteEsfuerzo('gpt-oss-120b-medium'), false, 'rechaza GPT-OSS');
@@ -2825,13 +2847,31 @@ console.log('✔ Test 69 [FEAT-025]: el workspace del último cast aparece prime
     assert(!capturados.includes('--effort'), 'sin AGY_EFFORT no se añade --effort');
     assert(!capturados.includes('--model'), 'sin AGY_MODEL no se añade --model');
 
-    await executor.runAgyTask({ prompt: 'test', model: 'claude-opus-4-6-thinking', effort: 'high', spawnFn: fakeSpawn });
-    assert(!capturados.includes('--effort'), 'con modelo Claude se omite --effort');
+    assert.deepStrictEqual(executor.modeloPorDefecto(), { model: null, effortPorDefecto: null }, 'sin .env no hay modelo ni esfuerzo por defecto');
+
+    // El incidente: AGY_EFFORT en el entorno del daemon y ningún modelo.
+    process.env.AGY_EFFORT = 'high';
+    assert.deepStrictEqual(executor.modeloPorDefecto(), { model: null, effortPorDefecto: 'high' }, 'modeloPorDefecto lee el entorno en cada llamada');
+    await executor.runAgyTask({ prompt: 'test', spawnFn: fakeSpawn });
+    assert(!capturados.includes('--effort'), 'AGY_EFFORT sin modelo no añade --effort');
+
+    await executor.runAgyTask({ prompt: 'test', model: 'claude-opus-4-6-thinking', spawnFn: fakeSpawn });
+    assert(!capturados.includes('--effort'), 'AGY_EFFORT con modelo Claude se omite');
     assert(capturados.includes('--model'), 'pero sí se pasa --model');
 
-    await executor.runAgyTask({ prompt: 'test', model: 'gemini-3.8-flash', effort: 'high', spawnFn: fakeSpawn });
-    assert(capturados.includes('--effort'), 'con modelo Gemini se pasa --effort');
+    await executor.runAgyTask({ prompt: 'test', model: 'gemini-3.8-flash', spawnFn: fakeSpawn });
+    assert(capturados.includes('--effort'), 'AGY_EFFORT con modelo Gemini se pasa --effort');
     assert(capturados.includes('--model'), 'y también --model');
+
+    // Paridad con el MCP: un pedido explícito incompatible se corta antes del spawn.
+    capturados = null;
+    const rVal = await executor.runAgyTask({ prompt: 'test', model: 'claude-opus-4-6-thinking', effort: 'high', spawnFn: fakeSpawn });
+    assert.strictEqual(capturados, null, 'pedido explícito incompatible no llega a lanzar agy');
+    assert(!rVal.success && /no admite effort/.test(rVal.error), 'y explica el motivo');
+
+    const rArgs = await executor.runAgyArgs(['--model', 'gemini-3.8-flash-high', '--effort', 'low', '-p', 'x'], { spawnFn: fakeSpawn });
+    assert.strictEqual(capturados, null, 'runAgyArgs (cast) tampoco lanza agy');
+    assert(!rArgs.success && /ya fija el esfuerzo/.test(rArgs.error), 'y explica la colisión');
   } finally {
     for (const [k, v] of Object.entries(envPrevio)) {
       if (v === undefined) delete process.env[k];

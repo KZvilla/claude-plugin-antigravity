@@ -30,6 +30,8 @@ const estadoAgentes = require('./agents/estado.js');
 const memoriaAgentes = require('./agents/memoria.js');
 const aprendizajeAgentes = require('./agents/aprendizaje.js');
 const castAgentes = require('./agents/cast.js');
+// BE-015 — Reglas de `--model`/`--effort` compartidas con el bot de Telegram.
+const { esfuerzoParaCli, validarModeloEsfuerzo } = require('./lib/cli-compat.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -359,7 +361,7 @@ function recordUsage(tool, model, effort, conversationId, durationSeconds, usage
     data.last_call = {
       tool,
       model: model || '(cli default)',
-      effort: effort || 'high',
+      effort: effort || 'default',
       conversation_id: conversationId || null,
       duration_seconds: dur,
       timestamp: new Date().toISOString(),
@@ -607,7 +609,7 @@ const TOOLS = [
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high'],
-          description: 'Reasoning effort level. Defaults to configured default (usually "high").'
+          description: 'Reasoning effort level. If omitted, the configured default applies only to Gemini models without an effort suffix; otherwise agy decides. Claude, GPT-OSS and suffixed models reject an explicit effort. An explicit effort without a model cannot be checked in advance: agy picks the model from its own settings.'
         },
         conversation_id: {
           type: 'string',
@@ -674,7 +676,7 @@ const TOOLS = [
           description: 'Maximum subagents running at once. Defaults to 3. The cap exists for quota, not CPU.'
         },
         modelo: { type: 'string', description: 'Default model for the batch. Defaults to the configured one.' },
-        effort: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Default effort for the batch. Defaults to "high".' },
+        effort: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Default effort for the batch. If omitted, the configured default applies only to Gemini models without an effort suffix.' },
         cwd: { type: 'string', description: 'Repository root. Defaults to Claude\'s current working directory.' },
         timeout_minutes: { type: 'number', description: 'Per-subagent timeout. Defaults to 15.' }
       },
@@ -698,7 +700,7 @@ const TOOLS = [
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high'],
-          description: 'Reasoning effort level. Defaults to "high".'
+          description: 'Reasoning effort level. If omitted, the configured default applies only to Gemini models without an effort suffix; otherwise agy decides. Claude, GPT-OSS and suffixed models reject an explicit effort. An explicit effort without a model cannot be checked in advance: agy picks the model from its own settings.'
         },
         conversation_id: {
           type: 'string',
@@ -738,7 +740,7 @@ const TOOLS = [
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high'],
-          description: 'Reasoning effort level. Defaults to "high".'
+          description: 'Reasoning effort level. If omitted, the configured default applies only to Gemini models without an effort suffix; otherwise agy decides. Claude, GPT-OSS and suffixed models reject an explicit effort. An explicit effort without a model cannot be checked in advance: agy picks the model from its own settings.'
         },
         conversation_id: {
           type: 'string',
@@ -783,7 +785,7 @@ const TOOLS = [
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high'],
-          description: 'Reasoning effort level. Defaults to "high".'
+          description: 'Reasoning effort level. If omitted, the configured default applies only to Gemini models without an effort suffix; otherwise agy decides. Claude, GPT-OSS and suffixed models reject an explicit effort. An explicit effort without a model cannot be checked in advance: agy picks the model from its own settings.'
         },
         conversation_id: {
           type: 'string',
@@ -827,7 +829,7 @@ const TOOLS = [
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high'],
-          description: 'Reasoning effort level. Defaults to "high".'
+          description: 'Reasoning effort level. If omitted, the configured default applies only to Gemini models without an effort suffix; otherwise agy decides. Claude, GPT-OSS and suffixed models reject an explicit effort. An explicit effort without a model cannot be checked in advance: agy picks the model from its own settings.'
         },
         conversation_id: {
           type: 'string',
@@ -988,7 +990,7 @@ const TOOLS = [
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high'],
-          description: 'Reasoning effort for summarization. Defaults to "high".'
+          description: 'Reasoning effort for summarization. If omitted, the configured default applies only to Gemini models without an effort suffix (the Pro fallback for long sessions uses "high").'
         },
         timeout_minutes: {
           type: 'number',
@@ -1337,7 +1339,7 @@ const TOOLS = [
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high'],
-          description: 'Reasoning effort. Defaults to "high": these agents exist to exercise judgment.'
+          description: 'Reasoning effort. If omitted, the configured default applies only to Gemini models without an effort suffix; otherwise agy decides.'
         },
         timeout_minutes: {
           type: 'number',
@@ -2099,61 +2101,6 @@ function terminateTree(child, graceMs = 5000) {
   return t;
 }
 
-// Los modelos de agy no aceptan cualquier esfuerzo. `agy models` los lista con
-// el sufijo incorporado, y la familia Pro solo existe en low y high:
-//
-//   gemini-3.8-flash-high|medium|low     gemini-3.7-flash-high|medium|low     gemini-3.1-pro-high|low
-//
-// Pasar el nombre corto es valido -- agy lo resuelve con --effort -- pero
-// `--model gemini-3.1-pro --effort medium` es un error que solo aparece tras
-// arrancar el proceso, con un mensaje que llega envuelto en JSON. Hoy no se
-// dispara porque el esfuerzo por defecto es `high`; en cuanto alguien pide
-// medium con un modelo Pro, si.
-function modeloAdmiteEsfuerzo(modelo) {
-  if (!modelo || typeof modelo !== 'string') return true;
-  if (/^(claude|gpt-oss)/i.test(modelo)) return false;
-  if (/-(low|medium|high)$/i.test(modelo)) return false;
-  return true;
-}
-
-const ESFUERZOS_POR_FAMILIA = [
-  { patron: /pro/i, permitidos: ['low', 'high'] }
-];
-
-function validarModeloEsfuerzo(cliArgs) {
-  const i = cliArgs.indexOf('--model');
-  const j = cliArgs.indexOf('--effort');
-  if (i === -1 || j === -1) return null;
-  const modelo = cliArgs[i + 1];
-  const esfuerzo = cliArgs[j + 1];
-  if (typeof modelo !== 'string' || typeof esfuerzo !== 'string') return null;
-
-  // Claude y GPT-OSS no admiten el flag --effort
-  if (/^(claude|gpt-oss)/i.test(modelo)) {
-    return `El modelo "${modelo}" no admite el parámetro --effort. `
-      + 'Elimina el parámetro effort o usa un modelo compatible (ej. familia Gemini).';
-  }
-
-  // Si el modelo ya tiene sufijo, agy rechaza si no coincide
-  const sufijoMatch = modelo.match(/-(low|medium|high)$/i);
-  if (sufijoMatch) {
-    const sufijo = sufijoMatch[1].toLowerCase();
-    if (sufijo !== esfuerzo.toLowerCase()) {
-      return `El modelo "${modelo}" ya fija el esfuerzo y entra en conflicto con --effort "${esfuerzo}".`;
-    }
-    return null;
-  }
-
-  for (const { patron, permitidos } of ESFUERZOS_POR_FAMILIA) {
-    if (patron.test(modelo) && !permitidos.includes(esfuerzo.toLowerCase())) {
-      return `El modelo "${modelo}" no admite effort "${esfuerzo}". `
-        + `Disponibles para esa familia: ${permitidos.join(', ')}. `
-        + `Ejecuta \`agy models\` para ver la lista completa.`;
-    }
-  }
-  return null;
-}
-
 // Por encima de este tamano, Flash deja de sostener la transcripcion entera y
 // empieza a rellenar huecos.
 //
@@ -2183,7 +2130,7 @@ function elegirModeloResumen(args, config, promptSize) {
   if (args.model) {
     return {
       model: args.model,
-      effort: args.effort || config.defaultEffort || 'high',
+      effort: esfuerzoParaCli({ modelo: args.model, pedido: args.effort, porDefecto: config.defaultEffort }),
       nota: null
     };
   }
@@ -2195,7 +2142,7 @@ function elegirModeloResumen(args, config, promptSize) {
   if (promptSize <= RESUMEN_UMBRAL_PRO) {
     return {
       model: porDefecto,
-      effort: args.effort || config.defaultEffort || 'high',
+      effort: esfuerzoParaCli({ modelo: porDefecto, pedido: args.effort, porDefecto: config.defaultEffort }),
       nota: `Prompt de ${kb} KB, por debajo del umbral de ${umbralKb} KB: se usa el modelo por defecto.`
         + ' El umbral mira el prompt preprocesado, no el tamano del log.'
     };
@@ -2384,8 +2331,8 @@ function createVoiceStreamSession(options = {}) {
   const cwd = options.cwd || process.cwd();
 
   const cliArgs = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
-  const voiceEffort = options.effort || (options.model ? null : 'low');
-  if (voiceEffort && modeloAdmiteEsfuerzo(options.model)) cliArgs.push('--effort', voiceEffort);
+  const voiceEffort = esfuerzoParaCli({ modelo: options.model, pedido: options.effort, porDefecto: 'low' });
+  if (voiceEffort) cliArgs.push('--effort', voiceEffort);
   if (options.model) cliArgs.push('--model', options.model);
   if (options.mode) cliArgs.push('--mode', options.mode);
   if (options.conversation_id) cliArgs.push('--conversation', options.conversation_id);
@@ -2513,7 +2460,7 @@ async function handleToolCall(name, args) {
 
       out += `**🤖 Active Model Configuration:**\n`;
       out += `- Model: \`${specs.name}\` (${specs.description})\n`;
-      out += `- Default Reasoning Effort: \`${config.defaultEffort || 'high'}\`\n`;
+      out += `- Default Reasoning Effort: ${config.defaultEffort ? `\`${config.defaultEffort}\` (only applied to Gemini models without an effort suffix)` : '_none: agy decides_'}\n`;
       // Sin cifra fiable se dice, no se rellena.
       out += `- Context Window: ${specs.contextWindow ? `\`${formatTokens(specs.contextWindow)} tokens\`` : '_not published for this model_'}\n`;
       out += `- Max Output Tokens: ${specs.maxOutput ? `\`${formatTokens(specs.maxOutput)} tokens\`` : '_not published for this model_'}\n`;
@@ -2575,7 +2522,7 @@ async function handleToolCall(name, args) {
         content: [
           {
             type: 'text',
-            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default: gemini-3.8-flash)'}\n- Default Effort: ${config.defaultEffort || 'high'}\n- Default Timeout: ${config.defaultTimeoutMinutes}m\n- Permissions Policy:\n  * Allow: [${p.allow.join(', ')}]\n  * Deny: [${p.deny.join(', ') || 'none'}]\n  * Denied Paths: [${p.deny_paths.join(', ')}]\n  * Denied Commands: [${p.deny_commands.join(', ')}]\n  * Sandbox Mode: ${p.sandbox ? 'enabled' : 'disabled'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
+            text: `Antigravity CLI Status:\n- Binary: ${AGY_BIN}\n- Version/Info: ${version || 'Available'}\n- OS: ${process.platform} (${process.arch})\n- Default Model: ${config.defaultModel || '(cli default: gemini-3.8-flash)'}\n- Default Effort: ${config.defaultEffort ? `${config.defaultEffort} (only for Gemini models without an effort suffix)` : '(none: agy decides)'}\n- Default Timeout: ${config.defaultTimeoutMinutes}m\n- Permissions Policy:\n  * Allow: [${p.allow.join(', ')}]\n  * Deny: [${p.deny.join(', ') || 'none'}]\n  * Denied Paths: [${p.deny_paths.join(', ')}]\n  * Denied Commands: [${p.deny_commands.join(', ')}]\n  * Sandbox Mode: ${p.sandbox ? 'enabled' : 'disabled'}\n- Active Config File: ${config.configFile || 'none (using defaults)'}\n- Ready to execute subagent tasks.`
           }
         ]
       };
@@ -2596,7 +2543,7 @@ async function handleToolCall(name, args) {
         content: [
           {
             type: 'text',
-            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || 'high'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Fanout statusline: ${result.config.fanout_statusline === false ? 'disabled' : 'enabled'}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
+            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || '(none: agy decides)'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Fanout statusline: ${result.config.fanout_statusline === false ? 'disabled' : 'enabled'}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
           }
         ]
       };
@@ -2624,10 +2571,8 @@ async function handleToolCall(name, args) {
         const cliArgs = ['--dangerously-skip-permissions'];
         cliArgs.push('--mode', peticion.mode || 'accept-edits');
         const modelo = peticion.model || config.defaultModel;
-        const esfuerzo = peticion.effort || config.defaultEffort;
-        if (esfuerzo && modeloAdmiteEsfuerzo(modelo)) {
-          cliArgs.push('--effort', esfuerzo);
-        }
+        const esfuerzo = esfuerzoParaCli({ modelo, pedido: peticion.effort, porDefecto: config.defaultEffort });
+        if (esfuerzo) cliArgs.push('--effort', esfuerzo);
         if (modelo) cliArgs.push('--model', modelo);
         cliArgs.push('-p', peticion.prompt);
 
@@ -2863,7 +2808,8 @@ async function handleToolCall(name, args) {
           projectId: args.project_id,
           budgetTokens: args.budget_tokens,
           model: args.model || config.defaultModel,
-          effort: args.effort || config.defaultEffort || 'high',
+          effort: args.effort,
+          effortPorDefecto: config.defaultEffort,
           timeoutMinutes: args.timeout_minutes || config.defaultTimeoutMinutes || 15
         }
       });
@@ -2942,11 +2888,9 @@ async function handleToolCall(name, args) {
         cliArgs.push('--sandbox');
       }
 
-      const effectiveEffort = args.effort || config.defaultEffort;
       const effectiveModel = args.model || config.defaultModel;
-      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
-        cliArgs.push('--effort', effectiveEffort);
-      }
+      const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: config.defaultEffort });
+      if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
       if (effectiveModel) {
         cliArgs.push('--model', effectiveModel);
       }
@@ -3189,8 +3133,8 @@ ${args.task}
 Analyze the codebase and provide a thorough, structured step-by-step implementation plan.
 DO NOT execute code modifications. Outline files to create/modify, architectural choices, edge cases, tests to write, and verification steps.`;
 
-      const effectiveEffort = args.effort || config.defaultEffort || null;
       const effectiveModel = args.model || config.defaultModel;
+      const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: config.defaultEffort });
       const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
@@ -3198,9 +3142,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         '--dangerously-skip-permissions',
         '--mode', 'plan'
       ];
-      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
-        cliArgs.push('--effort', effectiveEffort);
-      }
+      if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3276,8 +3218,8 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         auditPrompt += `Perform the full Mode 2 process: investigate the repository FIRST before judging. Search for existing flows, reconstruct current behavior, contrast with the plan, check for contradictions, evaluate integration points, evaluate testability, explicitly check for over-engineering, then assign severity and verdict.\n`;
       }
 
-      const effectiveEffort = args.effort || config.defaultEffort || null;
       const effectiveModel = args.model || config.defaultModel;
+      const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: config.defaultEffort });
       const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
@@ -3285,9 +3227,7 @@ DO NOT execute code modifications. Outline files to create/modify, architectural
         '--dangerously-skip-permissions',
         '--mode', 'plan'
       ];
-      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
-        cliArgs.push('--effort', effectiveEffort);
-      }
+      if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3357,8 +3297,8 @@ Review the code changes or files with high rigor and precision. Focus on high-im
 4. Accessibility (WCAG) and error handling
 Provide specific findings with file paths, line numbers, issue descriptions, and concrete recommendations. Prioritize actionable findings over exhaustive repetition.`;
 
-      const effectiveEffort = args.effort || config.defaultEffort || null;
       const effectiveModel = args.model || config.defaultModel;
+      const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: config.defaultEffort });
       const perms = resolvePermissions(args.permissions, config);
 
       const cliArgs = [
@@ -3366,9 +3306,7 @@ Provide specific findings with file paths, line numbers, issue descriptions, and
         '--dangerously-skip-permissions',
         '--mode', 'plan'
       ];
-      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
-        cliArgs.push('--effort', effectiveEffort);
-      }
+      if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3461,17 +3399,15 @@ If the research topic relates to the current codebase or project, explain how th
 
 Be thorough but concise. Prioritize primary sources and official documentation over blog posts. If searches return nothing usable on some sub-question, say so explicitly instead of filling the gap from memory.`;
 
-      const effectiveEffort = args.effort || config.defaultEffort || null;
       const effectiveModel = args.model || config.defaultModel;
+      const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: config.defaultEffort });
 
       const cliArgs = [
         '--output-format', 'json',
         '--dangerously-skip-permissions',
         '--mode', 'plan'
       ];
-      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
-        cliArgs.push('--effort', effectiveEffort);
-      }
+      if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3631,9 +3567,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         '--dangerously-skip-permissions',
         '--mode', 'plan'
       ];
-      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
-        cliArgs.push('--effort', effectiveEffort);
-      }
+      if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
 
       if (perms.sandbox) {
         cliArgs.push('--sandbox');
@@ -3872,16 +3806,15 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       const enablePersonality = Boolean(args.personality);
       const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile, enablePersonality);
       const effectiveModel = args.model || config.defaultModel;
-      const effectiveEffort = args.effort || (effectiveModel ? null : 'low');
+      // `low` por latencia, pero solo si el modelo lo admite (BE-015).
+      const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: 'low' });
 
       const cliArgs = [
         '--output-format', 'json',
         '--dangerously-skip-permissions',
         '--mode', 'plan'
       ];
-      if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
-        cliArgs.push('--effort', effectiveEffort);
-      }
+      if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
 
       if (effectiveModel) {
         cliArgs.push('--model', effectiveModel);
@@ -4006,15 +3939,13 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // llamante YA tiene el texto, que es la premisa de agy_say.
       if (args.polish) {
         const effectiveModel = args.model || config.defaultModel;
-        const effectiveEffort = args.effort || (effectiveModel ? null : 'low');
+        const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: 'low' });
         const cliArgs = [
           '--output-format', 'json',
           '--dangerously-skip-permissions',
           '--mode', 'plan'
         ];
-        if (effectiveEffort && modeloAdmiteEsfuerzo(effectiveModel)) {
-          cliArgs.push('--effort', effectiveEffort);
-        }
+        if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
         if (effectiveModel) cliArgs.push('--model', effectiveModel);
         cliArgs.push('-p', getPolishPrompt(rawText, targetLang, chosenProfile, enablePersonality));
 
