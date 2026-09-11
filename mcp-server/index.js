@@ -54,6 +54,7 @@ function leerTagsDelRepo(cwd) {
 }
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
+const { PRIMING_CHARLA, procesarEventosDrain } = require('./lib/voice-drain');
 
 // Resolve agy binary location
 function resolveAgyBin() {
@@ -3411,11 +3412,8 @@ async function handleToolCall(name, args) {
         // conversational behavior, then drain it away so callers never see it.
         let primingNote = '';
         if (args.prime_conversational !== false) {
-          const primingText = 'A partir de ahora estamos en una conversación de voz en tiempo real, no en una sesión de código. ' +
-            'Respondé siempre en 1 a 3 oraciones breves, en lenguaje hablado natural. ' +
-            'No uses markdown, listas, enlaces ni bloques de código. No escribas, edites ni planifiques archivos — ' +
-            'es una charla, no una tarea de programación, salvo que te pida explícitamente hacer algo en el proyecto. ' +
-            'Confirmá que entendiste respondiendo con una sola palabra: OK.';
+          // Incluye la regla del aviso previo antes de usar herramientas (lib/voice-drain.js).
+          const primingText = PRIMING_CHARLA;
           try {
             sendVoiceStreamTurn(session, primingText);
             const primingDeadline = Date.now() + 10000;
@@ -3461,22 +3459,11 @@ async function handleToolCall(name, args) {
 
       if (action === 'drain') {
         const events = drainVoiceStreamEvents(session);
-        const deltas = events
-          .filter(e => e.event === 'step_update' && e.step_update && e.step_update.step_type === 'agent_response' && e.step_update.text_delta)
-          .map(e => ({ state: e.step_update.state, text_delta: e.step_update.text_delta }));
-        const resultEvent = events.find(e => e.event === 'result');
-
-        // Fase 3: feed each delta through the per-session Sentence Chunker so the
-        // caller gets TTS-ready sentences, not just raw text fragments. On turn
-        // completion, flush whatever's left buffered (e.g. short replies like "OK"
-        // that never reach the minimum word count on their own).
-        let sentences = [];
-        for (const d of deltas) {
-          sentences = sentences.concat(session.chunker.push(d.text_delta));
-        }
-        if (resultEvent) {
-          sentences = sentences.concat(session.chunker.flush());
-        }
+        // Fase 3: each delta goes through the per-session Sentence Chunker so the
+        // caller gets TTS-ready sentences. The chunker is flushed on turn completion
+        // (short replies like "OK") and when a tool step starts, so a spoken
+        // heads-up before a web search is not held until the search ends.
+        const { sentences, deltas, herramientas, resultEvent } = procesarEventosDrain(events, session.chunker, session.drainEstado || (session.drainEstado = {}));
 
         return {
           content: [{
@@ -3488,6 +3475,7 @@ async function handleToolCall(name, args) {
               turn_complete: !!resultEvent,
               sentences,
               deltas,
+              herramientas,
               result: resultEvent ? resultEvent.result : null,
               raw_event_count: events.length
             }, null, 2)

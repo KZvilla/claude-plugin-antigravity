@@ -50,7 +50,8 @@ from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
     resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
     get_model_status, resolve_engine_and_model, tts_model_name, unload_model, stt_full_model_name,
-    unload_all_loaded_models, LatidoUso, activar_motor_chat
+    unload_all_loaded_models, LatidoUso, activar_motor_chat,
+    Muletillas, TiemposTurno, decidir_muletilla
 )
 
 SAMPLE_RATE = 16000
@@ -192,6 +193,10 @@ def main():
                          help="Soltar el modelo fijado antes de empezar (si choca con el motor de la voz elegida).")
     parser.add_argument("--motor", default=None, choices=["omnivoice", "voicebox"],
                          help="Proveedor de voz. Por defecto OmniVoice si la voz tiene muestra, salvo voz_por_perfil.")
+    # 3000: en vivo, Gemini tarda ~2 s en emitir texto incluso para un "hola";
+    # con 1500 la muletilla sonaba en todos los turnos.
+    parser.add_argument("--muletilla-ms", type=int, default=3000,
+                         help="Si agy no emite texto en este tiempo, suena una muletilla pregrabada (solo OmniVoice). 0 las desactiva.")
     args = parser.parse_args()
 
     if args.list_devices:
@@ -232,8 +237,6 @@ def main():
     # que esta realmente descargado varia por maquina - se consulta en vivo.
     model_status = get_model_status()
     engine, model_size = resolve_engine_and_model(profile, model_status, args.engine, args.model_size)
-    print(f"[voice-loop] Motor TTS: {engine}" + (f" ({model_size})" if model_size else ""))
-    print(f"[voice-loop] Modelo STT: {args.stt_model}")
 
     # Antes de abrir el microfono: el modelo de esta voz pasa a ser el activo.
     # Si hay otro fijado, o no hay VRAM, se dice ahora y no a mitad de la charla.
@@ -245,9 +248,28 @@ def main():
         print("[voice-loop] Si hay un modelo fijado de otra voz, volve a correr con --soltar-pin.")
         mcp.close()
         return
-    print(f"[voice-loop] Proveedor de voz: {'OmniVoice' if proveedor == 'omnivoice' else 'Voicebox'}")
+    voz = "OmniVoice" if proveedor == "omnivoice" else f"Voicebox · {engine}" + (f" ({model_size})" if model_size else "")
+    print(f"[voice-loop] Voz: {voz}")
+    print(f"[voice-loop] Modelo STT: {args.stt_model}")
     modelo_tts = "omnivoice" if proveedor == "omnivoice" else tts_model_name(engine, model_size)
     latido = LatidoUso([modelo_tts, stt_full_model_name(args.stt_model)])
+
+    player = AudioPlayer()
+    executor = ThreadPoolExecutor(max_workers=2)
+    last_generation_id = {"id": None}
+    sequencer = SentenceSequencer(player, last_generation_id)
+
+    # Muletillas solo con OmniVoice: una sintesis ya enviada no se interrumpe,
+    # y con Qwen (~10 s) taparia la primera respuesta (auditoria del plan).
+    # Se generan mientras arranca la sesion de agy; "ocupado" las frena
+    # durante un turno o una sintesis de la charla.
+    turno_en_curso = {"activo": False}
+    futuros = []
+    muletillas = None
+    if proveedor == "omnivoice" and args.muletilla_ms > 0:
+        muletillas = Muletillas(profile, args.language, engine, model_size, proveedor, muestra,
+                                ocupado=lambda: turno_en_curso["activo"] or player.is_active()
+                                or any(not f.done() for f in list(futuros)))
 
     # /models/load solo carga el modelo TTS "Qwen" (su propio schema no acepta
     # un engine) -- precalentarlo cuando el perfil resolvio a Kokoro/otro motor
@@ -256,7 +278,7 @@ def main():
     is_qwen_engine = engine in ("qwen", "qwen_custom_voice")
 
     print("[voice-loop] Iniciando sesion agy_voice_stream" +
-          (" (con pre-warm de Voicebox en paralelo)" if is_qwen_engine else "") + "...")
+          (" (con pre-warm de Voicebox en paralelo)" if is_qwen_engine and proveedor == "voicebox" else "") + "...")
     start_args = {"action": "start", "effort": args.effort, "mode": "plan",
                   "prewarm_voicebox": is_qwen_engine and proveedor == "voicebox"}
     if is_qwen_engine:
@@ -277,11 +299,6 @@ def main():
     threading.Thread(target=_prewarm_stt, daemon=True).start()
     print()
 
-    player = AudioPlayer()
-    executor = ThreadPoolExecutor(max_workers=2)
-    last_generation_id = {"id": None}
-    sequencer = SentenceSequencer(player, last_generation_id)
-
     # Token de generacion: cada barge-in real (detectado por VAD) lo incrementa.
     # El turn worker descarta oraciones de un turno cuyo token quedo viejo, para
     # que un turno interrumpido no "reviva" hablando despues del corte.
@@ -300,11 +317,14 @@ def main():
         # el usuario vuelve a hablar enseguida, on_speech_start ya subio el token
         # antes de que esta utterance se procese, y ese turno "viejo" se colaria
         # como si fuera vigente (asi sonaban dos respuestas identicas seguidas).
-        turn_queue.put((audio_samples, generation_token["value"]))
+        # t0 de la medicion: el fin de la utterance segun el VAD (llega
+        # --min-silence-ms despues de que el usuario deja de hablar).
+        turn_queue.put((audio_samples, generation_token["value"], time.monotonic()))
 
     def turn_worker():
         while True:
-            audio_samples, my_token = turn_queue.get()
+            audio_samples, my_token, t0 = turn_queue.get()
+            tiempos = TiemposTurno(t0)
             print(f"  [debug] utterance recibida: {len(audio_samples)/SAMPLE_RATE:.2f}s, token={my_token}")
             try:
                 wav_bytes = float32_to_wav_bytes(audio_samples)
@@ -312,6 +332,7 @@ def main():
             except Exception as err:
                 print(f"  ⚠️ Error transcribiendo: {err}")
                 continue
+            tiempos.marcar("transcripcion")
 
             if not text or len(text.strip()) < 2:
                 continue
@@ -319,20 +340,57 @@ def main():
                 continue  # te interrumpiste a vos mismo antes de terminar de transcribir
 
             print(f"Vos> {text}")
-            mcp.call_tool("agy_voice_stream", {"action": "send", "stream_id": stream_id, "text": text})
+            turno_en_curso["activo"] = True
+            hubo_oracion = False
 
-            turn_complete = False
-            while not turn_complete:
-                time.sleep(0.15)
-                drain = json.loads(mcp.call_tool("agy_voice_stream", {"action": "drain", "stream_id": stream_id}))
-                turn_complete = drain["turn_complete"]
-                for sentence in drain["sentences"]:
-                    if generation_token["value"] != my_token:
-                        continue  # barge-in ocurrio mientras agy seguia respondiendo
-                    print(f"Agy> {sentence}")
-                    future = executor.submit(synthesize_sentence, sentence, profile, args.language, engine, model_size,
-                                             proveedor, muestra)
-                    sequencer.submit(future, sentence)
+            def al_primer_audio(t=tiempos):
+                t.marcar("primer_audio")
+                t.imprimir_una_vez()
+
+            # Un error de MCP (timeout, isError) no debe matar este hilo: sin el,
+            # la charla queda muda para siempre (auditoria de la implementacion).
+            try:
+                mcp.call_tool("agy_voice_stream", {"action": "send", "stream_id": stream_id, "text": text})
+                t_envio = time.monotonic()
+                tiempos.marcar("envio")
+                muletilla_sono = False
+
+                turn_complete = False
+                while not turn_complete:
+                    time.sleep(0.15)
+                    drain = json.loads(mcp.call_tool("agy_voice_stream", {"action": "drain", "stream_id": stream_id}))
+                    turn_complete = drain["turn_complete"]
+                    if drain.get("deltas"):
+                        tiempos.marcar("primer_texto")
+                    hubo_herramienta = bool(drain.get("herramientas"))
+                    if hubo_herramienta:
+                        tiempos.marcar("herramienta")
+                    if muletillas and decidir_muletilla(
+                            muletilla_sono, tiempos.marca("primer_texto") is not None, player.is_active(),
+                            generation_token["value"] == my_token, hubo_herramienta,
+                            (time.monotonic() - t_envio) * 1000, args.muletilla_ms):
+                        ruta = muletillas.elegir()
+                        if ruta:
+                            player.enqueue(ruta, "(muletilla)", borrar=False)
+                            tiempos.marcar("muletilla")
+                            muletilla_sono = True
+                    for sentence in drain["sentences"]:
+                        if generation_token["value"] != my_token:
+                            continue  # barge-in ocurrio mientras agy seguia respondiendo
+                        print(f"Agy> {sentence}")
+                        tiempos.marcar("primera_oracion")
+                        hubo_oracion = True
+                        future = executor.submit(synthesize_sentence, sentence, profile, args.language, engine,
+                                                 model_size, proveedor, muestra)
+                        futuros.append(future)
+                        del futuros[:-8]
+                        sequencer.submit(future, sentence, al_empezar=al_primer_audio)
+            except Exception as err:
+                print(f"  ⚠️ Error en el turno: {err}")
+            finally:
+                turno_en_curso["activo"] = False
+            if not hubo_oracion:
+                tiempos.imprimir_una_vez()
 
     threading.Thread(target=turn_worker, daemon=True).start()
 
@@ -363,6 +421,8 @@ def main():
         mcp.close()
         executor.shutdown(wait=False)
         latido.stop()
+        if muletillas:
+            muletillas.stop()
 
         if args.unload_all_on_exit:
             print("[voice-loop] Descargando TODO lo que Voicebox tenga cargado...")

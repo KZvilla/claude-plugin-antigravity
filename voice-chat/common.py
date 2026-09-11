@@ -7,6 +7,7 @@ reproductor local en cola FIFO. Sin dependencias pip - solo stdlib.
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -503,8 +504,10 @@ class AudioPlayer:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def enqueue(self, wav_path, label):
-        self._queue.put((wav_path, label))
+    def enqueue(self, wav_path, label, borrar=True, al_empezar=None):
+        # borrar=False para las muletillas: viven en una cache entre sesiones.
+        # al_empezar se llama justo antes de reproducir (medicion por turno).
+        self._queue.put((wav_path, label, borrar, al_empezar))
 
     def is_active(self):
         with self._lock:
@@ -513,9 +516,14 @@ class AudioPlayer:
 
     def _run(self):
         while True:
-            wav_path, label = self._queue.get()
+            wav_path, label, borrar, al_empezar = self._queue.get()
             if wav_path is None:
                 return
+            if al_empezar:
+                try:
+                    al_empezar()
+                except Exception:
+                    pass
             escaped = wav_path.replace("'", "''")
             ps_cmd = f"& {{ $p = '{escaped}'; (New-Object System.Media.SoundPlayer $p).PlaySync() }}"
             with self._lock:
@@ -527,14 +535,16 @@ class AudioPlayer:
             self._current_proc.wait()
             with self._lock:
                 self._current_proc = None
-            _delete_generation(wav_path)
+            if borrar:
+                _delete_generation(wav_path)
 
     def barge_in(self):
         dropped = 0
         while True:
             try:
-                wav_path, _ = self._queue.get_nowait()
-                _delete_generation(wav_path)
+                wav_path, _, borrar, _ = self._queue.get_nowait()
+                if borrar:
+                    _delete_generation(wav_path)
                 dropped += 1
             except queue.Empty:
                 break
@@ -558,19 +568,156 @@ class SentenceSequencer:
         self._last_generation_id = last_generation_id
         threading.Thread(target=self._run, daemon=True).start()
 
-    def submit(self, future, text):
-        self._queue.put((future, text))
+    def submit(self, future, text, al_empezar=None):
+        self._queue.put((future, text, al_empezar))
 
     def _run(self):
         while True:
             item = self._queue.get()
             if item is None:
                 return
-            future, text = item
+            future, text, al_empezar = item
             try:
                 gen_id, wav_path = future.result()
                 print(f"  [debug] enqueue gen_id={gen_id} wav={os.path.basename(wav_path)} text={text[:40]!r}")
                 self._last_generation_id["id"] = gen_id
-                self._player.enqueue(wav_path, text)
+                self._player.enqueue(wav_path, text, al_empezar=al_empezar)
             except Exception as err:
                 print(f"  ⚠️ Error sintetizando \"{text}\": {err}")
+
+
+# Muletillas (plan-charla-latencia, C y D): frases cortas pregrabadas con la
+# voz de la charla, para cuando agy tarda en emitir el primer texto. Sin
+# puntos suspensivos ni exclamaciones: con Qwen, la puntuacion forzada hizo
+# alucinar la voz (evaluacion del 2026-09-11).
+FRASES_MULETILLA = {
+    "es": ["A ver, dame un segundo.", "Mmm, dejame ver eso.", "Buena pregunta, ya te digo."],
+    "en": ["Let me see, one second.", "Hmm, let me check that.", "Good question, give me a moment."],
+}
+MULETILLAS_DIR = os.path.join(STATE_DIR, "muletillas")
+
+
+def _slug(texto):
+    return "".join(c if (c.isalnum() or c in "_.-") else "_" for c in (texto or ""))
+
+
+class Muletillas:
+    """Genera en segundo plano las muletillas de una voz y las guarda en una
+    cache entre sesiones (MULETILLAS_DIR). Una muestra de voz mas nueva que el
+    .wav invalida la cache. Si algo falla, la charla sigue sin muletillas."""
+
+    def __init__(self, profile, language, engine, model_size, proveedor, muestra,
+                 sintetizar=None, ocupado=None, directorio=None, arrancar=True):
+        self._sintetizar = sintetizar or synthesize_sentence
+        self._ocupado = ocupado or (lambda: False)
+        self._args = (profile, language, engine, model_size, proveedor, muestra)
+        self._frases = FRASES_MULETILLA.get(language) or FRASES_MULETILLA["en"]
+        base = f"{_slug(profile['name'])}-{language}-{proveedor}"
+        if proveedor != "omnivoice":
+            base += f"-{_slug(tts_model_name(engine, model_size))}"
+        carpeta = directorio or MULETILLAS_DIR
+        self._rutas = [os.path.join(carpeta, f"{base}-{i}.wav") for i in range(len(self._frases))]
+        try:
+            self._mtime_muestra = os.path.getmtime(muestra["audio_path"]) if muestra else None
+        except OSError:
+            self._mtime_muestra = None
+        self._listas = []
+        self._siguiente = 0
+        self._lock = threading.Lock()
+        self._parar = threading.Event()
+        self._hilo = threading.Thread(target=self._generar, daemon=True)
+        if arrancar:
+            self._hilo.start()
+
+    def _vigente(self, ruta):
+        try:
+            return os.path.getsize(ruta) > 0 and (
+                self._mtime_muestra is None or os.path.getmtime(ruta) >= self._mtime_muestra)
+        except OSError:
+            return False
+
+    def _generar(self):
+        try:
+            os.makedirs(os.path.dirname(self._rutas[0]), exist_ok=True)
+        except OSError:
+            return
+        for frase, ruta in zip(self._frases, self._rutas):
+            if self._parar.is_set():
+                return
+            if not self._vigente(ruta):
+                # Prioridad baja: no competir por la GPU con la respuesta en curso.
+                while self._ocupado() and not self._parar.is_set():
+                    self._parar.wait(0.2)
+                if self._parar.is_set():
+                    return
+                try:
+                    _, wav = self._sintetizar(frase, *self._args)
+                    shutil.copyfile(wav, ruta)
+                    _delete_generation(wav)
+                except Exception as err:
+                    print(f"  ⚠️ Muletilla \"{frase}\" no se pudo generar: {err}")
+                    continue
+            with self._lock:
+                self._listas.append(ruta)
+
+    def esperar(self, timeout=None):
+        self._hilo.join(timeout)
+
+    def elegir(self):
+        """Siguiente muletilla lista, rotando; None si todavia no hay ninguna."""
+        with self._lock:
+            if not self._listas:
+                return None
+            ruta = self._listas[self._siguiente % len(self._listas)]
+            self._siguiente += 1
+            return ruta
+
+    def stop(self):
+        self._parar.set()
+
+
+def decidir_muletilla(ya_sono, hubo_texto, reproduciendo, vigente, hubo_herramienta, transcurrido_ms, umbral_ms):
+    """Una muletilla por turno, solo mientras agy no emitio texto. Se adelanta
+    si agy informo una herramienta. umbral_ms <= 0 las desactiva."""
+    if umbral_ms <= 0 or ya_sono or hubo_texto or reproduciendo or not vigente:
+        return False
+    return hubo_herramienta or transcurrido_ms >= umbral_ms
+
+
+class TiemposTurno:
+    """Medicion por turno (plan-charla-latencia, E). Cada marca se toma una sola
+    vez; t0 es el fin de lo que dijo el usuario (VAD) o el Enter."""
+
+    ETIQUETAS = [("transcripcion", "transcripción"), ("envio", "envío"), ("herramienta", "herramienta"),
+                 ("muletilla", "muletilla"), ("primer_texto", "primer texto"),
+                 ("primera_oracion", "primera oración"), ("primer_audio", "primer audio")]
+
+    def __init__(self, t0=None, reloj=time.monotonic):
+        self._reloj = reloj
+        self.t0 = t0 if t0 is not None else reloj()
+        self._marcas = {}
+        self._impresa = False
+        self._lock = threading.Lock()
+
+    def marcar(self, nombre):
+        with self._lock:
+            if nombre in self._marcas:
+                return False
+            self._marcas[nombre] = self._reloj() - self.t0
+            return True
+
+    def marca(self, nombre):
+        with self._lock:
+            return self._marcas.get(nombre)
+
+    def linea(self):
+        with self._lock:
+            partes = [f"{etq} {self._marcas[k]:.1f} s" for k, etq in self.ETIQUETAS if k in self._marcas]
+        return "⏱ " + " · ".join(partes) if partes else "⏱ sin marcas"
+
+    def imprimir_una_vez(self):
+        with self._lock:
+            if self._impresa:
+                return
+            self._impresa = True
+        print(f"  {self.linea()}")
