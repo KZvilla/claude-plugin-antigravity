@@ -34,6 +34,7 @@ const castAgentes = require('./agents/cast.js');
 // BE-015 — Reglas de `--model`/`--effort` compartidas con el bot de Telegram.
 const { esfuerzoParaCli, validarModeloEsfuerzo } = require('./lib/cli-compat.js');
 const vb = require('./voicebox-server.js');
+const om = require('./omnivoice.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -161,7 +162,11 @@ const CLAVES_VOICEBOX_CONFIG = [
   'voicebox_server_exe',
   'voicebox_idle_unload_minutes',
   'voicebox_idle_shutdown_minutes',
-  'statusline_voicebox'
+  'statusline_voicebox',
+  'omnivoice_port',
+  'omnivoice_dir',
+  'omnivoice_class_temperature',
+  'voz_por_perfil'
 ];
 
 function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
@@ -988,6 +993,23 @@ const TOOLS = [
         statusline_voicebox: {
           type: 'boolean',
           description: 'Show the Voicebox/VRAM segment in the statusline while Voicebox is running. Default true.'
+        },
+        omnivoice_port: {
+          type: 'number',
+          description: 'Port of the local OmniVoice server (second voice engine, installed with npm run omnivoice:install). Default 17494.'
+        },
+        omnivoice_dir: {
+          type: 'string',
+          description: 'Where OmniVoice is installed (venv and weights). Default %LOCALAPPDATA%\\lagrange-omnivoice.'
+        },
+        omnivoice_class_temperature: {
+          type: 'number',
+          description: 'Sampling temperature for OmniVoice: 0 is deterministic and flat. Default 0.7, chosen by ear.'
+        },
+        voz_por_perfil: {
+          type: 'object',
+          additionalProperties: { type: 'string', enum: ['omnivoice', 'voicebox'] },
+          description: 'Per-voice engine override, e.g. {"Priscilla": "voicebox"}. Wins over modo.'
         }
       }
     }
@@ -1173,6 +1195,16 @@ const TOOLS = [
         keep_model: {
           type: 'boolean',
           description: 'When true, pins this voice\'s TTS model in GPU memory until released with agy_voice_model (action "release"). Use it when the user says the interaction will go on with this voice, on PC or Telegram. Defaults to false: the model is freed after the idle timeout.'
+        },
+        modo: {
+          type: 'string',
+          enum: ['inmediato', 'diferido'],
+          description: 'Which voice engine fits: "inmediato" (default) for something the user is waiting to hear now — uses OmniVoice (fast) when it is installed; "diferido" when the user asked to be told later ("when you finish, narrate it") — uses Qwen via Voicebox (slower, better prosody). A per-voice override in voz_por_perfil wins over this.'
+        },
+        motor: {
+          type: 'string',
+          enum: ['omnivoice', 'voicebox'],
+          description: 'Force a voice engine, overriding modo and voz_por_perfil. OmniVoice needs a voice with a cloned sample; preset voices always use Voicebox.'
         }
       }
     }
@@ -1194,6 +1226,16 @@ const TOOLS = [
         keep_model: {
           type: 'boolean',
           description: 'When true, pins this voice\'s TTS model in GPU memory until released with agy_voice_model (action "release"). Use it when the user says the interaction will go on with this voice, on PC or Telegram. Defaults to false: the model is freed after the idle timeout.'
+        },
+        modo: {
+          type: 'string',
+          enum: ['inmediato', 'diferido'],
+          description: 'Which voice engine fits: "inmediato" (default) for something the user is waiting to hear now — uses OmniVoice (fast) when it is installed; "diferido" when the user asked to be told later ("when you finish, narrate it") — uses Qwen via Voicebox (slower, better prosody). A per-voice override in voz_por_perfil wins over this.'
+        },
+        motor: {
+          type: 'string',
+          enum: ['omnivoice', 'voicebox'],
+          description: 'Force a voice engine, overriding modo and voz_por_perfil. OmniVoice needs a voice with a cloned sample; preset voices always use Voicebox.'
         },
         voice: {
           type: 'string',
@@ -1293,7 +1335,7 @@ const TOOLS = [
         },
         engine: {
           type: 'string',
-          description: 'For "activate"/"pin": explicit engine (qwen, qwen_custom_voice, kokoro, …) instead of a voice.'
+          description: 'For "start"/"activate"/"pin"/"unload": explicit engine (qwen, qwen_custom_voice, kokoro, …, or "omnivoice" for the OmniVoice server) instead of a voice.'
         },
         model_size: {
           type: 'string',
@@ -1770,7 +1812,32 @@ async function describirEstadoVoicebox(voiceboxUrl, config) {
   out += `- **Fijado**: ${pin ? `\`${pin.model}\`${pin.voice ? ` (voz ${pin.voice})` : ''} desde ${pin.since}` : 'nada'}\n`;
   out += `- **VRAM**: ${vram ? `${(vram.libreMb / 1024).toFixed(1)} GB libres de ${(vram.totalMb / 1024).toFixed(1)} GB` : 'sin nvidia-smi'}\n`;
   out += `- **Inactividad**: descarga a los ${config.voiceboxIdleUnloadMinutes} min y apaga a los ${config.voiceboxIdleShutdownMinutes || '∞'} min (solo si lo levantó el plugin)\n`;
+  if (om.omniInstalado({ config })) {
+    const urlO = om.urlOmni(config);
+    const ho = await vb.salud(urlO, 2000);
+    if (!ho.ok) {
+      out += `- **OmniVoice**: apagado (se levanta solo al narrar en modo inmediato) · \`${urlO}\`\n`;
+    } else {
+      const eo = await vb.estadoOmniServidor(urlO);
+      const cargado = eo.models.some(m => m.loaded);
+      out += `- **OmniVoice**: \`${urlO}\` · ${ho.info.variant || '?'} · ${cargado ? 'modelo cargado' : 'sin modelo cargado'}${eo.generando ? ' · generando' : ''}\n`;
+    }
+  } else {
+    out += '- **OmniVoice**: no instalado (`npm run omnivoice:install`)\n';
+  }
   out += `- **Estado y logs**: \`${vb.dirEstado()}\`\n`;
+  return out;
+}
+
+/** Salida común de `agy_voice_model` activate/pin, para los dos proveedores. */
+function formatearActivacion(r, action, deVoz) {
+  let out = action === 'pin'
+    ? `📌 \`${r.objetivo}\` fijado${deVoz}: queda cargado hasta \`release\` o \`unload\`.`
+    : `✅ Modelo activo: \`${r.objetivo}\`${deVoz}.`;
+  if (r.descargados.length) out += `\n- Descargados antes: ${r.descargados.map(n => `\`${n}\``).join(', ')}`;
+  if (r.postergados.length) out += `\n- Siguen cargados (en uso hace <30 s, se descargan por inactividad): ${r.postergados.map(n => `\`${n}\``).join(', ')}`;
+  if (r.guarda === 'ok') out += '\n- Guarda de VRAM: hay espacio.';
+  else if (r.guarda === 'omitida') out += '\n- Guarda de VRAM: omitida (sin nvidia-smi o sin tamaño del modelo).';
   return out;
 }
 
@@ -1835,30 +1902,51 @@ async function emitirNarracionInterna({
   language,
   localPlayback = false,
   sendTelegram = true,
-  motor
+  motor,
+  proveedor = 'voicebox',
+  muestra = null,
+  omniUrl = null,
+  classTemperature = null
 }) {
   const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Roaming');
   const genDir = path.join(appData, 'sh.voicebox.app', 'generations');
   const beforeFiles = fs.existsSync(genDir) ? fs.readdirSync(genDir) : [];
 
   let speakRes;
-  try {
-    speakRes = await sendVoiceboxGenerate(voiceboxUrl, spokenText, profile.id, language, {
-      engine: motor.engine,
-      modelSize: motor.modelSize
-    });
-  } catch (err) {
-    return { ok: false, error: err.message };
+  let generatedWavPath = null;
+  if (proveedor === 'omnivoice') {
+    // OmniVoice genera síncrono y devuelve la ruta: no hay nada que esperar en
+    // generations/ de Voicebox. El bridge recibe el archivo directo.
+    try {
+      const r = await om.sintetizarOmni(omniUrl, {
+        texto: spokenText,
+        refAudio: muestra.audioPath,
+        refText: muestra.refText,
+        classTemperature
+      });
+      speakRes = { id: r.id, segundos: r.segundos, proveedor: 'omnivoice' };
+      generatedWavPath = r.audioPath;
+    } catch (err) {
+      return { ok: false, error: `OmniVoice: ${err.message}` };
+    }
+  } else {
+    try {
+      speakRes = await sendVoiceboxGenerate(voiceboxUrl, spokenText, profile.id, language, {
+        engine: motor.engine,
+        modelSize: motor.modelSize
+      });
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
   }
 
   let localPlayed = false;
   let telegramDelivered = false;
   let telegramError = null;
-  let generatedWavPath = null;
 
   if (localPlayback) {
     try {
-      generatedWavPath = await waitForGenerationFile(
+      if (!generatedWavPath) generatedWavPath = await waitForGenerationFile(
         genDir,
         (speakRes && speakRes.id) ? speakRes.id : null,
         beforeFiles,
@@ -1936,6 +2024,14 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
   }
   if (destino.health && destino.health.started) out += `- **Voicebox**: levantado sin GUI (${destino.health.variante})\n`;
   if (destino.health && destino.health.aviso) out += `- ⚠️ ${destino.health.aviso}\n`;
+  if (destino.proveedor) {
+    const seg = emision && emision.speakRes && emision.speakRes.segundos;
+    let linea = `- **Motor**: ${destino.proveedor === 'omnivoice' ? 'OmniVoice' : 'Voicebox'} (modo ${destino.modo}${Number.isFinite(seg) ? `, ${seg.toFixed(1)} s` : ''})`;
+    if (destino.fallback) linea += ` — no se usó OmniVoice: ${destino.motivoProveedor}`;
+    if (destino.desdeCache) linea += ' · voz desde la caché (Voicebox no respondió)';
+    out += `${linea}\n`;
+  }
+  if (destino.avisoMuestra) out += `- ⚠️ ${destino.avisoMuestra}\n`;
   out += `- **Idioma**: \`${langLabel} (${language})\`\n`;
   // Lo que se aplicó de verdad, no lo que se pidió: si la reescritura falla se
   // narra el texto original, y decir «en personaje» sería falso.
@@ -1991,80 +2087,146 @@ async function reescribirEnPersona({ texto, destino, args, config }) {
   return { texto: salida, aplicado: true, duracion, error: null };
 }
 
-async function prepareNarrationTarget(args, config) {
+/** Los dos servidores de voz para el coordinador de VRAM. */
+function servidoresVoz(voiceboxUrl, config) {
+  return { voicebox: voiceboxUrl, omnivoice: om.omniInstalado({ config }) ? om.urlOmni(config) : null };
+}
+
+/** Lo que la emisión necesita de `destino` (proveedor, muestra, motor). */
+function camposEmision(destino) {
+  return {
+    motor: destino.motor,
+    proveedor: destino.proveedor,
+    muestra: destino.muestra,
+    omniUrl: destino.omniUrl,
+    classTemperature: destino.classTemperature
+  };
+}
+
+/**
+ * Resuelve Voicebox, la voz, el proveedor (OmniVoice o Voicebox) y deja la
+ * VRAM lista, o devuelve el error ya formateado para el cliente.
+ *
+ * Proveedor: motor explícito → voz fijada en `voz_por_perfil` → modo
+ * (inmediato → OmniVoice, diferido → Voicebox). Si OmniVoice no se puede usar
+ * (no instalado, voz sin muestra, muestra borrada, no arranca) se cae a
+ * Voicebox diciendo por qué. Si Voicebox no levanta pero la voz sale por
+ * OmniVoice, perfiles y muestra vienen de la caché de voces.
+ */
+async function prepareNarrationTarget(args, config, opciones = {}) {
   const voiceboxUrl = resolveVoiceboxUrl(args, config);
+  const modo = args.modo === 'diferido' || args.modo === 'inmediato' ? args.modo : (opciones.modoPorDefecto || 'inmediato');
+  const errorTexto = (texto, isError = false) => ({
+    error: { ...(isError ? { isError: true } : {}), content: [{ type: 'text', text: texto }] }
+  });
 
-  // Si no corre, se levanta sin GUI (plan A). El error ya nombra la causa.
+  // Si no corre, se levanta sin GUI. El error ya nombra la causa.
   const health = await vb.ensureVoicebox(voiceboxUrl, { config });
-  if (!health.ok) {
-    return {
-      error: {
-        content: [{
-          type: 'text',
-          text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}`
-        }]
-      }
-    };
+  let profiles = null;
+  let errorPerfiles = health.ok ? null : health.error;
+  if (health.ok) {
+    try {
+      profiles = await getVoiceboxProfiles(voiceboxUrl);
+      om.guardarCacheVoces({ perfiles: profiles });
+    } catch (err) {
+      errorPerfiles = `Error al consultar los perfiles de voz de Voicebox: ${err.message}`;
+    }
   }
-
-  let profiles = [];
-  try {
-    profiles = await getVoiceboxProfiles(voiceboxUrl);
-  } catch (err) {
-    return {
-      error: {
-        content: [{ type: 'text', text: `⚠️ Error al consultar los perfiles de voz de Voicebox: ${err.message}` }]
-      }
-    };
+  let desdeCache = false;
+  if (!profiles) {
+    const cache = om.leerCacheVoces();
+    if (!(cache && Array.isArray(cache.perfiles) && cache.perfiles.length)) {
+      return errorTexto(`⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${errorPerfiles}`);
+    }
+    profiles = cache.perfiles;
+    desdeCache = true;
   }
 
   let voiceResolution;
   try {
     voiceResolution = resolveVoiceProfile(profiles, args.voice, args.language);
   } catch (err) {
-    return {
-      error: {
-        content: [{ type: 'text', text: `⚠️ Error resolviendo el perfil de voz: ${err.message}` }]
+    return errorTexto(`⚠️ Error resolviendo el perfil de voz: ${err.message}`);
+  }
+  const perfil = voiceResolution.profile;
+
+  const preferencia = om.preferenciaProveedor({ motorPedido: args.motor, modo, perfil, config });
+  let proveedor = 'voicebox';
+  let motivoProveedor = preferencia.motivo;
+  let muestra = null;
+  let omniUrl = null;
+  if (preferencia.proveedor === 'omnivoice') {
+    if (!om.omniInstalado({ config })) {
+      motivoProveedor = 'OmniVoice no está instalado (npm run omnivoice:install)';
+    } else {
+      muestra = await om.muestraDePerfil(health.ok ? voiceboxUrl : null, perfil);
+      if (!muestra) {
+        motivoProveedor = `${perfil.name} no tiene muestra (perfil preset): OmniVoice necesita una para clonar`;
+      } else if (!fs.existsSync(muestra.audioPath)) {
+        // Sin esto, OmniVoice respondería con un error de Python al abrir el archivo.
+        motivoProveedor = `la muestra de ${perfil.name} ya no está en disco (${muestra.audioPath})`;
+        muestra = null;
+      } else {
+        const s = await om.ensureOmniVoice(om.urlOmni(config), { config });
+        if (s.ok) {
+          proveedor = 'omnivoice';
+          omniUrl = om.urlOmni(config);
+        } else {
+          motivoProveedor = `OmniVoice no arrancó: ${s.error}`;
+          muestra = null;
+        }
       }
-    };
+    }
+  }
+  const fallback = preferencia.proveedor === 'omnivoice' && proveedor !== 'omnivoice';
+  if (proveedor === 'voicebox' && !health.ok) {
+    return errorTexto(`⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}` +
+      (fallback ? `\n\nY OmniVoice no se pudo usar: ${motivoProveedor}.` : ''));
   }
 
-  // Motor del perfil (plan E) y VRAM (plan C): antes de generar, el modelo de
-  // esta voz pasa a ser el activo — respeta el pin y descarga los TTS ajenos
-  // que no estén en uso.
-  const modelos = {};
-  try {
-    for (const m of await vb.estadoModelos(voiceboxUrl)) modelos[m.model_name] = m;
-  } catch {}
-  const motor = vb.resolverMotor(voiceResolution.profile, modelos);
+  // Motor y VRAM: el modelo de esta voz pasa a ser el activo. El coordinador ve
+  // los dos servidores, respeta el pin y descarga los TTS ajenos sin uso.
+  let motor;
+  if (proveedor === 'omnivoice') {
+    motor = { engine: vb.MODELO_OMNI, modelSize: null };
+  } else {
+    const modelos = {};
+    try {
+      for (const m of await vb.estadoModelos(voiceboxUrl)) modelos[m.model_name] = m;
+    } catch {}
+    motor = vb.resolverMotor(perfil, modelos);
+  }
   let activacion;
   try {
-    activacion = await vb.aplicarModeloActivo(voiceboxUrl, {
+    activacion = await vb.aplicarModeloActivo(servidoresVoz(health.ok ? voiceboxUrl : null, config), {
+      proveedor,
       ...motor,
-      voz: voiceResolution.profile.name,
+      voz: perfil.name,
       fijar: Boolean(args.keep_model)
     });
   } catch (err) {
-    // Sin /models/status no se puede ordenar la VRAM, pero sí se puede hablar.
+    // Sin inventario no se puede ordenar la VRAM, pero sí se puede hablar.
     activacion = { ok: true, omitida: err.message };
   }
-  if (!activacion.ok) {
-    return {
-      error: {
-        isError: true,
-        content: [{ type: 'text', text: `⚠️ ${activacion.error}` }]
-      }
-    };
-  }
+  if (!activacion.ok) return errorTexto(`⚠️ ${activacion.error}`, true);
 
   return {
     voiceboxUrl,
     voiceResolution,
-    profile: voiceResolution.profile,
+    profile: perfil,
     language: voiceResolution.language,
     motor,
     activacion,
-    health
+    health,
+    proveedor,
+    motivoProveedor,
+    fallback,
+    modo,
+    muestra,
+    omniUrl,
+    desdeCache,
+    classTemperature: config.omnivoiceClassTemperature,
+    avisoMuestra: proveedor === 'omnivoice' ? om.avisoMuestraLarga(muestra, perfil) : null
   };
 }
 
@@ -2772,7 +2934,7 @@ async function handleToolCall(name, args) {
         content: [
           {
             type: 'text',
-            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || '(none: agy decides)'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Fanout statusline: ${result.config.fanout_statusline === false ? 'disabled' : 'enabled'}\n- Voicebox: autostart ${result.config.voicebox_autostart === false ? 'off' : 'on'}, idle unload ${result.config.voicebox_idle_unload_minutes ?? 10}m, idle shutdown ${result.config.voicebox_idle_shutdown_minutes ?? 30}m, statusline ${result.config.statusline_voicebox === false ? 'off' : 'on'}${result.config.voicebox_url ? `, url ${result.config.voicebox_url}` : ''}${result.config.voicebox_port ? `, port ${result.config.voicebox_port}` : ''}${result.config.voicebox_server_exe ? `, exe ${result.config.voicebox_server_exe}` : ''}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
+            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || '(none: agy decides)'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Fanout statusline: ${result.config.fanout_statusline === false ? 'disabled' : 'enabled'}\n- Voicebox: autostart ${result.config.voicebox_autostart === false ? 'off' : 'on'}, idle unload ${result.config.voicebox_idle_unload_minutes ?? 10}m, idle shutdown ${result.config.voicebox_idle_shutdown_minutes ?? 30}m, statusline ${result.config.statusline_voicebox === false ? 'off' : 'on'}${result.config.voicebox_url ? `, url ${result.config.voicebox_url}` : ''}${result.config.voicebox_port ? `, port ${result.config.voicebox_port}` : ''}${result.config.voicebox_server_exe ? `, exe ${result.config.voicebox_server_exe}` : ''}${result.config.voz_por_perfil ? `, voz_por_perfil ${JSON.stringify(result.config.voz_por_perfil)}` : ''}${result.config.omnivoice_class_temperature !== undefined ? `, omnivoice class_temperature ${result.config.omnivoice_class_temperature}` : ''}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
           }
         ]
       };
@@ -3220,7 +3382,7 @@ async function handleToolCall(name, args) {
           (async () => {
             const s = await vb.ensureVoicebox(voiceboxUrl, { config });
             if (!s.ok) return { ok: false, error: s.error };
-            const a = await vb.aplicarModeloActivo(voiceboxUrl, { engine: 'qwen', modelSize });
+            const a = await vb.aplicarModeloActivo(servidoresVoz(voiceboxUrl, config), { engine: 'qwen', modelSize });
             if (!a.ok) return { ok: false, error: a.error };
             return voiceboxModelsLoad(voiceboxUrl, modelSize);
           })()
@@ -3776,7 +3938,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // Si falla, el resumen sigue sin persona y la narración informa el fallo.
       let destinoVoz = null;
       if (args.narrate && args.personality) {
-        const d = await prepareNarrationTarget(args, config);
+        const d = await prepareNarrationTarget(args, config, { modoPorDefecto: 'diferido' });
         if (!d.error) destinoVoz = d;
       }
       const summarySystemPrompt = getSummaryPrompt(focus, Boolean(args.narrate), destinoVoz ? destinoVoz.profile : null);
@@ -3977,7 +4139,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         if (!digestHablado) {
           formatted += `- Narracion: no se emitio (el modelo no incluyo la seccion \`${MARCA_DIGEST}\`; el documento se guardo igual)\n`;
         } else {
-          const destino = destinoVoz || await prepareNarrationTarget(args, config);
+          // Diferido por defecto: el resumen se narra cuando termina, nadie lo espera en vivo.
+          const destino = destinoVoz || await prepareNarrationTarget(args, config, { modoPorDefecto: 'diferido' });
           if (destino.error) {
             formatted += `- Narracion: fallo la preparacion de voz; el digest va abajo en texto\n`;
           } else {
@@ -3988,7 +4151,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
               profile: destino.profile,
               language: destino.language,
               localPlayback: args.local_playback !== false,
-              sendTelegram: args.send_telegram !== false
+              sendTelegram: args.send_telegram !== false,
+              ...camposEmision(destino)
             });
             formatted += `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : (destinoVoz ? 'emitida, con el digest escrito en personaje' : 'emitida')}\n`;
           }
@@ -4111,7 +4275,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         language: targetLang,
         localPlayback: playLocally,
         sendTelegram: args.send_telegram !== false,
-        motor: destino.motor
+        ...camposEmision(destino)
       });
 
       if (!emision.ok) {
@@ -4249,7 +4413,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         language: targetLang,
         localPlayback: playLocally,
         sendTelegram: args.send_telegram !== false,
-        motor: destino.motor
+        ...camposEmision(destino)
       });
 
       if (!emision.ok) {
@@ -4311,25 +4475,37 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         return responder(`Acción desconocida: \`${action}\`.`, true);
       }
 
-      const health = await vb.ensureVoicebox(voiceboxUrl, { config });
-      if (!health.ok) return responder(`⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}`, true);
-
-      if (action === 'start') {
-        let out = health.started
-          ? `✅ Voicebox levantado sin GUI (${health.variante}, \`${health.exe}\`).`
-          : `✅ Voicebox ya estaba corriendo en \`${voiceboxUrl}\`.`;
-        if (health.aviso) out += `\n\n⚠️ ${health.aviso}`;
-        return responder(out);
-      }
+      const esOmni = args.engine === vb.MODELO_OMNI;
+      const urlO = om.urlOmni(config);
 
       if (action === 'unload') {
+        // Primero OmniVoice (el server es nuestro, siempre se puede); después
+        // Voicebox, solo si lo levantó el plugin o con force.
+        const liberados = [];
+        const pinPrevio = vb.leerPin();
+        if (om.omniInstalado({ config })) {
+          const eo = await vb.estadoOmniServidor(urlO);
+          if (eo.models.some(m => m.loaded)) {
+            try {
+              await vb.descargarOmniServidor(urlO);
+              liberados.push(`\`${vb.MODELO_OMNI}\` (${vb.SIZE_MB_OMNI} MB)`);
+            } catch (err) {
+              process.stderr.write(`[antigravity-mcp] unload de omnivoice falló: ${err.message}\n`);
+            }
+          }
+        }
+        if (esOmni) {
+          if (pinPrevio && pinPrevio.model === vb.MODELO_OMNI) vb.escribirPin(null);
+          return responder(liberados.length ? `🗑️ Descargado: ${liberados.join(', ')}.` : 'OmniVoice no tenía el modelo cargado.');
+        }
+        const vbArriba = (await vb.salud(voiceboxUrl)).ok;
         const k = vb.leerKeeper();
-        if (!(k && k.vivo && k.ownsServer) && !args.force) {
-          return responder('Este Voicebox no lo levantó el plugin (probablemente la GUI): no descargo sus modelos. Pasá `force: true` para hacerlo igual.', true);
+        if (vbArriba && !(k && k.vivo && k.ownsServer) && !args.force) {
+          const aviso = 'Este Voicebox no lo levantó el plugin (probablemente la GUI): no descargo sus modelos. Pasá `force: true` para hacerlo igual.';
+          return liberados.length ? responder(`🗑️ Descargado: ${liberados.join(', ')}.\n\n${aviso}`) : responder(aviso, true);
         }
         vb.escribirPin(null);
-        const tts = (await vb.estadoModelos(voiceboxUrl)).filter(m => m.loaded && vb.esModeloTts(m.model_name));
-        const liberados = [];
+        const tts = vbArriba ? (await vb.estadoModelos(voiceboxUrl)).filter(m => m.loaded && vb.esModeloTts(m.model_name)) : [];
         for (const m of tts) {
           try {
             await vb.descargarModelo(voiceboxUrl, m.model_name);
@@ -4339,6 +4515,34 @@ Be thorough but concise. Prioritize primary sources and official documentation o
           }
         }
         return responder(liberados.length ? `🗑️ Descargados: ${liberados.join(', ')}. Pin liberado.` : 'No había modelos TTS cargados. Pin liberado.');
+      }
+
+      // OmniVoice (segundo proveedor): start/activate/pin con engine "omnivoice".
+      if (esOmni) {
+        if (!om.omniInstalado({ config })) return responder('OmniVoice no está instalado: `npm run omnivoice:install`.', true);
+        const s = await om.ensureOmniVoice(urlO, { config });
+        if (!s.ok) return responder(`⚠️ ${s.error}`, true);
+        if (action === 'start') return responder(s.started ? `✅ OmniVoice levantado en \`${urlO}\`.` : `✅ OmniVoice ya estaba corriendo en \`${urlO}\`.`);
+        const vbArriba = (await vb.salud(voiceboxUrl)).ok;
+        const r = await vb.aplicarModeloActivo(servidoresVoz(vbArriba ? voiceboxUrl : null, config), {
+          proveedor: vb.MODELO_OMNI,
+          engine: vb.MODELO_OMNI,
+          voz: args.voice || null,
+          fijar: action === 'pin'
+        });
+        if (!r.ok) return responder(`⚠️ ${r.error}`, true);
+        return responder(formatearActivacion(r, action, args.voice ? ` (voz ${args.voice})` : ''));
+      }
+
+      const health = await vb.ensureVoicebox(voiceboxUrl, { config });
+      if (!health.ok) return responder(`⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}`, true);
+
+      if (action === 'start') {
+        let out = health.started
+          ? `✅ Voicebox levantado sin GUI (${health.variante}, \`${health.exe}\`).`
+          : `✅ Voicebox ya estaba corriendo en \`${voiceboxUrl}\`.`;
+        if (health.aviso) out += `\n\n⚠️ ${health.aviso}`;
+        return responder(out);
       }
 
       // activate / pin
@@ -4355,18 +4559,9 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       const mapa = {};
       for (const m of await vb.estadoModelos(voiceboxUrl)) mapa[m.model_name] = m;
       const motor = vb.resolverMotor(perfil || {}, mapa, args.engine || null, args.model_size || null);
-      const r = await vb.aplicarModeloActivo(voiceboxUrl, { ...motor, voz: perfil ? perfil.name : null, fijar: action === 'pin' });
+      const r = await vb.aplicarModeloActivo(servidoresVoz(voiceboxUrl, config), { ...motor, voz: perfil ? perfil.name : null, fijar: action === 'pin' });
       if (!r.ok) return responder(`⚠️ ${r.error}`, true);
-
-      const deVoz = perfil ? ` (voz ${perfil.name})` : '';
-      let out = action === 'pin'
-        ? `📌 \`${r.objetivo}\` fijado${deVoz}: queda cargado hasta \`release\` o \`unload\`.`
-        : `✅ Modelo activo: \`${r.objetivo}\`${deVoz}.`;
-      if (r.descargados.length) out += `\n- Descargados antes: ${r.descargados.map(n => `\`${n}\``).join(', ')}`;
-      if (r.postergados.length) out += `\n- Siguen cargados (en uso hace <30 s, los descarga el keeper): ${r.postergados.map(n => `\`${n}\``).join(', ')}`;
-      if (r.guarda === 'ok') out += '\n- Guarda de VRAM: hay espacio.';
-      else if (r.guarda === 'omitida') out += '\n- Guarda de VRAM: omitida (sin nvidia-smi o sin tamaño del modelo).';
-      return responder(out);
+      return responder(formatearActivacion(r, action, perfil ? ` (voz ${perfil.name})` : ''));
     }
 
     case 'telegram_bridge_status': {

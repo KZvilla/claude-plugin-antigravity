@@ -85,6 +85,18 @@ GPU memory: `agy_voice_model` (`status`, `pin`, `release`, `unload`) and
 models are freed after `voicebox_idle_unload_minutes`. While Voicebox runs, the
 statusline shows a Voicebox/VRAM line (`statusline_voicebox: false` hides it).
 
+**Optional: OmniVoice** (second voice engine, Windows + NVIDIA). Much faster
+than Qwen (about 6 s for 36 s of audio instead of 70+) and lighter (~2 GB of
+VRAM), a bit flatter in prosody. With it installed, what the user waits to hear
+now (`agy_say`, `agy_narrate`, voice chat) goes through OmniVoice and what they
+asked to hear later (`modo: "diferido"`, session summaries) through Qwen; a
+voice can be pinned to one engine with `voz_por_perfil` (e.g. `{"Priscilla":
+"voicebox"}` via `agy_set_config`). It clones from the Voicebox voice's sample,
+so preset voices keep using Voicebox. Install only if they ask: `npm run
+omnivoice:install` downloads ~8 GB (Python 3.12, torch CUDA, weights) into
+`%LOCALAPPDATA%\lagrange-omnivoice`. Tell them the weights are CC-BY-NC
+(non-commercial use).
+
 Non-default port: `voicebox_url` / `voicebox_port` on the narration tools, or
 persist it with `agy_set_config`.
 

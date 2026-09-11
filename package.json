@@ -20,7 +20,8 @@
     "bridge:daemon:stop": "npm --prefix telegram-bridge run daemon:stop",
     "bridge:daemon:logs": "npm --prefix telegram-bridge run daemon:logs",
     "gates": "node scripts/gates.mjs",
-    "gates:quick": "node scripts/gates.mjs --quick"
+    "gates:quick": "node scripts/gates.mjs --quick",
+    "omnivoice:install": "node scripts/omnivoice-install.mjs"
   },
   "keywords": [
     "claude-code",

@@ -52,6 +52,10 @@ const GENERACION_TTL_MS = 5 * 60 * 1000;
 // más allá, se descarta en vez de contar como en curso para siempre.
 const DESFASE_RELOJ_MS = 60 * 1000;
 const ESTADOS_FINALES = new Set(['completed', 'failed', 'error', 'cancelled', 'canceled']);
+// OmniVoice (segundo proveedor): un solo modelo, con este nombre en el
+// inventario, el pin y los archivos de uso. Tamaño medido: ~1.9-2.8 GB.
+const MODELO_OMNI = 'omnivoice';
+const SIZE_MB_OMNI = 2400;
 
 const RUTA_KEEPER = path.join(__dirname, 'voicebox-keeper.js');
 
@@ -60,7 +64,12 @@ const CONFIG_POR_DEFECTO = {
   voiceboxServerExe: null,
   voiceboxIdleUnloadMinutes: 10,
   voiceboxIdleShutdownMinutes: 30,
-  statuslineVoicebox: true
+  statuslineVoicebox: true,
+  // OmniVoice (segundo proveedor, plan de OmniVoice).
+  omnivoicePort: 17494,
+  omnivoiceDir: null,
+  omnivoiceClassTemperature: 0.7,
+  vozPorPerfil: {}
 };
 
 // ==============================================================================
@@ -148,6 +157,12 @@ function aplicarClavesVoicebox(destino, parsed) {
   if (Number.isFinite(parsed.voicebox_idle_unload_minutes)) destino.voiceboxIdleUnloadMinutes = parsed.voicebox_idle_unload_minutes;
   if (Number.isFinite(parsed.voicebox_idle_shutdown_minutes)) destino.voiceboxIdleShutdownMinutes = parsed.voicebox_idle_shutdown_minutes;
   if (parsed.statusline_voicebox !== undefined) destino.statuslineVoicebox = parsed.statusline_voicebox !== false;
+  if (Number.isFinite(parsed.omnivoice_port)) destino.omnivoicePort = parsed.omnivoice_port;
+  if (parsed.omnivoice_dir !== undefined) destino.omnivoiceDir = parsed.omnivoice_dir || null;
+  if (Number.isFinite(parsed.omnivoice_class_temperature)) destino.omnivoiceClassTemperature = parsed.omnivoice_class_temperature;
+  if (parsed.voz_por_perfil && typeof parsed.voz_por_perfil === 'object' && !Array.isArray(parsed.voz_por_perfil)) {
+    destino.vozPorPerfil = { ...parsed.voz_por_perfil };
+  }
   return destino;
 }
 
@@ -694,27 +709,96 @@ function mensajeConflictoPin(pin, objetivo, voz) {
  * aplica la guarda de VRAM y descarga los TTS ajenos que no estén en uso.
  * Con `fijar`, además registra el pin (y precarga si es Qwen).
  */
-async function aplicarModeloActivo(baseUrl, { engine, modelSize = null, voz = null, fijar = false }, deps = {}) {
+/** /models/status de Voicebox sin lanzar: un server caído aporta []. */
+async function estadoModelosTolerante(baseUrl) {
+  try {
+    return await estadoModelos(baseUrl);
+  } catch {
+    return [];
+  }
+}
+
+/** /models/status del server de OmniVoice; caído → sin modelos ni generación. */
+async function estadoOmniServidor(url) {
+  try {
+    const r = await pedir(`${url}/models/status`, { timeout: 3000 });
+    if (r.status < 200 || r.status >= 300) return { models: [], generando: false, generando_desde: null };
+    const d = JSON.parse(r.body);
+    return {
+      models: (Array.isArray(d.models) ? d.models : []).map(m => ({ model_name: m.model_name, loaded: Boolean(m.loaded), size_mb: m.size_mb || SIZE_MB_OMNI })),
+      generando: Boolean(d.generando),
+      generando_desde: d.generando_desde || null
+    };
+  } catch {
+    return { models: [], generando: false, generando_desde: null };
+  }
+}
+
+async function descargarOmniServidor(url) {
+  const r = await pedir(`${url}/models/omnivoice/unload`, { method: 'POST', timeout: 15000, body: {} });
+  if (r.status < 200 || r.status >= 300) throw new Error(`unload de omnivoice devolvió HTTP ${r.status}`);
+}
+
+/**
+ * El pin y el uso de OmniVoice no son asunto del keeper de Voicebox: un pin
+ * `omnivoice` no puede impedir que Voicebox se descargue o se apague, y usar
+ * OmniVoice no mantiene vivo a Voicebox (auditoría del plan de OmniVoice).
+ */
+function pinDeVoicebox(pin) {
+  return pin && pin.model && pin.model !== MODELO_OMNI ? pin.model : null;
+}
+
+function usosSinOmni(usos) {
+  const copia = { ...usos };
+  delete copia[MODELO_OMNI];
+  return copia;
+}
+
+/**
+ * Coordinador de VRAM entre los dos servidores (Voicebox y OmniVoice).
+ *
+ * `servidores` es la URL de Voicebox (forma anterior) o `{ voicebox, omnivoice }`.
+ * Inventario unificado: los modelos cargados de ambos, cada servidor solo si
+ * responde. Misma regla de siempre: un TTS residente, respetando pin, uso
+ * reciente y generación en curso, con guarda de VRAM; cada candidato se
+ * descarga en su servidor.
+ */
+async function aplicarModeloActivo(servidores, { proveedor = 'voicebox', engine, modelSize = null, voz = null, fijar = false }, deps = {}) {
   const env = deps.env || process.env;
   const ahora = (deps.ahora || Date.now)();
-  const obtenerModelos = deps.estadoModelos || estadoModelos;
+  const urls = typeof servidores === 'string' ? { voicebox: servidores, omnivoice: null } : (servidores || {});
+  const baseUrl = urls.voicebox || null;
   const descargar = deps.descargarModelo || descargarModelo;
+  const descargarOmni = deps.descargarOmni || descargarOmniServidor;
   const medirVram = deps.vram || vramNvidia;
-  const objetivo = ttsModelName(engine, modelSize);
+  const objetivo = proveedor === 'omnivoice' ? MODELO_OMNI : ttsModelName(engine, modelSize);
 
   const pin = leerPin(env);
   if (pin && pin.model !== objetivo && !fijar) {
     return { ok: false, conflicto: true, objetivo, error: mensajeConflictoPin(pin, objetivo, voz) };
   }
 
-  const modelos = await obtenerModelos(baseUrl);
-  const porNombre = Object.fromEntries(modelos.map(m => [m.model_name, m]));
-  const cargados = modelos.filter(m => m.loaded).map(m => m.model_name);
+  const inventario = [];
+  if (baseUrl) {
+    for (const m of await (deps.estadoModelos || estadoModelosTolerante)(baseUrl)) {
+      inventario.push({ ...m, proveedor: 'voicebox' });
+    }
+  }
+  let omni = null;
+  if (urls.omnivoice) {
+    omni = await (deps.estadoOmni || estadoOmniServidor)(urls.omnivoice);
+    for (const m of omni.models) inventario.push({ ...m, proveedor: 'omnivoice' });
+  }
+  const porNombre = Object.fromEntries(inventario.map(m => [m.model_name, m]));
+  const cargados = inventario.filter(m => m.loaded).map(m => m.model_name);
   const protegido = fijar ? null : (pin && pin.model);
   const candidatos = modelosADescargar({ cargados, objetivo, usos: leerUsos(env), ahora, protegido });
-  // Con una generación en curso en Voicebox (de cualquier cliente, incluso
-  // otra sesión del plugin) no se descarga nada: podría ser el modelo que usa.
-  const enCurso = hayGeneracionFresca(await (deps.generacionesActivas || generacionesActivas)(baseUrl), ahora);
+  // Con una generación en curso en cualquiera de los dos (de cualquier
+  // cliente) no se descarga nada: podría ser el modelo que usa. OmniVoice
+  // informa desde cuándo genera: pasado el TTL, se lo considera colgado.
+  const activasVb = baseUrl ? await (deps.generacionesActivas || generacionesActivas)(baseUrl) : [];
+  const omniGenerando = Boolean(omni && omni.generando && esFresca(fechaVoicebox(omni.generando_desde), ahora));
+  const enCurso = hayGeneracionFresca(activasVb, ahora) || omniGenerando;
   const aDescargar = enCurso ? [] : candidatos;
   const postergados = cargados.filter(n => esModeloTts(n) && n !== objetivo && !aDescargar.includes(n));
 
@@ -722,7 +806,7 @@ async function aplicarModeloActivo(baseUrl, { engine, modelSize = null, voz = nu
   let guarda = yaCargado ? 'ya-cargado' : 'omitida';
   if (!yaCargado) {
     const vram = medirVram();
-    const tam = porNombre[objetivo] && porNombre[objetivo].size_mb;
+    const tam = (porNombre[objetivo] && porNombre[objetivo].size_mb) || (objetivo === MODELO_OMNI ? SIZE_MB_OMNI : null);
     if (vram && tam) {
       const libera = aDescargar.reduce((s, n) => s + ((porNombre[n] && porNombre[n].size_mb) || 0), 0);
       const necesita = tam * MARGEN_VRAM;
@@ -731,7 +815,7 @@ async function aplicarModeloActivo(baseUrl, { engine, modelSize = null, voz = nu
           return {
             ok: false,
             objetivo,
-            error: `Hay una generación en curso en Voicebox (otro cliente); no se puede liberar VRAM para ${objetivo} ahora. Reintentá en unos segundos.`
+            error: `Hay una generación en curso (Voicebox u OmniVoice); no se puede liberar VRAM para ${objetivo} ahora. Reintentá en unos segundos.`
           };
         }
         return {
@@ -748,7 +832,8 @@ async function aplicarModeloActivo(baseUrl, { engine, modelSize = null, voz = nu
   const descargados = [];
   for (const n of aDescargar) {
     try {
-      await descargar(baseUrl, n);
+      if (porNombre[n] && porNombre[n].proveedor === 'omnivoice') await descargarOmni(urls.omnivoice);
+      else await descargar(baseUrl, n);
       descargados.push(n);
     } catch (err) {
       process.stderr.write(`[voicebox] No se pudo descargar ${n}: ${err.message}\n`);
@@ -756,8 +841,8 @@ async function aplicarModeloActivo(baseUrl, { engine, modelSize = null, voz = nu
   }
 
   if (fijar) {
-    escribirPin({ model: objetivo, engine, modelSize: modelSize || null, voice: voz || null, since: new Date(ahora).toISOString() }, env);
-    if (engine === 'qwen' && !yaCargado) {
+    escribirPin({ model: objetivo, engine: proveedor === 'omnivoice' ? MODELO_OMNI : engine, modelSize: modelSize || null, voice: voz || null, since: new Date(ahora).toISOString() }, env);
+    if (proveedor === 'voicebox' && baseUrl && engine === 'qwen' && !yaCargado) {
       try {
         await (deps.cargarQwen || cargarQwen)(baseUrl, modelSize);
       } catch (err) {
@@ -824,5 +909,12 @@ module.exports = {
   hayGeneracionFresca,
   usosDesdeVoicebox,
   generacionesActivas,
-  historialReciente
+  historialReciente,
+  MODELO_OMNI,
+  SIZE_MB_OMNI,
+  estadoModelosTolerante,
+  estadoOmniServidor,
+  descargarOmniServidor,
+  pinDeVoicebox,
+  usosSinOmni
 };

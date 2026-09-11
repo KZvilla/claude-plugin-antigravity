@@ -50,7 +50,7 @@ from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
     resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
     get_model_status, resolve_engine_and_model, tts_model_name, unload_model, stt_full_model_name,
-    unload_all_loaded_models, LatidoUso
+    unload_all_loaded_models, LatidoUso, activar_motor_chat
 )
 
 SAMPLE_RATE = 16000
@@ -190,6 +190,8 @@ def main():
                          help="Descargar TODO lo que Voicebox tenga cargado ahora mismo y salir, sin arrancar sesion.")
     parser.add_argument("--soltar-pin", action="store_true",
                          help="Soltar el modelo fijado antes de empezar (si choca con el motor de la voz elegida).")
+    parser.add_argument("--motor", default=None, choices=["omnivoice", "voicebox"],
+                         help="Proveedor de voz. Por defecto OmniVoice si la voz tiene muestra, salvo voz_por_perfil.")
     args = parser.parse_args()
 
     if args.list_devices:
@@ -235,17 +237,17 @@ def main():
 
     # Antes de abrir el microfono: el modelo de esta voz pasa a ser el activo.
     # Si hay otro fijado, o no hay VRAM, se dice ahora y no a mitad de la charla.
-    activate_args = {"action": "activate", "engine": engine}
-    if model_size:
-        activate_args["model_size"] = model_size
+    # La charla va por OmniVoice si la voz tiene muestra (regla del usuario).
     try:
-        mcp.call_tool("agy_voice_model", activate_args)
+        proveedor, muestra = activar_motor_chat(mcp, profile, engine, model_size, args.motor)
     except RuntimeError as err:
         print(f"[voice-loop] {err}")
         print("[voice-loop] Si hay un modelo fijado de otra voz, volve a correr con --soltar-pin.")
         mcp.close()
         return
-    latido = LatidoUso([tts_model_name(engine, model_size), stt_full_model_name(args.stt_model)])
+    print(f"[voice-loop] Proveedor de voz: {'OmniVoice' if proveedor == 'omnivoice' else 'Voicebox'}")
+    modelo_tts = "omnivoice" if proveedor == "omnivoice" else tts_model_name(engine, model_size)
+    latido = LatidoUso([modelo_tts, stt_full_model_name(args.stt_model)])
 
     # /models/load solo carga el modelo TTS "Qwen" (su propio schema no acepta
     # un engine) -- precalentarlo cuando el perfil resolvio a Kokoro/otro motor
@@ -255,7 +257,8 @@ def main():
 
     print("[voice-loop] Iniciando sesion agy_voice_stream" +
           (" (con pre-warm de Voicebox en paralelo)" if is_qwen_engine else "") + "...")
-    start_args = {"action": "start", "effort": args.effort, "mode": "plan", "prewarm_voicebox": is_qwen_engine}
+    start_args = {"action": "start", "effort": args.effort, "mode": "plan",
+                  "prewarm_voicebox": is_qwen_engine and proveedor == "voicebox"}
     if is_qwen_engine:
         start_args["voicebox_model_size"] = model_size or "1.7B"
     start_text = mcp.call_tool("agy_voice_stream", start_args)
@@ -327,7 +330,8 @@ def main():
                     if generation_token["value"] != my_token:
                         continue  # barge-in ocurrio mientras agy seguia respondiendo
                     print(f"Agy> {sentence}")
-                    future = executor.submit(synthesize_sentence, sentence, profile, args.language, engine, model_size)
+                    future = executor.submit(synthesize_sentence, sentence, profile, args.language, engine, model_size,
+                                             proveedor, muestra)
                     sequencer.submit(future, sentence)
 
     threading.Thread(target=turn_worker, daemon=True).start()

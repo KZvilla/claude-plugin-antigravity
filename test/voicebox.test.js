@@ -266,6 +266,72 @@ async function main() {
 
   dir = tmp();
   try {
+    await group('coordinador de VRAM entre Voicebox y OmniVoice (v0.23.0)', async () => {
+      const env = { ...process.env, LAGRANGE_VOICEBOX_DIR: dir };
+      const urls = { voicebox: 'http://vb', omnivoice: 'http://omni' };
+      const iso = (ms) => new Date(ms).toISOString().replace('Z', '');
+      let vbDescargados = [];
+      let omniDescargas = 0;
+      const deps = ({ vbModelos = [], omniModelos = [], generando = false, generandoDesde = null, libreMb = 20000, ahora = Date.now() }) => ({
+        env,
+        ahora: () => ahora,
+        estadoModelos: async () => vbModelos,
+        estadoOmni: async () => ({ models: omniModelos, generando, generando_desde: generandoDesde }),
+        descargarModelo: async (_u, n) => { vbDescargados.push(n); },
+        descargarOmni: async () => { omniDescargas++; },
+        cargarQwen: async () => {},
+        vram: () => ({ usadoMb: 0, libreMb, totalMb: 24576 }),
+        generacionesActivas: async () => []
+      });
+      const qwen = (loaded) => ({ model_name: 'qwen-tts-1.7B', loaded, size_mb: 4333 });
+      const omni = (loaded) => ({ model_name: 'omnivoice', loaded, size_mb: 2400 });
+
+      let r = await vb.aplicarModeloActivo(urls, { proveedor: 'omnivoice', engine: 'omnivoice' }, deps({ vbModelos: [qwen(true)], omniModelos: [omni(false)] }));
+      check('Qwen cargado → activar OmniVoice lo descarga en Voicebox', r.ok && r.objetivo === 'omnivoice' && JSON.stringify(vbDescargados) === '["qwen-tts-1.7B"]', JSON.stringify(r));
+
+      // 2 min después: el uso de omnivoice que marcó el paso anterior ya no es reciente.
+      const luego = Date.now() + 2 * MIN;
+      r = await vb.aplicarModeloActivo(urls, { engine: 'qwen', modelSize: '1.7B' }, deps({ vbModelos: [qwen(false)], omniModelos: [omni(true)], ahora: luego }));
+      check('OmniVoice cargado → activar Qwen lo descarga en su server', r.ok && omniDescargas === 1, JSON.stringify(r));
+
+      const despues = luego + 2 * MIN;
+      r = await vb.aplicarModeloActivo(urls, { engine: 'qwen', modelSize: '1.7B' }, deps({ vbModelos: [qwen(false)], omniModelos: [omni(true)], generando: true, generandoDesde: iso(despues - 5000), ahora: despues }));
+      check('OmniVoice generando → no se descarga, queda postergado', r.ok && omniDescargas === 1 && r.postergados.includes('omnivoice'), JSON.stringify(r));
+
+      r = await vb.aplicarModeloActivo(urls, { engine: 'qwen', modelSize: '1.7B' }, deps({ vbModelos: [qwen(false)], omniModelos: [omni(true)], generando: true, generandoDesde: iso(despues - 10 * MIN), ahora: despues }));
+      check('OmniVoice «generando» hace 10 min (colgado) → se descarga igual', r.ok && omniDescargas === 2, JSON.stringify(r));
+
+      r = await vb.aplicarModeloActivo(urls, { proveedor: 'omnivoice', engine: 'omnivoice' }, deps({ omniModelos: [omni(false)], libreMb: 100 }));
+      check('guarda de VRAM con el tamaño de OmniVoice', !r.ok && /VRAM insuficiente para omnivoice/.test(r.error), r.error);
+
+      const sinVb = { ...deps({ omniModelos: [omni(false)] }), estadoModelos: async () => { throw new Error('no debía consultar Voicebox'); } };
+      r = await vb.aplicarModeloActivo({ voicebox: null, omnivoice: 'http://omni' }, { proveedor: 'omnivoice', engine: 'omnivoice' }, sinVb);
+      check('Voicebox caído: el coordinador sigue con OmniVoice', r.ok, JSON.stringify(r));
+
+      vb.escribirPin({ model: 'qwen-tts-1.7B', voice: 'Alya' }, env);
+      r = await vb.aplicarModeloActivo(urls, { proveedor: 'omnivoice', engine: 'omnivoice', voz: 'Alya' }, deps({ vbModelos: [qwen(true)], omniModelos: [omni(false)] }));
+      check('pin de Qwen protege contra OmniVoice (conflicto)', !r.ok && r.conflicto && /qwen-tts-1\.7B/.test(r.error), r.error);
+      vb.escribirPin(null, env);
+
+      check('estadoModelosTolerante con Voicebox caído → []', JSON.stringify(await vb.estadoModelosTolerante('http://127.0.0.1:1')) === '[]');
+      const eo = await vb.estadoOmniServidor('http://127.0.0.1:1');
+      check('estadoOmniServidor con OmniVoice caído → sin modelos', eo.models.length === 0 && eo.generando === false);
+    });
+
+    await group('el keeper de Voicebox ignora a OmniVoice (v0.23.0)', () => {
+      check('pin omnivoice no es pin de Voicebox', vb.pinDeVoicebox({ model: 'omnivoice' }) === null);
+      check('pin de Qwen sí', vb.pinDeVoicebox({ model: 'qwen-tts-1.7B' }) === 'qwen-tts-1.7B');
+      check('sin pin → null', vb.pinDeVoicebox(null) === null);
+      const u = vb.usosSinOmni({ omnivoice: 5, kokoro: 3 });
+      check('el uso de omnivoice no cuenta para el keeper', !('omnivoice' in u) && u.kokoro === 3);
+      const ahora = 100 * MIN;
+      const d = vb.decidirAccionKeeper({ ownsServer: true, pinModel: vb.pinDeVoicebox({ model: 'omnivoice' }), cargados: [], usos: {}, ahora, idleUnloadMs: 10 * MIN, idleShutdownMs: 30 * MIN, ultimoUso: 0 });
+      check('con OmniVoice fijado, Voicebox inactivo se apaga igual', d.accion === 'apagar');
+    });
+  } finally { removeFixture(dir); }
+
+  dir = tmp();
+  try {
     await group('swap con una generación colgada no se bloquea (v0.22.1)', async () => {
       const env = { ...process.env, LAGRANGE_VOICEBOX_DIR: dir };
       const descargados = [];

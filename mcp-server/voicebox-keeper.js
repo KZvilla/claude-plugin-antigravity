@@ -141,9 +141,10 @@ async function main() {
     const cfg = vb.leerConfigVoicebox();
     const idleUnloadMs = cfg.voiceboxIdleUnloadMinutes * 60000;
     const idleShutdownMs = cfg.voiceboxIdleShutdownMinutes * 60000;
-    const pin = vb.leerPin();
-    const pinModel = pin ? pin.model : null;
-    const usosCrudos = vb.leerUsos();
+    // Un pin o un uso de OmniVoice no son de este server: no pueden impedir
+    // que Voicebox descargue ni se apague (OmniVoice se gestiona solo).
+    const pinModel = vb.pinDeVoicebox(vb.leerPin());
+    const usosCrudos = vb.usosSinOmni(vb.leerUsos());
     // Uso de clientes que no pasan por el plugin (GUI, scripts): Voicebox lo
     // expone en /tasks/active y /history. Sin esto, el keeper descargaba un
     // modelo a mitad de una generación ajena.

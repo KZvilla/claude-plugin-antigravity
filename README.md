@@ -149,7 +149,7 @@ Nineteen tools exposed via the MCP server — fourteen `agy_*` tools, four `tele
 | `agy_narrate` | audio TTS | 3m | Spoken audio update of latest checkpoint via Voicebox (zero Claude tokens). Takes no text — it writes the script from the session log |
 | `agy_say` | audio TTS | — (3m with `polish`) | Speak a specific text you already have. Sanitized locally by default (markdown, paths, URLs, emoji stripped; secrets redacted); `polish: true` has Gemini condense it first |
 | `agy_narrate_voices` | read-only | — | List installed Voicebox voice profiles, languages, roles, and GPU health |
-| `agy_voice_model` | GPU memory | — | Start Voicebox headless, and pin / release / unload the TTS model in VRAM (`status` is read-only) |
+| `agy_voice_model` | GPU memory | — | Start Voicebox headless (or OmniVoice with `engine: "omnivoice"`), and pin / release / unload the TTS model in VRAM across both (`status` is read-only) |
 | `agy_usage` | — | — | Session token telemetry, context window saturation, model limits, quota health |
 | `agy_status` | — | — | Binary path, CLI version, active model/effort defaults, permission policies |
 | `agy_set_config` | — | — | Persist model, effort, timeout, or permission preferences |
@@ -618,10 +618,31 @@ GPU memory is managed for you:
   desktop app started.
 - **VRAM guard.** A model is not loaded when `nvidia-smi` says it would not fit.
 
-While Voicebox runs, the statusline shows a line such as
-`🎙️ voicebox cuda · qwen-tts-1.7B 📌 · VRAM 19.4/24.0 GB libre`
+While a voice server runs, the statusline shows a line such as
+`🎙️ voicebox cuda · qwen-tts-1.7B 📌 · VRAM 5.4/24.0 GB` — VRAM **in use** over
+total, measured live (`nvidia-smi`, cached 3 s), with a `⚠` above 85 %
 (disable it with `statusline_voicebox: false`). State and logs live in
 `~/.claude/lagrange-voicebox/`.
+
+### OmniVoice (optional second voice engine)
+
+[OmniVoice](https://github.com/k2-fsa/OmniVoice) clones the same Voicebox
+voices from their samples, about ten times faster than Qwen 1.7B (≈6 s for 36 s
+of audio) and in ~2 GB of VRAM, with somewhat flatter prosody. Once installed:
+
+- **Immediate** narration — `agy_say`, `agy_narrate` (default `modo:
+  "inmediato"`) and the voice chat — goes through OmniVoice.
+- **Deferred** narration — `modo: "diferido"`, and session summaries with
+  `narrate` — goes through Qwen via Voicebox.
+- `voz_por_perfil` pins a voice to one engine (`{"Priscilla": "voicebox"}`);
+  `motor` forces one per call. Preset voices (no sample) always use Voicebox.
+- Voicebox stays the source of truth for voices and samples; a small cache lets
+  OmniVoice keep narrating if Voicebox is down.
+- Its own server (port 17494) frees its model and shuts down when idle, like
+  the Voicebox keeper; one TTS model stays resident across both engines.
+
+Install (Windows + NVIDIA, ~8 GB into `%LOCALAPPDATA%\lagrange-omnivoice`):
+`npm run omnivoice:install`. The OmniVoice weights are **CC-BY-NC** (non-commercial).
 
 If Voicebox cannot be reached or started, the plugin returns a diagnostic naming the cause without failing your development session.
 

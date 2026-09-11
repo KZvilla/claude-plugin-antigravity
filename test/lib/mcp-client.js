@@ -23,6 +23,11 @@ const REPO_ROOT = path.join(__dirname, '..', '..');
 function startServer({ serverJs, cwd, captureFile } = {}) {
   const entry = serverJs || process.env.SERVER_JS || path.join(REPO_ROOT, 'mcp-server', 'index.js');
   const env = { ...process.env };
+  // Sin esto, un test que narra detecta el OmniVoice instalado de verdad (en
+  // %LOCALAPPDATA%) y el coordinador de VRAM le descarga el modelo al server
+  // real del usuario: pasó durante una auditoría. Quien quiera OmniVoice en un
+  // test lo simula con su propio OMNIVOICE_DIR.
+  if (!env.OMNIVOICE_DIR) env.OMNIVOICE_DIR = path.join(require('os').tmpdir(), 'lagrange-omnivoice-ausente-en-tests');
 
   if (captureFile) {
     env.CAPTURE_FILE = captureFile;
