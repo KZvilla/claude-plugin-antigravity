@@ -18,8 +18,20 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 const { check, group, report } = require('./lib/assert');
 
+const { resolverBash } = require('../mcp-server/lib/bash');
+
 const REPO_ROOT = path.join(__dirname, '..');
 const BRIDGE = path.join(REPO_ROOT, 'telegram-bridge');
+
+// En Windows, `bash` del PATH suele ser el lanzador de WSL, que no entiende
+// rutas C:\ (asi fallaban estos tests). Se usa el bash de Git; sin el, lo que
+// necesita bash se omite en vez de fallar.
+const BASH = resolverBash();
+const SIN_BASH = process.platform === 'win32' && !BASH;
+function omitir(que) {
+  console.log(`  (sin bash de Git: se omite ${que})`);
+  check(`${que} — omitido, sin bash de Git`, true);
+}
 
 // Preload que finge la plataforma. Es la unica forma de ejercitar las tres
 // ramas del despachador desde una sola maquina.
@@ -27,8 +39,15 @@ const PRELOAD = path.join(os.tmpdir(), `agy-fakeplat-${process.pid}.js`);
 fs.writeFileSync(PRELOAD, 'if (process.env.FAKE_PLATFORM) Object.defineProperty(process, "platform", { value: process.env.FAKE_PLATFORM });\n');
 
 function correrDespachador(plataforma, comando) {
+  const env = { ...process.env, FAKE_PLATFORM: plataforma };
+  // Fingiendo linux en Windows, daemon.mjs invoca `bash`: se antepone el dir
+  // del bash de Git sobre la clave real del entorno (Path/PATH), sin duplicarla.
+  if (process.platform === 'win32' && BASH) {
+    const clave = Object.keys(env).find(k => k.toUpperCase() === 'PATH') || 'PATH';
+    env[clave] = path.dirname(BASH) + path.delimiter + (env[clave] || '');
+  }
   return spawnSync(process.execPath, ['--require', PRELOAD, path.join(BRIDGE, 'daemon.mjs'), comando], {
-    env: { ...process.env, FAKE_PLATFORM: plataforma },
+    env,
     encoding: 'utf8',
     timeout: 30000
   });
@@ -40,15 +59,19 @@ async function main() {
     check('daemon.sh presente', fs.existsSync(path.join(BRIDGE, 'daemon.sh')));
     check('daemon.mjs (despachador) presente', fs.existsSync(path.join(BRIDGE, 'daemon.mjs')));
 
-    let bashOk = false;
-    let bashDetalle = '';
-    try {
-      execFileSync('bash', ['-n', path.join(BRIDGE, 'daemon.sh')], { stdio: ['pipe', 'pipe', 'pipe'] });
-      bashOk = true;
-    } catch (err) {
-      bashDetalle = (err.stderr || '').toString().slice(0, 200) || err.message;
+    if (SIN_BASH) {
+      omitir('daemon.sh parsea con bash -n');
+    } else {
+      let bashOk = false;
+      let bashDetalle = '';
+      try {
+        execFileSync(BASH, ['-n', path.join(BRIDGE, 'daemon.sh')], { stdio: ['pipe', 'pipe', 'pipe'] });
+        bashOk = true;
+      } catch (err) {
+        bashDetalle = (err.stderr || '').toString().slice(0, 200) || err.message;
+      }
+      check('daemon.sh parsea con bash -n', bashOk, bashDetalle);
     }
-    check('daemon.sh parsea con bash -n', bashOk, bashDetalle);
   });
 
   await group('daemon.sh cubre los mismos verbos que daemon.ps1', () => {
@@ -116,9 +139,15 @@ async function main() {
       'cat "$UNIT_FILE"'
     ].join('\n'));
 
+    if (SIN_BASH) {
+      omitir('la unidad se puede renderizar');
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    }
+
     let unidad = '';
     try {
-      unidad = execFileSync('bash', [render], { encoding: 'utf8', timeout: 20000 });
+      unidad = execFileSync(BASH, [render], { encoding: 'utf8', timeout: 20000 });
     } catch (err) {
       unidad = '';
       check('la unidad se puede renderizar', false, (err.stderr || err.message || '').toString().slice(0, 200));
@@ -222,10 +251,15 @@ async function main() {
   await group('El despachador elige por plataforma', () => {
     // Linux: debe llegar a daemon.sh. Sin systemd en esta maquina, el propio
     // script se queja de systemctl — que es la prueba de que el despacho llego.
-    const linux = correrDespachador('linux', 'status');
-    const salidaLinux = `${linux.stdout || ''}${linux.stderr || ''}`;
-    check('linux enruta a daemon.sh', /systemctl|systemd|Unidad|unidad/i.test(salidaLinux), salidaLinux.slice(0, 200));
-    check('linux NO invoca powershell', !/powershell/i.test(salidaLinux), salidaLinux.slice(0, 200));
+    if (SIN_BASH) {
+      omitir('linux enruta a daemon.sh');
+      omitir('linux NO invoca powershell');
+    } else {
+      const linux = correrDespachador('linux', 'status');
+      const salidaLinux = `${linux.stdout || ''}${linux.stderr || ''}`;
+      check('linux enruta a daemon.sh', /systemctl|systemd|Unidad|unidad/i.test(salidaLinux), salidaLinux.slice(0, 200));
+      check('linux NO invoca powershell', !/powershell/i.test(salidaLinux), salidaLinux.slice(0, 200));
+    }
 
     // macOS: limite declarado, no un fallo accidental.
     const mac = correrDespachador('darwin', 'install');
@@ -289,7 +323,9 @@ async function main() {
   });
 
   try { fs.unlinkSync(PRELOAD); } catch {}
-  report();
+  // Antes era `report();` a secas: la suite salia en 0 con FAILs y run.js no
+  // la contaba.
+  process.exit(report() ? 0 : 1);
 }
 
 main().catch(err => {
