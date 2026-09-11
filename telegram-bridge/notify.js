@@ -8,6 +8,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { registerPendingAsk, getPendingAsk, expirePendingAsk } from './state.js';
 import { splitMessage, markdownToTelegramHtml, escapeHtml } from './formatter.js';
@@ -331,6 +332,17 @@ export async function sendTelegramVoice(options = {}) {
 }
 
 /**
+ * Identificador de un ask. Aleatorio de verdad: el anterior (`Date.now()` más
+ * cuatro caracteres de `Math.random()`) se podía adivinar sabiendo más o menos
+ * la hora, y el `callback_data` lo puede fabricar un cliente propio. Queda en
+ * `ask:ask_<16 hex>:<i>`, lejos de los 64 bytes, y sin `:` que confunda el
+ * `split(':')` del handler.
+ */
+export function nuevoAskId() {
+  return 'ask_' + crypto.randomBytes(8).toString('hex');
+}
+
+/**
  * 3. Pregunta interactiva Human-in-the-Loop (Espera respuesta desde el móvil)
  */
 export async function askTelegramQuestion(options = {}) {
@@ -343,7 +355,7 @@ export async function askTelegramQuestion(options = {}) {
 
   if (!question) throw new Error('Se requiere el parámetro "question".');
   const chatId = getDefaultChatId(targetChatId);
-  const askId = 'ask_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+  const askId = nuevoAskId();
 
   // Construir teclado en línea
   const inlineKeyboard = [
