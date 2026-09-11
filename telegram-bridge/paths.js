@@ -54,6 +54,70 @@ export function bridgeDataDirPath() {
 }
 
 /**
+ * ¿Hay un bot vivo atendiendo este directorio de datos?
+ *
+ * Los botones de un `telegram_ask` solo los recibe el daemon (el único que
+ * consume `getUpdates`). Sin él, la pregunta sale igual —el envío es HTTPS
+ * directo— y el usuario toca un botón que se queda girando para siempre. Esto
+ * es lo que permite negarse ANTES de mandarla.
+ *
+ * Mismo criterio que `acquireLock` de bot.js, con dos matices:
+ *   - `EPERM` en `process.kill(pid, 0)` significa que el proceso EXISTE pero es
+ *     de otro usuario o está elevado: cuenta como vivo.
+ *   - `bootId` tiene resolución de minuto y sale de `Date.now()` menos
+ *     `os.uptime()`, que no avanzan igual: dos cálculos del mismo arranque
+ *     pueden diferir en uno. Se tolera ±1; exigir igualdad rechazaría un bot
+ *     vivo.
+ *
+ * Pura salvo por la lectura del lock; `ahora`, `uptime` y `killFn` son
+ * inyectables para los tests.
+ *
+ * @returns {{ vivo: boolean, motivo: 'vivo'|'sin-lock'|'pid-muerto'|'otro-arranque'|'lock-ilegible', pid: number|null, startedAt: string|null }}
+ */
+export function estadoDaemon({
+  dataDir = bridgeDataDirPath(),
+  ahora = Date.now(),
+  uptime = os.uptime(),
+  killFn = (pid, senal) => process.kill(pid, senal)
+} = {}) {
+  const sinDatos = { pid: null, startedAt: null };
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(dataDir, 'bridge.lock'), 'utf8').trim();
+  } catch (err) {
+    return { vivo: false, motivo: err.code === 'ENOENT' ? 'sin-lock' : 'lock-ilegible', ...sinDatos };
+  }
+
+  // Formato actual (JSON) o legado (solo el PID), como `readLockFrom` de bot.js.
+  let lock = null;
+  try {
+    if (raw.startsWith('{')) {
+      const p = JSON.parse(raw);
+      if (Number.isInteger(p.pid)) lock = { pid: p.pid, startedAt: p.startedAt ?? null, bootId: p.bootId ?? null };
+    } else {
+      const pid = parseInt(raw, 10);
+      if (Number.isInteger(pid)) lock = { pid, startedAt: null, bootId: null };
+    }
+  } catch {}
+  if (!lock) return { vivo: false, motivo: 'lock-ilegible', ...sinDatos };
+
+  const datos = { pid: lock.pid, startedAt: lock.startedAt };
+  try {
+    killFn(lock.pid, 0);
+  } catch (err) {
+    if (err?.code !== 'EPERM') return { vivo: false, motivo: 'pid-muerto', ...datos };
+  }
+
+  if (lock.bootId !== null) {
+    const bootActual = Math.floor((ahora - uptime * 1000) / 60000);
+    if (!(Math.abs(Number(lock.bootId) - bootActual) <= 1)) {
+      return { vivo: false, motivo: 'otro-arranque', ...datos };
+    }
+  }
+  return { vivo: true, motivo: 'vivo', ...datos };
+}
+
+/**
  * Como `bridgeDataDirPath`, pero garantizando que el directorio existe.
  *
  * Si no se puede crear —permisos, disco lleno— se cae al directorio indicado
@@ -173,7 +237,9 @@ export function resolveDataFile(nombre, legacyDir) {
   if (fs.existsSync(legacy) && !fs.existsSync(destino)) {
     try {
       fs.renameSync(legacy, destino);
-      console.log(`[paths] ${nombre} migrado de ${legacyDir} a ${dataDir}.`);
+      // stderr, no stdout: `notify.js --ask-json` resuelve state.json por aquí,
+      // y su stdout es un JSON que el servidor MCP parsea.
+      console.error(`[paths] ${nombre} migrado de ${legacyDir} a ${dataDir}.`);
     } catch (err) {
       // `rename` entre volúmenes distintos falla con EXDEV; copiar y borrar sí
       // funciona. Si tampoco se puede, se sigue con el destino vacío: es estado
@@ -181,7 +247,7 @@ export function resolveDataFile(nombre, legacyDir) {
       try {
         fs.copyFileSync(legacy, destino);
         fs.unlinkSync(legacy);
-        console.log(`[paths] ${nombre} copiado de ${legacyDir} a ${dataDir}.`);
+        console.error(`[paths] ${nombre} copiado de ${legacyDir} a ${dataDir}.`);
       } catch (err2) {
         console.error(`[paths] No se pudo migrar ${legacy}: ${err2.message}. Se parte de cero en ${destino}.`);
       }

@@ -218,6 +218,38 @@ lock_started_at() {
 }
 
 # ──────────────────────────────────────────────────────────────────────
+# Dependencias
+# ──────────────────────────────────────────────────────────────────────
+#
+# Paquete por paquete (deps.mjs), no la carpeta: una node_modules incompleta
+# dejaba al bot muriendo al arrancar con ERR_MODULE_NOT_FOUND. Se llama desde
+# install y start, NUNCA desde test_prerequisites: test/daemon-platform.test.js
+# extrae esa funcion con sed y la ejecuta sola, y una llamada a una funcion que
+# no extrajo romperia el render de la unidad.
+
+dependencias_faltantes() {
+  node "$BRIDGE_DIR/deps.mjs" "$BRIDGE_DIR" 2>&1
+}
+
+# Solo con el bot parado: npm ci borra node_modules antes de reinstalar.
+assert_dependencias() {
+  local faltan
+  if faltan="$(dependencias_faltantes)"; then
+    ok 'Dependencias completas'
+    return 0
+  fi
+  warn "Faltan dependencias: $(printf '%s' "$faltan" | tr '\n' ' '). Instalando..."
+  if [ -f "$BRIDGE_DIR/package-lock.json" ]; then
+    (cd "$BRIDGE_DIR" && npm ci --omit=dev) || true
+  else
+    (cd "$BRIDGE_DIR" && npm install --omit=dev) || true
+  fi
+  faltan="$(dependencias_faltantes)" \
+    || fail "Siguen faltando dependencias: $(printf '%s' "$faltan" | tr '\n' ' '). Revisa la salida de npm."
+  ok 'Dependencias instaladas'
+}
+
+# ──────────────────────────────────────────────────────────────────────
 # Comandos
 # ──────────────────────────────────────────────────────────────────────
 
@@ -304,6 +336,20 @@ invoke_install() {
     systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
   fi
 
+  # `systemctl stop` puede tardar en soltar el proceso. Si pasado eso sigue
+  # habiendo un bot vivo, no es de la unidad (se lanzo a mano) y npm ci no
+  # podria reemplazar node_modules debajo de el: se pide detenerlo.
+  local pid_vivo intentos=0
+  pid_vivo="$(lock_pid || true)"
+  while [ -n "$pid_vivo" ] && kill -0 "$pid_vivo" 2>/dev/null && [ "$intentos" -lt 40 ]; do
+    sleep 0.25
+    intentos=$((intentos + 1))
+  done
+  if [ -n "$pid_vivo" ] && kill -0 "$pid_vivo" 2>/dev/null; then
+    fail "Hay un bot vivo (PID $pid_vivo) que no es de la unidad. Detenlo antes de instalar."
+  fi
+  assert_dependencias
+
   write_unit "$node_path" "$agy_path"
   systemctl --user daemon-reload
   systemctl --user enable --now "$UNIT_NAME"
@@ -335,6 +381,10 @@ invoke_start() {
   require_systemd
   systemctl --user list-unit-files "$UNIT_NAME" --no-legend 2>/dev/null | grep -q . \
     || fail "La unidad no esta registrada. Ejecuta: ./daemon.sh install"
+  # Con la unidad activa, start no hace nada y el bot tiene node_modules en uso.
+  if ! systemctl --user is-active --quiet "$UNIT_NAME"; then
+    assert_dependencias
+  fi
   systemctl --user start "$UNIT_NAME"
   ok 'Unidad arrancada.'
 }
@@ -370,6 +420,12 @@ invoke_status() {
     ok "Bot vivo - PID $pid, desde $(lock_started_at || echo desconocido)"
   else
     warn "Lockfile huerfano del PID $pid: el proceso ya no existe."
+  fi
+
+  # Informativo: status no instala nada.
+  local faltan
+  if ! faltan="$(dependencias_faltantes)"; then
+    warn "Faltan dependencias: $(printf '%s' "$faltan" | tr '\n' ' '). El bot no arrancaria; ./daemon.sh start las instala."
   fi
 
   info "Datos: $DATA_DIR"

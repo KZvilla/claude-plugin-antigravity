@@ -2329,6 +2329,62 @@ console.log('✔ Test 55 [FEAT-035]: un ask solo se responde desde su propio cha
 }
 console.log('✔ Test 56 [FEAT-035]: askId aleatorio, con forma estable y dentro de callback_data');
 
+// Test 57 [fix/telegram-ask]: estadoDaemon decide si hay un bot que pueda
+// atender los botones de un ask. Mismo criterio que acquireLock, con EPERM
+// como vivo y ±1 minuto de tolerancia en bootId.
+{
+  const paths = await import('./paths.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-daemon-'));
+  const lock = path.join(dir, 'bridge.lock');
+  const ahora = Date.now();
+  const uptime = os.uptime();
+  const bootActual = Math.floor((ahora - uptime * 1000) / 60000);
+  const estado = (extra = {}) => paths.estadoDaemon({ dataDir: dir, ahora, uptime, ...extra });
+  const errorCon = (code) => () => { const e = new Error(code); e.code = code; throw e; };
+
+  assert.strictEqual(estado().motivo, 'sin-lock', 'sin lock');
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startedAt: 'desde-test', bootId: String(bootActual) }));
+  const vivo = estado();
+  assert(vivo.vivo && vivo.pid === process.pid && vivo.startedAt === 'desde-test', 'lock propio del arranque actual → vivo, con pid y startedAt');
+  for (const delta of [-1, 1]) {
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, bootId: String(bootActual + delta) }));
+    assert(estado().vivo, `bootId desfasado ${delta} se tolera`);
+  }
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, bootId: String(bootActual + 2) }));
+  assert.strictEqual(estado().motivo, 'otro-arranque', 'bootId de otro arranque');
+  fs.writeFileSync(lock, JSON.stringify({ pid: 424242, bootId: String(bootActual) }));
+  assert.strictEqual(estado({ killFn: errorCon('ESRCH') }).motivo, 'pid-muerto', 'ESRCH: no hay proceso');
+  assert(estado({ killFn: errorCon('EPERM') }).vivo, 'EPERM: el proceso existe aunque no sea nuestro');
+  fs.writeFileSync(lock, String(process.pid));
+  assert(estado().vivo, 'lock legado (solo el PID)');
+  fs.writeFileSync(lock, '{roto');
+  assert.strictEqual(estado().motivo, 'lock-ilegible', 'lock corrupto');
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+console.log('✔ Test 57 [fix/telegram-ask]: estadoDaemon reconoce un bot vivo, uno muerto y uno de otro arranque');
+
+// Test 58 [fix/telegram-ask]: sin daemon, askTelegramQuestion se niega ANTES de
+// tocar la red. La pregunta habría llegado con botones que nadie atiende.
+{
+  const notify = await import('./notify.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sin-daemon-'));
+  const dirPrevio = process.env.TELEGRAM_BRIDGE_DATA_DIR;
+  const fetchPrevio = globalThis.fetch;
+  let llamadasRed = 0;
+  process.env.TELEGRAM_BRIDGE_DATA_DIR = dir;
+  globalThis.fetch = async () => { llamadasRed++; throw new Error('no debería salir a la red'); };
+  try {
+    await assert.rejects(() => notify.askTelegramQuestion({ question: '¿Sigo?' }), /no está corriendo \(sin-lock\)/);
+    assert.strictEqual(llamadasRed, 0, 'no se mandó nada a Telegram');
+  } finally {
+    globalThis.fetch = fetchPrevio;
+    if (dirPrevio === undefined) delete process.env.TELEGRAM_BRIDGE_DATA_DIR;
+    else process.env.TELEGRAM_BRIDGE_DATA_DIR = dirPrevio;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+console.log('✔ Test 58 [fix/telegram-ask]: sin daemon, el ask falla rápido y sin tocar la red');
+
 // Limpieza: solo el directorio temporal de test
 try {
   fs.rmSync(path.dirname(TEST_STATE_FILE), { recursive: true, force: true });

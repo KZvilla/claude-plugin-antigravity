@@ -23,6 +23,7 @@ const { getSummaryPrompt, recuperarDocumentoEnlazado, validarDocumento, separarD
 const { executeAgyStdin, executeAgyStreaming } = require('./agy-stream.js');
 const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
 const { lanzarFanout } = require('./fanout.js');
+const { invokeTelegramBridge } = require('./telegram-cli.js');
 const { crearEscritorDeEstado, crearLectorDeControl, rutaProgreso, limpiarProgreso } = require('./fanout-estado.js');
 const registroAgentes = require('./agents/registry.js');
 const estadoAgentes = require('./agents/estado.js');
@@ -2459,56 +2460,8 @@ function stopVoiceStreamSession(session) {
   session.status = 'stopped';
 }
 
-// Helper: Invoke Telegram Bridge for outbound notifications and human-in-the-loop decisions
-function invokeTelegramBridge(command, payload = {}) {
-  return new Promise((resolve) => {
-    const notifyScript = path.join(__dirname, '..', 'telegram-bridge', 'notify.js');
-    if (!fs.existsSync(notifyScript)) {
-      return resolve({ ok: false, error: 'telegram-bridge/notify.js not found' });
-    }
-
-    const timeoutSec = (payload.timeoutSeconds || payload.timeout_seconds || 300) + 15;
-    const child = spawn(process.execPath, [notifyScript, command, '-'], {
-      shell: false,
-      cwd: path.dirname(notifyScript),
-      env: { ...process.env },
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    const timer = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch {}
-      resolve({ ok: false, error: `Telegram operation timed out after ${timeoutSec}s` });
-    }, timeoutSec * 1000);
-
-    child.stdin.write(JSON.stringify(payload) + '\n');
-    child.stdin.end();
-
-    child.stdout.on('data', d => { stdout += d.toString('utf8'); });
-    child.stderr.on('data', d => { stderr += d.toString('utf8'); });
-
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      try {
-        const parsed = JSON.parse(stdout.trim());
-        resolve({ ok: code === 0, ...parsed });
-      } catch {
-        resolve({
-          ok: code === 0,
-          raw: stdout.trim(),
-          error: stderr.trim() || `Process exited with code ${code}`
-        });
-      }
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      resolve({ ok: false, error: err.message });
-    });
-  });
-}
+// `invokeTelegramBridge` (salida hacia Telegram y human-in-the-loop) vive en
+// telegram-cli.js, donde se puede probar.
 
 // Tool Handlers
 async function handleToolCall(name, args) {
@@ -4165,12 +4118,11 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         } catch {}
       }
 
-      let lock = null;
-      try { lock = JSON.parse(fs.readFileSync(lockFile, 'utf8')); } catch {}
-      let botVivo = false;
-      if (lock && Number.isInteger(lock.pid)) {
-        try { process.kill(lock.pid, 0); botVivo = true; } catch {}
-      }
+      // El mismo criterio con el que `telegram_ask` decide si puede preguntar
+      // (paths.js): si divergieran, status diría «vivo» y el ask se negaría.
+      const daemon = rutas.estadoDaemon({ dataDir });
+      const botVivo = daemon.vivo;
+      const lock = daemon.pid !== null ? { pid: daemon.pid, startedAt: daemon.startedAt } : null;
 
       let stateInfo = null;
       try {
