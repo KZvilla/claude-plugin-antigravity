@@ -175,6 +175,22 @@ function ejecutarDelegado(comando, stdinCrudo) {
   }
 }
 
+function segmentoFanout(ctx) {
+  const corrida = corridaMasReciente(ctx.cwd);
+  if (!corrida || estaExpirada(corrida)) return null;
+  return armarLinea(corrida);
+}
+
+// Si el módulo del segmento de Voicebox no carga, el fanout sigue pintándose.
+let segmentoVoicebox = () => null;
+try {
+  ({ segmentoVoicebox } = require('./statusline-voicebox.js'));
+} catch {}
+
+// Una línea por segmento, en este orden. Agregar información a la statusline
+// es sumar una función `(ctx) => string | null` acá.
+const SEGMENTOS = [segmentoFanout, segmentoVoicebox];
+
 async function main() {
   // El texto crudo de stdin se necesita dos veces: para nuestro propio parseo
   // y para pasárselo intacto al comando delegado (que espera el mismo
@@ -185,17 +201,17 @@ async function main() {
 
   const base = ejecutarDelegado(leerDelegado(cwd), crudo);
 
-  let lineaFanout = '';
-  try {
-    const corrida = corridaMasReciente(cwd);
-    if (corrida && !estaExpirada(corrida)) {
-      lineaFanout = armarLinea(corrida) || '';
+  const ctx = { cwd, stdin: datosStdin };
+  // Cada segmento aislado: uno que falla se pierde solo, no arrastra al resto.
+  const lineas = SEGMENTOS.map((segmento) => {
+    try {
+      return segmento(ctx) || '';
+    } catch {
+      return '';
     }
-  } catch {
-    lineaFanout = '';
-  }
+  });
 
-  const salida = [base, lineaFanout].filter(Boolean).join('\n');
+  const salida = [base, ...lineas].filter(Boolean).join('\n');
   process.stdout.write(salida);
 }
 

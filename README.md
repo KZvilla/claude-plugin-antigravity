@@ -149,6 +149,7 @@ Nineteen tools exposed via the MCP server — fourteen `agy_*` tools, four `tele
 | `agy_narrate` | audio TTS | 3m | Spoken audio update of latest checkpoint via Voicebox (zero Claude tokens). Takes no text — it writes the script from the session log |
 | `agy_say` | audio TTS | — (3m with `polish`) | Speak a specific text you already have. Sanitized locally by default (markdown, paths, URLs, emoji stripped; secrets redacted); `polish: true` has Gemini condense it first |
 | `agy_narrate_voices` | read-only | — | List installed Voicebox voice profiles, languages, roles, and GPU health |
+| `agy_voice_model` | GPU memory | — | Start Voicebox headless, and pin / release / unload the TTS model in VRAM (`status` is read-only) |
 | `agy_usage` | — | — | Session token telemetry, context window saturation, model limits, quota health |
 | `agy_status` | — | — | Binary path, CLI version, active model/effort defaults, permission policies |
 | `agy_set_config` | — | — | Persist model, effort, timeout, or permission preferences |
@@ -595,7 +596,34 @@ The plugin detects available voices installed in your local Voicebox (`http://12
   - Preferred: `Emily`
   - Fallback: `Aria` $\rightarrow$ `Aiden` $\rightarrow$ First installed English profile
 
-If Voicebox is offline or unreachable, the plugin returns a friendly diagnostic notification without failing your development session.
+### Voicebox without the desktop app
+
+The desktop app does not need to be open. On Windows, when a voice tool finds
+Voicebox down, the plugin starts its server headless — the CUDA backend under
+`%APPDATA%\sh.voicebox.app\backends\cuda\` (downloaded the first time you open
+the app), falling back to the CPU one in Program Files — with the app's own data
+directory, so the same voices are there. If the app *is* open, nothing is started.
+
+GPU memory is managed for you:
+
+- **One TTS model at a time.** Switching to a voice that uses another model frees
+  the previous one first, unless it was used in the last 30 s by another session.
+- **Pin a model** with `keep_model: true` on `agy_say`/`agy_narrate`, or
+  `agy_voice_model` action `pin`: it stays loaded until `release` or `unload`.
+  Asking for a voice on a different model while one is pinned is refused with a
+  clear message rather than silently evicting it.
+- **Idle release.** A small keeper process frees unpinned models after
+  `voicebox_idle_unload_minutes` (10) and shuts the headless server down after
+  `voicebox_idle_shutdown_minutes` (30). It never unloads or stops a Voicebox the
+  desktop app started.
+- **VRAM guard.** A model is not loaded when `nvidia-smi` says it would not fit.
+
+While Voicebox runs, the statusline shows a line such as
+`🎙️ voicebox cuda · qwen-tts-1.7B 📌 · VRAM 19.4/24.0 GB libre`
+(disable it with `statusline_voicebox: false`). State and logs live in
+`~/.claude/lagrange-voicebox/`.
+
+If Voicebox cannot be reached or started, the plugin returns a diagnostic naming the cause without failing your development session.
 
 ### 🎭 Enriquecer la Personalidad desde Voicebox (Sin tocar código)
 
@@ -615,7 +643,7 @@ Full-duplex spoken conversation with Antigravity — not a Claude Code slash com
 - `voice-chat/text_loop.py` — console input, zero pip dependencies (stdlib only).
 - `voice-chat/voice_loop.py` — real microphone input via Silero VAD, with real barge-in: the instant it detects you starting to speak, it cuts playback and cancels any in-flight Voicebox synthesis.
 
-Both require a local Voicebox instance reachable at `http://127.0.0.1:17493` (or `VOICEBOX_URL`) for TTS/STT; `voice_loop.py` additionally needs `pip install -r voice-chat/requirements.txt` (`sounddevice`, `silero-vad`, `numpy`).
+Both use a local Voicebox at `http://127.0.0.1:17493` (or `VOICEBOX_URL`) for TTS/STT, started headless through the MCP server if it is not running; they refuse to open the mic if another voice's model is pinned (`--soltar-pin` releases it); `voice_loop.py` additionally needs `pip install -r voice-chat/requirements.txt` (`sounddevice`, `silero-vad`, `numpy`).
 
 ```bash
 # Console-only, zero extra dependencies

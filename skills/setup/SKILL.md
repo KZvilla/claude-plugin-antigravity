@@ -71,10 +71,19 @@ From `agy_status`. If the binary is missing or unauthenticated:
 
 ### Track B — Voicebox (local TTS)
 
-From `agy_narrate_voices`. If unreachable, Voicebox is simply not running —
-it is a separate desktop app, not something this plugin installs. Ask them to
-start it, then re-check. If it reports profiles, the track is done; offer
-`/lagrange:voices` to see them and `/lagrange:narrate` to try one.
+From `agy_narrate_voices`. Voicebox is a separate desktop app the plugin does
+not install, but on Windows it does **not** need to stay open: when a voice
+tool finds it down, the plugin starts its server headless on its own. What it
+needs is the app installed and opened **once**, so it downloads the CUDA
+backend and the voice models. If `agy_narrate_voices` reports that no server
+binary was found, that first run is what is missing; if it warns that Voicebox
+runs on CPU, the CUDA backend is. If it reports profiles, the track is done;
+offer `/lagrange:voices` to see them and `/lagrange:narrate` to try one.
+
+GPU memory: `agy_voice_model` (`status`, `pin`, `release`, `unload`) and
+`keep_model: true` on the narration tools keep a voice's model loaded; unpinned
+models are freed after `voicebox_idle_unload_minutes`. While Voicebox runs, the
+statusline shows a Voicebox/VRAM line (`statusline_voicebox: false` hides it).
 
 Non-default port: `voicebox_url` / `voicebox_port` on the narration tools, or
 persist it with `agy_set_config`.
