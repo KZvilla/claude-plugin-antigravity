@@ -3463,7 +3463,7 @@ async function handleToolCall(name, args) {
         // caller gets TTS-ready sentences. The chunker is flushed on turn completion
         // (short replies like "OK") and when a tool step starts, so a spoken
         // heads-up before a web search is not held until the search ends.
-        const { sentences, deltas, herramientas, resultEvent } = procesarEventosDrain(events, session.chunker, session.drainEstado || (session.drainEstado = {}));
+        const { sentences, deltas, herramientas, detalles, resultEvent } = procesarEventosDrain(events, session.chunker, session.drainEstado || (session.drainEstado = {}));
 
         return {
           content: [{
@@ -3476,6 +3476,7 @@ async function handleToolCall(name, args) {
               sentences,
               deltas,
               herramientas,
+              detalles,
               result: resultEvent ? resultEvent.result : null,
               raw_event_count: events.length
             }, null, 2)

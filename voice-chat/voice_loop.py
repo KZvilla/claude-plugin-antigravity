@@ -51,7 +51,7 @@ from common import (  # noqa: E402
     resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
     get_model_status, resolve_engine_and_model, tts_model_name, unload_model, stt_full_model_name,
     unload_all_loaded_models, LatidoUso, activar_motor_chat,
-    Senales, TiemposTurno, decidir_senal, clave_de_herramienta
+    Senales, TiemposTurno, decidir_senal, clave_de_paso
 )
 
 SAMPLE_RATE = 16000
@@ -369,10 +369,12 @@ def main():
                     turn_complete = drain["turn_complete"]
                     if drain.get("deltas"):
                         tiempos.marcar("primer_texto")
-                    for h in drain.get("herramientas") or []:
+                    # `detalles` trae el servidor MCP; un MCP viejo solo trae nombres.
+                    for paso in drain.get("detalles") or drain.get("herramientas") or []:
                         tiempos.marcar("herramienta")
-                        if clave_de_herramienta(h) != ultima_clave:
-                            pendiente = h
+                        clave_paso = clave_de_paso(paso)
+                        if clave_paso != ultima_clave:
+                            pendiente = clave_paso
                     if senales:
                         ahora = time.monotonic()
                         clave = decidir_senal(

@@ -7,6 +7,7 @@ reproductor local en cola FIFO. Sin dependencias pip - solo stdlib.
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -610,12 +611,18 @@ class SentenceSequencer:
 # no se editan archivos, y cada clave extra es GPU al arrancar con la cache
 # fria. "archivos" se sumo a pedido del usuario: aparece en busquedas reales,
 # cuando agy lee lo que descargo.
-ORDEN_SENALES = ["pensando", "web", "pagina", "archivos", "herramienta"]
+# navegador/memoria/agenda: por el servidor MCP que informa drain
+# (plan-senales-mcp). "navegador" va alto: es el caso agentico del usuario.
+ORDEN_SENALES = ["pensando", "web", "navegador", "pagina", "archivos", "memoria", "agenda", "herramienta"]
 FRASES_SENAL = {
-    "es": {"pensando": "Pensando.", "web": "Buscando en la web.", "pagina": "Leyendo la página.",
-           "archivos": "Revisando archivos.", "herramienta": "Usando una herramienta."},
-    "en": {"pensando": "Thinking.", "web": "Searching the web.", "pagina": "Reading the page.",
-           "archivos": "Looking through files.", "herramienta": "Using a tool."},
+    "es": {"pensando": "Pensando.", "web": "Buscando en la web.", "navegador": "Usando el navegador.",
+           "pagina": "Leyendo la página.", "archivos": "Revisando archivos.",
+           "memoria": "Consultando la memoria.", "agenda": "Revisando la agenda.",
+           "herramienta": "Usando una herramienta."},
+    "en": {"pensando": "Thinking.", "web": "Searching the web.", "navegador": "Using the browser.",
+           "pagina": "Reading the page.", "archivos": "Looking through files.",
+           "memoria": "Checking memory.", "agenda": "Checking the calendar.",
+           "herramienta": "Using a tool."},
 }
 # Inventario de agy observado (mcp-server/agents/registry.js); el resto cae en "herramienta".
 CATEGORIA_HERRAMIENTA = {
@@ -641,6 +648,36 @@ def _borrar_resultado(future):
 
 def clave_de_herramienta(nombre):
     return CATEGORIA_HERRAMIENTA.get(nombre or "", "herramienta")
+
+
+# Tokens exactos del nombre del servidor, no substrings (auditoria del plan):
+# "file-browser" no es un navegador y "task-scheduler" no es una agenda.
+TOKENS_SERVIDOR = {
+    "navegador": {"playwright", "puppeteer", "chrome", "chromium"},
+    "memoria": {"memory", "memoria", "mem0"},
+    "agenda": {"calendar", "agenda", "schedule"},
+}
+
+
+def clave_de_servidor(servidor):
+    if not isinstance(servidor, str) or not servidor.strip():
+        return None
+    tokens = set(re.split(r"[^a-z0-9]+", servidor.lower()))
+    for clave, nombres in TOKENS_SERVIDOR.items():
+        if tokens & nombres:
+            return clave
+    return None
+
+
+def clave_de_paso(paso):
+    """Clave de senal de un paso de drain: un detalle {nombre, servidor,
+    accion} o, de un MCP viejo, solo el nombre de la herramienta."""
+    if isinstance(paso, dict):
+        nombre = paso.get("nombre")
+        if nombre == "call_mcp_tool":
+            return clave_de_servidor(paso.get("servidor")) or "herramienta"
+        return clave_de_herramienta(nombre)
+    return clave_de_herramienta(paso)
 
 
 def _slug(texto):
@@ -719,7 +756,7 @@ class Senales:
         self._parar.set()
 
 
-def decidir_senal(hubo_texto, reproduciendo, vigente, herramienta, ultima_clave, desde_ultima_ms,
+def decidir_senal(hubo_texto, reproduciendo, vigente, clave_pendiente, ultima_clave, desde_ultima_ms,
                   transcurrido_ms, umbral_ms, sonaron=0,
                   separacion_ms=SEPARACION_SENALES_MS, maximo=MAX_SENALES_TURNO,
                   separacion_tras_pensando_ms=SEPARACION_TRAS_PENSANDO_MS):
@@ -731,8 +768,10 @@ def decidir_senal(hubo_texto, reproduciendo, vigente, herramienta, ultima_clave,
     la quinta ya le sonaba a disco rayado."""
     if umbral_ms <= 0 or hubo_texto or reproduciendo or not vigente or sonaron >= maximo:
         return None
-    if herramienta:
-        clave = clave_de_herramienta(herramienta)
+    # clave_pendiente ya es una clave de senal (clave_de_paso en el loop): no
+    # se vuelve a mapear, o "navegador" caeria en "herramienta" (auditoria).
+    if clave_pendiente:
+        clave = clave_pendiente
         if clave == ultima_clave:
             return None
         separacion = separacion_tras_pensando_ms if ultima_clave == "pensando" else separacion_ms

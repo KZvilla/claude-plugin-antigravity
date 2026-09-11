@@ -30,6 +30,9 @@ function procesarEventosDrain(events, chunker, estado = {}) {
   let sentences = [];
   const deltas = [];
   const herramientas = [];
+  // Un detalle por paso nuevo: agy expone el servidor MCP en
+  // tool_info.parameters.ServerName (captura cruda, plan-senales-mcp).
+  const detalles = [];
   if (!(estado.pasosVistos instanceof Set)) estado.pasosVistos = new Set();
   const pasosVistos = estado.pasosVistos;
   let resultEvent = null;
@@ -45,7 +48,14 @@ function procesarEventosDrain(events, chunker, estado = {}) {
         if (clave === null || !pasosVistos.has(clave)) {
           if (clave !== null) pasosVistos.add(clave);
           sentences = sentences.concat(chunker.flush());
-          herramientas.push(s.tool_name || (s.tool_info && s.tool_info.name) || 'tool');
+          const nombre = s.tool_name || s.tool_info?.name || 'tool';
+          herramientas.push(nombre);
+          const params = s.tool_info?.parameters;
+          detalles.push({
+            nombre,
+            servidor: typeof params?.ServerName === 'string' ? params.ServerName : null,
+            accion: typeof params?.ToolName === 'string' ? params.ToolName : null
+          });
         }
       }
     } else if (e.event === 'result' && !resultEvent) {
@@ -57,7 +67,7 @@ function procesarEventosDrain(events, chunker, estado = {}) {
     pasosVistos.clear();
   }
 
-  return { sentences, deltas, herramientas, resultEvent };
+  return { sentences, deltas, herramientas, detalles, resultEvent };
 }
 
 module.exports = { PRIMING_CHARLA, procesarEventosDrain };

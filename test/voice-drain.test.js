@@ -31,6 +31,24 @@ async function main() {
     check('la respuesta llega después', JSON.stringify(r2.sentences) === JSON.stringify(['Encontré tres noticias sobre eso.']));
   });
 
+  await group('detalle del paso: servidor MCP (plan-senales-mcp)', () => {
+    // Forma real capturada de agy (2026-09-11).
+    const mcp = (i, state, extra = {}) => ({ event: 'step_update', step_update: {
+      step_index: i, state, step_type: 'tool', tool_name: 'call_mcp_tool',
+      tool_info: { name: 'call_mcp_tool', parameters: { Arguments: { url: 'https://example.com' }, ServerName: 'playwright', ToolName: 'browser_navigate' }, ...extra }
+    } });
+    const estado = {};
+    const r = procesarEventosDrain([mcp(13, 'ACTIVE')], new SentenceChunker(), estado);
+    check('detalle con servidor y acción', JSON.stringify(r.detalles) === JSON.stringify([{ nombre: 'call_mcp_tool', servidor: 'playwright', accion: 'browser_navigate' }]), JSON.stringify(r.detalles));
+    check('herramientas no cambia', JSON.stringify(r.herramientas) === '["call_mcp_tool"]');
+    const r2 = procesarEventosDrain([mcp(13, 'DONE'), mcp(13, 'ERROR', { error: { type: 'TOOL_ERROR' } })], new SentenceChunker(), estado);
+    check('DONE y ERROR del mismo paso no se repiten', r2.detalles.length === 0, JSON.stringify(r2.detalles));
+    const r3 = procesarEventosDrain([tool('search_web', 1)], new SentenceChunker());
+    check('sin tool_info: servidor y acción en null', JSON.stringify(r3.detalles) === JSON.stringify([{ nombre: 'search_web', servidor: null, accion: null }]), JSON.stringify(r3.detalles));
+    const r4 = procesarEventosDrain([{ event: 'step_update', step_update: { step_index: 4, step_type: 'tool', tool_name: 'call_mcp_tool', tool_info: { error: { type: 'TOOL_ERROR' } } } }], new SentenceChunker());
+    check('tool_info sin parameters no rompe', r4.detalles.length === 1 && r4.detalles[0].servidor === null);
+  });
+
   await group('ignora el eco y lo que no es texto del agente', () => {
     const r = procesarEventosDrain([{ event: 'step_update', step_update: { step_type: 'user_input', text_delta: 'ECO' } }, result], new SentenceChunker());
     check('sin oraciones', r.sentences.length === 0, JSON.stringify(r.sentences));

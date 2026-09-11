@@ -30,7 +30,7 @@ from common import (  # noqa: E402
     resolve_voice_profile, synthesize_sentence, voicebox_cancel,
     get_model_status, resolve_engine_and_model, unload_all_loaded_models,
     LatidoUso, tts_model_name, activar_motor_chat,
-    Senales, TiemposTurno, decidir_senal, clave_de_herramienta
+    Senales, TiemposTurno, decidir_senal, clave_de_paso
 )
 
 
@@ -167,10 +167,11 @@ def main():
                     turn_complete = drain["turn_complete"]
                     if drain.get("deltas"):
                         tiempos.marcar("primer_texto")
-                    for h in drain.get("herramientas") or []:
+                    for paso in drain.get("detalles") or drain.get("herramientas") or []:
                         tiempos.marcar("herramienta")
-                        if clave_de_herramienta(h) != ultima_clave:
-                            pendiente = h
+                        clave_paso = clave_de_paso(paso)
+                        if clave_paso != ultima_clave:
+                            pendiente = clave_paso
                     if senales:
                         ahora = time.monotonic()
                         clave = decidir_senal(

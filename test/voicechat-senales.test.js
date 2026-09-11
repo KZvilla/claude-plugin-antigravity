@@ -69,10 +69,27 @@ r["mapeo"] = [common.clave_de_herramienta(x) for x in
                "call_mcp_tool", None]]
 
 def d(**kw):
-    base = dict(hubo_texto=False, reproduciendo=False, vigente=True, herramienta=None, ultima_clave=None,
+    # Los casos se escriben con nombres de herramienta; decidir_senal recibe la
+    # clave ya calculada, como en los loops (clave_de_paso).
+    if "herramienta" in kw:
+        kw["clave_pendiente"] = common.clave_de_herramienta(kw.pop("herramienta"))
+    base = dict(hubo_texto=False, reproduciendo=False, vigente=True, clave_pendiente=None, ultima_clave=None,
                 desde_ultima_ms=0, transcurrido_ms=0, umbral_ms=2500, sonaron=0)
     base.update(kw)
     return common.decidir_senal(**base)
+
+r["pasos"] = [common.clave_de_paso(x) for x in [
+    {"nombre": "call_mcp_tool", "servidor": "playwright", "accion": "browser_navigate"},
+    {"nombre": "call_mcp_tool", "servidor": "mcp-memory", "accion": "search"},
+    {"nombre": "call_mcp_tool", "servidor": "schedule-x", "accion": "list"},
+    {"nombre": "call_mcp_tool", "servidor": "file-browser", "accion": "ls"},
+    {"nombre": "call_mcp_tool", "servidor": "task-scheduler", "accion": "run"},
+    {"nombre": "call_mcp_tool", "servidor": None, "accion": None},
+    {"nombre": "call_mcp_tool", "servidor": 123, "accion": None},
+    {"nombre": "search_web", "servidor": None, "accion": None},
+    "view_file",
+]]
+r["navegador_suena"] = d(clave_pendiente="navegador") == "navegador"
 
 r["decision"] = [
     d(herramienta="search_web"),
@@ -175,6 +192,9 @@ async function main() {
       check('cada marca se toma una vez', x.marca_una_vez);
       check('línea de tiempos', x.linea === '⏱ transcripción 0.7 s · primer texto 5.9 s', x.linea);
       check('barge_in no borra señales', x.barge_in_respeta_borrar);
+      check('clave_de_paso por servidor MCP (tokens exactos)', JSON.stringify(x.pasos) === JSON.stringify(
+        ['navegador', 'memoria', 'agenda', 'herramienta', 'herramienta', 'herramienta', 'herramienta', 'web', 'archivos']), JSON.stringify(x.pasos));
+      check('una clave de servidor llega intacta a decidir_senal', x.navegador_suena);
       check('descarta y borra el audio de un turno cortado', x.descarta_turno_cortado);
       check('una síntesis vieja en curso no traba al turno nuevo', x.no_traba_turno_nuevo);
       check('y su audio se borra al terminar', x.borra_la_tardia);
