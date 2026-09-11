@@ -7,6 +7,7 @@ reproductor local en cola FIFO. Sin dependencias pip - solo stdlib.
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -503,8 +504,10 @@ class AudioPlayer:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def enqueue(self, wav_path, label):
-        self._queue.put((wav_path, label))
+    def enqueue(self, wav_path, label, borrar=True, al_empezar=None):
+        # borrar=False para las senales: viven en una cache entre sesiones.
+        # al_empezar se llama justo antes de reproducir (medicion por turno).
+        self._queue.put((wav_path, label, borrar, al_empezar))
 
     def is_active(self):
         with self._lock:
@@ -513,9 +516,14 @@ class AudioPlayer:
 
     def _run(self):
         while True:
-            wav_path, label = self._queue.get()
+            wav_path, label, borrar, al_empezar = self._queue.get()
             if wav_path is None:
                 return
+            if al_empezar:
+                try:
+                    al_empezar()
+                except Exception:
+                    pass
             escaped = wav_path.replace("'", "''")
             ps_cmd = f"& {{ $p = '{escaped}'; (New-Object System.Media.SoundPlayer $p).PlaySync() }}"
             with self._lock:
@@ -527,14 +535,16 @@ class AudioPlayer:
             self._current_proc.wait()
             with self._lock:
                 self._current_proc = None
-            _delete_generation(wav_path)
+            if borrar:
+                _delete_generation(wav_path)
 
     def barge_in(self):
         dropped = 0
         while True:
             try:
-                wav_path, _ = self._queue.get_nowait()
-                _delete_generation(wav_path)
+                wav_path, _, borrar, _ = self._queue.get_nowait()
+                if borrar:
+                    _delete_generation(wav_path)
                 dropped += 1
             except queue.Empty:
                 break
@@ -558,19 +568,216 @@ class SentenceSequencer:
         self._last_generation_id = last_generation_id
         threading.Thread(target=self._run, daemon=True).start()
 
-    def submit(self, future, text):
-        self._queue.put((future, text))
+    def submit(self, future, text, al_empezar=None, vigente=None):
+        # vigente(): False si el turno de esta oracion ya fue cortado. La
+        # sintesis no se puede cancelar, pero su audio no debe sonar despues
+        # del corte (visto en vivo: una oracion vieja tras el barge-in).
+        self._queue.put((future, text, al_empezar, vigente))
 
     def _run(self):
         while True:
             item = self._queue.get()
             if item is None:
                 return
-            future, text = item
+            future, text, al_empezar, vigente = item
+            if vigente is not None and not vigente():
+                # No esperar una sintesis de un turno cortado: trabaria al turno
+                # nuevo detras (auditoria del plan v2). Si todavia no empezo se
+                # cancela; si ya corre, su .wav se borra cuando termine.
+                if not future.cancel():
+                    future.add_done_callback(_borrar_resultado)
+                print(f"  ✋ Descartada (turno cortado): {text[:40]!r}")
+                continue
             try:
                 gen_id, wav_path = future.result()
+                if vigente is not None and not vigente():
+                    _delete_generation(wav_path)
+                    print(f"  ✋ Descartada (turno cortado): {text[:40]!r}")
+                    continue
                 print(f"  [debug] enqueue gen_id={gen_id} wav={os.path.basename(wav_path)} text={text[:40]!r}")
                 self._last_generation_id["id"] = gen_id
-                self._player.enqueue(wav_path, text)
+                self._player.enqueue(wav_path, text, al_empezar=al_empezar)
             except Exception as err:
                 print(f"  ⚠️ Error sintetizando \"{text}\": {err}")
+
+
+# Senales (plan-charla-latencia, v2 H): frases cortas pregrabadas con la voz
+# de la charla, que dicen que agy sigue trabajando y, si la hay, que
+# herramienta usa. Una clave por categoria; el orden es la prioridad de
+# generacion. Sin puntos suspensivos ni exclamaciones: con Qwen, la
+# puntuacion forzada hizo alucinar la voz (evaluacion del 2026-09-11).
+# Pocas claves y no una por herramienta (auditoria del plan v2): en la charla
+# no se editan archivos, y cada clave extra es GPU al arrancar con la cache
+# fria. "archivos" se sumo a pedido del usuario: aparece en busquedas reales,
+# cuando agy lee lo que descargo.
+ORDEN_SENALES = ["pensando", "web", "pagina", "archivos", "herramienta"]
+FRASES_SENAL = {
+    "es": {"pensando": "Pensando.", "web": "Buscando en la web.", "pagina": "Leyendo la página.",
+           "archivos": "Revisando archivos.", "herramienta": "Usando una herramienta."},
+    "en": {"pensando": "Thinking.", "web": "Searching the web.", "pagina": "Reading the page.",
+           "archivos": "Looking through files.", "herramienta": "Using a tool."},
+}
+# Inventario de agy observado (mcp-server/agents/registry.js); el resto cae en "herramienta".
+CATEGORIA_HERRAMIENTA = {
+    "search_web": "web",
+    "read_url_content": "pagina",
+    "view_file": "archivos", "list_dir": "archivos", "grep_search": "archivos", "find_by_name": "archivos",
+}
+SENALES_DIR = os.path.join(STATE_DIR, "senales")
+SEPARACION_SENALES_MS = 8000
+# Tras "Pensando", nombrar la herramienta no espera los 8 s: es informacion nueva.
+SEPARACION_TRAS_PENSANDO_MS = 3000
+MAX_SENALES_TURNO = 3
+
+
+def _borrar_resultado(future):
+    """Callback para una sintesis descartada que ya estaba en curso."""
+    try:
+        _, wav_path = future.result()
+        _delete_generation(wav_path)
+    except Exception:
+        pass
+
+
+def clave_de_herramienta(nombre):
+    return CATEGORIA_HERRAMIENTA.get(nombre or "", "herramienta")
+
+
+def _slug(texto):
+    return "".join(c if (c.isalnum() or c in "_.-") else "_" for c in (texto or ""))
+
+
+class Senales:
+    """Genera en segundo plano las senales de una voz, en orden de prioridad,
+    y las guarda en una cache entre sesiones (SENALES_DIR). Una muestra de voz
+    mas nueva que el .wav invalida la cache. Si algo falla, la charla sigue
+    sin esa senal."""
+
+    def __init__(self, profile, language, engine, model_size, proveedor, muestra,
+                 sintetizar=None, ocupado=None, directorio=None, arrancar=True):
+        self._sintetizar = sintetizar or synthesize_sentence
+        self._ocupado = ocupado or (lambda: False)
+        self._args = (profile, language, engine, model_size, proveedor, muestra)
+        frases = FRASES_SENAL.get(language) or FRASES_SENAL["en"]
+        base = f"{_slug(profile['name'])}-{language}-{proveedor}"
+        if proveedor != "omnivoice":
+            base += f"-{_slug(tts_model_name(engine, model_size))}"
+        carpeta = directorio or SENALES_DIR
+        self._items = [(clave, frases[clave], os.path.join(carpeta, f"{base}-{clave}.wav"))
+                       for clave in ORDEN_SENALES]
+        try:
+            self._mtime_muestra = os.path.getmtime(muestra["audio_path"]) if muestra else None
+        except OSError:
+            self._mtime_muestra = None
+        self._listas = {}
+        self._lock = threading.Lock()
+        self._parar = threading.Event()
+        self._hilo = threading.Thread(target=self._generar, daemon=True)
+        if arrancar:
+            self._hilo.start()
+
+    def _vigente(self, ruta):
+        try:
+            return os.path.getsize(ruta) > 0 and (
+                self._mtime_muestra is None or os.path.getmtime(ruta) >= self._mtime_muestra)
+        except OSError:
+            return False
+
+    def _generar(self):
+        try:
+            os.makedirs(os.path.dirname(self._items[0][2]), exist_ok=True)
+        except OSError:
+            return
+        for clave, frase, ruta in self._items:
+            if self._parar.is_set():
+                return
+            if not self._vigente(ruta):
+                # Prioridad baja: no competir por la GPU con la respuesta en curso.
+                while self._ocupado() and not self._parar.is_set():
+                    self._parar.wait(0.2)
+                if self._parar.is_set():
+                    return
+                try:
+                    _, wav = self._sintetizar(frase, *self._args)
+                    shutil.copyfile(wav, ruta)
+                    _delete_generation(wav)
+                except Exception as err:
+                    print(f"  ⚠️ Señal \"{frase}\" no se pudo generar: {err}")
+                    continue
+            with self._lock:
+                self._listas[clave] = ruta
+
+    def esperar(self, timeout=None):
+        self._hilo.join(timeout)
+
+    def elegir(self, clave):
+        """Ruta de la senal pedida; None si todavia no esta lista."""
+        with self._lock:
+            return self._listas.get(clave)
+
+    def stop(self):
+        self._parar.set()
+
+
+def decidir_senal(hubo_texto, reproduciendo, vigente, herramienta, ultima_clave, desde_ultima_ms,
+                  transcurrido_ms, umbral_ms, sonaron=0,
+                  separacion_ms=SEPARACION_SENALES_MS, maximo=MAX_SENALES_TURNO,
+                  separacion_tras_pensando_ms=SEPARACION_TRAS_PENSANDO_MS):
+    """Que senal suena ahora, o None. Nunca con texto de la respuesta, audio
+    sonando, turno cortado o umbral <= 0. La primera herramienta del turno
+    suena ya; otra categoria, solo con separacion_ms desde la anterior; la
+    misma categoria no se repite. "pensando" una sola vez, si no hubo
+    herramienta ni texto en umbral_ms. Tope de `maximo` por turno: al usuario
+    la quinta ya le sonaba a disco rayado."""
+    if umbral_ms <= 0 or hubo_texto or reproduciendo or not vigente or sonaron >= maximo:
+        return None
+    if herramienta:
+        clave = clave_de_herramienta(herramienta)
+        if clave == ultima_clave:
+            return None
+        separacion = separacion_tras_pensando_ms if ultima_clave == "pensando" else separacion_ms
+        if ultima_clave is None or desde_ultima_ms >= separacion:
+            return clave
+        return None
+    if ultima_clave is None and transcurrido_ms >= umbral_ms:
+        return "pensando"
+    return None
+
+
+class TiemposTurno:
+    """Medicion por turno (plan-charla-latencia, E). Cada marca se toma una sola
+    vez; t0 es el fin de lo que dijo el usuario (VAD) o el Enter."""
+
+    ETIQUETAS = [("transcripcion", "transcripción"), ("envio", "envío"), ("herramienta", "herramienta"),
+                 ("senal", "señal"), ("primer_texto", "primer texto"),
+                 ("primera_oracion", "primera oración"), ("primer_audio", "primer audio")]
+
+    def __init__(self, t0=None, reloj=time.monotonic):
+        self._reloj = reloj
+        self.t0 = t0 if t0 is not None else reloj()
+        self._marcas = {}
+        self._impresa = False
+        self._lock = threading.Lock()
+
+    def marcar(self, nombre):
+        with self._lock:
+            if nombre in self._marcas:
+                return False
+            self._marcas[nombre] = self._reloj() - self.t0
+            return True
+
+    def marca(self, nombre):
+        with self._lock:
+            return self._marcas.get(nombre)
+
+    def linea(self):
+        with self._lock:
+            partes = [f"{etq} {self._marcas[k]:.1f} s" for k, etq in self.ETIQUETAS if k in self._marcas]
+        return "⏱ " + " · ".join(partes) if partes else "⏱ sin marcas"
+
+    def imprimir_una_vez(self):
+        with self._lock:
+            if self._impresa:
+                return
+            self._impresa = True
+        print(f"  {self.linea()}")
