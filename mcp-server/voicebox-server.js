@@ -44,6 +44,14 @@ const VENTANA_EN_USO_MS = 30000;
 const INTERVALO_TOQUE_MS = 10000;
 const MARGEN_VRAM = 1.2;
 const ESTADO_FRESCO_MS = 30000;
+// Una generación que figura «en curso» hace más que esto se considera colgada
+// y no cuenta como uso presente: si no, una tarea muerta en Voicebox dejaba al
+// keeper sin descargar ni apagar nunca. Las reales tardan 5-90 s.
+const GENERACION_TTL_MS = 5 * 60 * 1000;
+// Una fecha hasta 60 s en el futuro sigue siendo «fresca» (reloj desfasado);
+// más allá, se descarta en vez de contar como en curso para siempre.
+const DESFASE_RELOJ_MS = 60 * 1000;
+const ESTADOS_FINALES = new Set(['completed', 'failed', 'error', 'cancelled', 'canceled']);
 
 const RUTA_KEEPER = path.join(__dirname, 'voicebox-keeper.js');
 
@@ -352,13 +360,64 @@ function modelosADescargar({ cargados, objetivo, usos = {}, ahora = Date.now(), 
  * de un /generate que solo registra el TTS.
  */
 function usosEfectivos({ cargados, usos = {}, vistoDesde = {} }) {
-  const global = Math.max(0, ...Object.values(usos));
+  // Un solo NaN en Math.max contamina todo y el keeper deja de descargar.
+  const finito = (v) => (Number.isFinite(v) ? v : 0);
+  const global = Math.max(0, ...Object.values(usos).filter(Number.isFinite));
   const efectivos = {};
   for (const n of cargados) {
-    const propio = Math.max(usos[n] || 0, vistoDesde[n] || 0);
+    const propio = Math.max(finito(usos[n]), finito(vistoDesde[n]));
     efectivos[n] = esModeloTts(n) ? propio : Math.max(propio, global);
   }
   return efectivos;
+}
+
+/**
+ * Fechas de Voicebox: ISO sin zona horaria, en UTC. Sin la `Z`, Node las
+ * interpreta como hora local (con UTC−3, tres horas en el futuro). Devuelve
+ * null si no es una fecha válida: nunca NaN.
+ */
+function fechaVoicebox(s) {
+  if (typeof s !== 'string' || !s.trim()) return null;
+  const t = s.trim();
+  const ms = Date.parse(/(Z|[+-]\d{2}:?\d{2})$/i.test(t) ? t : `${t}Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function esFresca(ts, ahora) {
+  if (!Number.isFinite(ts)) return false;
+  const delta = ahora - ts;
+  return delta > -DESFASE_RELOJ_MS && delta < GENERACION_TTL_MS;
+}
+
+/** ¿Hay en Voicebox alguna generación en curso que no esté colgada? */
+function hayGeneracionFresca(activas, ahora = Date.now()) {
+  return (activas || []).some(g => esFresca(fechaVoicebox(g && g.started_at), ahora));
+}
+
+/**
+ * Uso de Voicebox por clientes que no pasan por el plugin (la GUI, scripts):
+ * sale de /history (motor y tamaño de cada generación) y de /tasks/active.
+ * Sin esto, el keeper descargó un modelo a mitad de una generación ajena.
+ */
+function usosDesdeVoicebox({ historial = [], activas = [], cargados = [], ahora = Date.now() }) {
+  const usos = {};
+  const marcar = (modelo, ms) => {
+    if (modelo && Number.isFinite(ms) && ms > (usos[modelo] || 0)) usos[modelo] = ms;
+  };
+  for (const item of historial || []) {
+    if (!item || !item.engine) continue;
+    const creada = fechaVoicebox(item.created_at);
+    if (creada === null) continue;
+    // Una generación que sigue en curso cuenta como uso ahora; una huérfana (más
+    // vieja que el TTL) cuenta solo desde que se creó. «En curso» es cualquier
+    // estado no final: Voicebox también reporta `loading_model` (visto en vivo),
+    // no solo `generating`.
+    const enCurso = !ESTADOS_FINALES.has(String(item.status || '').toLowerCase()) && esFresca(creada, ahora);
+    marcar(ttsModelName(item.engine, item.model_size), enCurso ? ahora : Math.min(creada, ahora));
+  }
+  // Una generación en curso no dice con qué modelo trabaja: se protegen todos.
+  if (hayGeneracionFresca(activas, ahora)) for (const n of cargados) marcar(n, ahora);
+  return usos;
 }
 
 function decidirAccionKeeper({ pinModel = null, cargados = [], usos = {}, ahora = Date.now(), idleUnloadMs, idleShutdownMs, ownsServer, ultimoUso = 0, fallosSeguidos = 0 }) {
@@ -435,6 +494,30 @@ async function estadoModelos(baseUrl) {
   if (r.status < 200 || r.status >= 300) throw new Error(`/models/status devolvió HTTP ${r.status}`);
   const datos = JSON.parse(r.body);
   return Array.isArray(datos.models) ? datos.models : [];
+}
+
+/** Generaciones en curso de cualquier cliente; [] si Voicebox no responde. */
+async function generacionesActivas(baseUrl) {
+  try {
+    const r = await pedir(`${baseUrl}/tasks/active`, { timeout: 3000 });
+    if (r.status < 200 || r.status >= 300) return [];
+    const d = JSON.parse(r.body);
+    return Array.isArray(d.generations) ? d.generations : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Últimas generaciones (terminadas o en curso) de cualquier cliente; [] si falla. */
+async function historialReciente(baseUrl, limit = 20) {
+  try {
+    const r = await pedir(`${baseUrl}/history?limit=${limit}`, { timeout: 3000 });
+    if (r.status < 200 || r.status >= 300) return [];
+    const d = JSON.parse(r.body);
+    return Array.isArray(d.items) ? d.items : [];
+  } catch {
+    return [];
+  }
 }
 
 async function descargarModelo(baseUrl, nombre) {
@@ -628,7 +711,11 @@ async function aplicarModeloActivo(baseUrl, { engine, modelSize = null, voz = nu
   const porNombre = Object.fromEntries(modelos.map(m => [m.model_name, m]));
   const cargados = modelos.filter(m => m.loaded).map(m => m.model_name);
   const protegido = fijar ? null : (pin && pin.model);
-  const aDescargar = modelosADescargar({ cargados, objetivo, usos: leerUsos(env), ahora, protegido });
+  const candidatos = modelosADescargar({ cargados, objetivo, usos: leerUsos(env), ahora, protegido });
+  // Con una generación en curso en Voicebox (de cualquier cliente, incluso
+  // otra sesión del plugin) no se descarga nada: podría ser el modelo que usa.
+  const enCurso = hayGeneracionFresca(await (deps.generacionesActivas || generacionesActivas)(baseUrl), ahora);
+  const aDescargar = enCurso ? [] : candidatos;
   const postergados = cargados.filter(n => esModeloTts(n) && n !== objetivo && !aDescargar.includes(n));
 
   const yaCargado = cargados.includes(objetivo);
@@ -640,6 +727,13 @@ async function aplicarModeloActivo(baseUrl, { engine, modelSize = null, voz = nu
       const libera = aDescargar.reduce((s, n) => s + ((porNombre[n] && porNombre[n].size_mb) || 0), 0);
       const necesita = tam * MARGEN_VRAM;
       if (vram.libreMb + libera < necesita) {
+        if (enCurso && candidatos.length) {
+          return {
+            ok: false,
+            objetivo,
+            error: `Hay una generación en curso en Voicebox (otro cliente); no se puede liberar VRAM para ${objetivo} ahora. Reintentá en unos segundos.`
+          };
+        }
         return {
           ok: false,
           objetivo,
@@ -723,5 +817,12 @@ module.exports = {
   lanzarKeeper,
   ensureVoicebox,
   aplicarModeloActivo,
-  mensajeConflictoPin
+  mensajeConflictoPin,
+  GENERACION_TTL_MS,
+  fechaVoicebox,
+  esFresca,
+  hayGeneracionFresca,
+  usosDesdeVoicebox,
+  generacionesActivas,
+  historialReciente
 };

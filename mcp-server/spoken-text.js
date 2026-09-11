@@ -131,10 +131,46 @@ ${String(rawText).slice(0, 12000)}
 - Output ONLY the final spoken text. No preamble, no quotes, no explanation.`;
 }
 
+/**
+ * Prompt de la reescritura en persona (`personality: true` sin `polish`).
+ *
+ * Existe porque la persona la aplicaba el LLM de Voicebox (Qwen3 0.6B) y ahora
+ * la aplica agy, que es más capaz y la aplica igual con cualquier motor de voz.
+ * No reusa getPolishPrompt porque ese condensa a 3 frases: aquí el texto se
+ * dice completo, solo cambia el tono.
+ */
+function getPersonaPrompt(rawText, targetLang, profile) {
+  const langName = targetLang === 'en' ? 'English' : 'Spanish';
+  const langCode = targetLang === 'en' ? 'en' : 'es';
+  const p = profile || {};
+
+  return `You are preparing a message to be spoken aloud by a text-to-speech voice (profile: ${p.name || 'Voice Assistant'}).
+Rewrite the message below in the voice of this speaker persona, as natural spoken ${langName} (${langCode}).
+
+## Speaker Persona (Derived from Voicebox Profile):
+- Name: "${p.name || 'Voice Assistant'}"
+- Description: "${p.description || 'Voice Assistant'}"
+- Personality Prompt: "${p.personality || 'Natural and expressive'}"
+
+## Message to rewrite:
+"""
+${String(rawText).slice(0, 12000)}
+"""
+
+## Critical Rules:
+- REWRITE ONLY. Do not add facts, numbers, names, conclusions or opinions that are not in the message above. If the message is vague, keep it vague.
+- Keep ALL of the content and roughly the same length: change the tone, cadence and wording, never what the message says.
+- Language MUST be ${langName}.
+- Write for the ear: no markdown, no bullet points, no code, no URLs, no file paths, no emoji. Spell out symbols and abbreviations the way a person would say them.
+- Never invent a status. If the message does not say whether something succeeded, do not claim it did.
+- Output ONLY the final spoken text. No preamble, no quotes, no explanation.`;
+}
+
 module.exports = {
   SPOKEN_TEXT_LIMIT,
   POLISH_SUGGESTED_OVER,
   redactSecrets,
   normalizeSpokenText,
-  getPolishPrompt
+  getPolishPrompt,
+  getPersonaPrompt
 };

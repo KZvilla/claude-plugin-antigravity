@@ -15,7 +15,8 @@ const os = require('node:os');
 const {
   POLISH_SUGGESTED_OVER,
   normalizeSpokenText,
-  getPolishPrompt
+  getPolishPrompt,
+  getPersonaPrompt
 } = require('./spoken-text.js');
 const { extractLastCheckpoint } = require('./checkpoint.js');
 const { preprocessSessionLog, renderFacts, renderFinalState } = require('./session-log.js');
@@ -1013,6 +1014,10 @@ const TOOLS = [
           type: 'boolean',
           description: 'Speak a short digest of the summary aloud (Voicebox, and Telegram if configured). The digest is produced in the SAME call that writes the document, so it costs no extra model round-trip and is written by something that just read the whole session. Do not try to get this by passing the finished document to agy_say: measured on a 36 KB handoff, plain narration speaks 1029 characters (2.8%, cut mid-sentence) and the polish path only ever sees the first 12000 characters, so the pending work and the findings — which live at the end — never reach the ear. The saved document never contains the digest.'
         },
+        personality: {
+          type: 'boolean',
+          description: 'Only with narrate: true. The spoken digest is written in the persona of the Voicebox voice profile (its description and personality fields), in the same Gemini call that writes the document. The document itself is unaffected. Defaults to false.'
+        },
         key_points: {
           type: 'array',
           items: { type: 'string' },
@@ -1155,7 +1160,7 @@ const TOOLS = [
         },
         personality: {
           type: 'boolean',
-          description: 'When true, adopts the persona and personality configured on the Voicebox profile (from profile.description and profile.personality). Defaults to false (neutral professional tone).'
+          description: 'When true, agy (Gemini) writes the script in the persona of the Voicebox profile (its description and personality fields). Defaults to false (neutral professional tone).'
         },
         send_telegram: {
           type: 'boolean',
@@ -1201,7 +1206,7 @@ const TOOLS = [
         },
         personality: {
           type: 'boolean',
-          description: 'When true, adopts the persona configured on the Voicebox profile. Defaults to false (neutral professional tone).'
+          description: 'When true, agy (Gemini) rewrites the text in the persona of the Voicebox profile (its description and personality fields), keeping all of its content. Adds a few seconds for that call. Defaults to false (neutral professional tone).'
         },
         local_playback: {
           type: 'boolean',
@@ -1828,7 +1833,6 @@ async function emitirNarracionInterna({
   voiceboxUrl,
   profile,
   language,
-  personality = false,
   localPlayback = false,
   sendTelegram = true,
   motor
@@ -1840,7 +1844,6 @@ async function emitirNarracionInterna({
   let speakRes;
   try {
     speakRes = await sendVoiceboxGenerate(voiceboxUrl, spokenText, profile.id, language, {
-      personality,
       engine: motor.engine,
       modelSize: motor.modelSize
     });
@@ -1914,7 +1917,7 @@ async function emitirNarracionInterna({
 /**
  * Bloque de salida comun a las dos herramientas de narracion.
  */
-function formatNarrationOutput({ spokenText, profile, language, personality, localPlayback, emision, voiceboxUrl, voiceResolution, destino = {} }) {
+function formatNarrationOutput({ spokenText, profile, language, personality, localPlayback, emision, voiceboxUrl, voiceResolution, destino = {}, personaAplicada = null }) {
   const langLabel = language === 'es' ? 'Español' : 'Inglés';
   const fallbackNotice = voiceResolution.isFallback
     ? ` *(Fallback: ${voiceResolution.reason})*`
@@ -1934,7 +1937,13 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
   if (destino.health && destino.health.started) out += `- **Voicebox**: levantado sin GUI (${destino.health.variante})\n`;
   if (destino.health && destino.health.aviso) out += `- ⚠️ ${destino.health.aviso}\n`;
   out += `- **Idioma**: \`${langLabel} (${language})\`\n`;
-  out += `- **Modo de Personalidad**: ${personality ? `🎭 En personaje (\`${profile.personality || profile.description || 'expresivo'}\`)` : '👔 Neutral / Profesional'}\n`;
+  // Lo que se aplicó de verdad, no lo que se pidió: si la reescritura falla se
+  // narra el texto original, y decir «en personaje» sería falso.
+  const enPersona = personaAplicada === null ? personality : personaAplicada;
+  let modoPersona = '👔 Neutral / Profesional';
+  if (enPersona) modoPersona = `🎭 En personaje, escrito por agy (\`${profile.personality || profile.description || 'expresivo'}\`)`;
+  else if (personality) modoPersona = '⚠️ Se pidió personalidad pero la reescritura falló: se narró el texto original';
+  out += `- **Modo de Personalidad**: ${modoPersona}\n`;
   out += `- **Reproducción Local en PC**: ${localPlayback ? (emision.localPlayed ? '🔊 Reproducido limpiamente en altavoces (sin eco)' : '⚠️ Solicitado pero falló el reproductor local') : '🤫 Silencioso en PC'}\n`;
   out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
   if (emision.speakRes && emision.speakRes.id) {
@@ -1952,6 +1961,36 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
  * Resuelve Voicebox y el perfil de voz, o devuelve el error ya formateado para
  * el cliente. Los dos primeros pasos son identicos en ambas herramientas.
  */
+/**
+ * Reescribe un texto en la persona del perfil de voz, con agy.
+ *
+ * Reemplaza a la reescritura del LLM de Voicebox (Qwen3 0.6B), que ya no se
+ * pide: agy es más capaz y la persona queda igual con cualquier motor. Si la
+ * llamada falla (agy ausente, sin respuesta), se devuelve el texto original:
+ * perder el mensaje por no poder darle tono sería el peor canje.
+ */
+async function reescribirEnPersona({ texto, destino, args, config }) {
+  const modelo = args.model || config.defaultModel;
+  const esfuerzo = esfuerzoParaCli({ modelo, pedido: args.effort, porDefecto: 'low' });
+  const cliArgs = ['--output-format', 'json', '--dangerously-skip-permissions', '--mode', 'plan'];
+  if (esfuerzo) cliArgs.push('--effort', esfuerzo);
+  if (modelo) cliArgs.push('--model', modelo);
+  cliArgs.push('-p', getPersonaPrompt(texto, destino.language, destino.profile));
+
+  const res = await executeAgy(cliArgs, { cwd: args.cwd || process.cwd(), timeoutMinutes: 3 });
+  const data = res.data || {};
+  const duracion = data.duration_seconds || 0;
+  if (data.usage) {
+    recordUsage('say', modelo, esfuerzo, data.conversation_id || '', duracion, data.usage, !res.success, res.error || '');
+  }
+  const salida = res.success ? (data.response || res.rawOutput || '').trim() : '';
+  if (!salida) {
+    process.stderr.write(`[antigravity-mcp] Reescritura en persona falló, se narra el original: ${res.error || 'sin respuesta'}\n`);
+    return { texto, aplicado: false, duracion, error: res.error || 'sin respuesta' };
+  }
+  return { texto: salida, aplicado: true, duracion, error: null };
+}
+
 async function prepareNarrationTarget(args, config) {
   const voiceboxUrl = resolveVoiceboxUrl(args, config);
 
@@ -2111,7 +2150,9 @@ async function sendVoiceboxGenerate(baseUrl, text, profileId, language, options 
     // null es válido en el schema de Voicebox: los motores no-Qwen no versionan por tamaño.
     model_size: options.modelSize !== undefined ? options.modelSize : '1.7B',
     engine: options.engine || 'qwen',
-    personality: Boolean(options.personality),
+    // La persona la aplica agy antes (reescribirEnPersona o el prompt del
+    // guion): el LLM de Voicebox (Qwen3 0.6B) reescribía otra vez, y peor.
+    personality: false,
     normalize: true
   };
   const res = await httpRequest(`${baseUrl}/generate`, {
@@ -3730,7 +3771,15 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
       // 5. Build the summarization prompt
       const focus = args.focus || 'full';
-      const summarySystemPrompt = getSummaryPrompt(focus, Boolean(args.narrate));
+      // Con narrate + personality, la voz se resuelve ANTES del prompt: el digest
+      // sale en persona en esta misma llamada a agy, sin reescribirlo después.
+      // Si falla, el resumen sigue sin persona y la narración informa el fallo.
+      let destinoVoz = null;
+      if (args.narrate && args.personality) {
+        const d = await prepareNarrationTarget(args, config);
+        if (!d.error) destinoVoz = d;
+      }
+      const summarySystemPrompt = getSummaryPrompt(focus, Boolean(args.narrate), destinoVoz ? destinoVoz.profile : null);
       const keyPoints = Array.isArray(args.key_points)
         ? args.key_points.map(p => String(p).trim()).filter(Boolean)
         : [];
@@ -3928,7 +3977,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         if (!digestHablado) {
           formatted += `- Narracion: no se emitio (el modelo no incluyo la seccion \`${MARCA_DIGEST}\`; el documento se guardo igual)\n`;
         } else {
-          const destino = await prepareNarrationTarget(args, config);
+          const destino = destinoVoz || await prepareNarrationTarget(args, config);
           if (destino.error) {
             formatted += `- Narracion: fallo la preparacion de voz; el digest va abajo en texto\n`;
           } else {
@@ -3938,11 +3987,10 @@ Be thorough but concise. Prioritize primary sources and official documentation o
               voiceboxUrl: destino.voiceboxUrl,
               profile: destino.profile,
               language: destino.language,
-              personality: Boolean(args.personality),
               localPlayback: args.local_playback !== false,
               sendTelegram: args.send_telegram !== false
             });
-            formatted += `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : 'emitida'}\n`;
+            formatted += `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : (destinoVoz ? 'emitida, con el digest escrito en personaje' : 'emitida')}\n`;
           }
           formatted += `\n**Digest hablado:** ${digestHablado}\n`;
         }
@@ -4044,6 +4092,9 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // El guion lo escribe un modelo con acceso al repo: pasa por el mismo
       // saneado que el texto libre de agy_say, redaccion de secretos incluida.
       let spokenText = normalizeSpokenText(resData.response || agyRes.rawOutput || '').text;
+      // El guion con persona lo escribe Gemini; si no devolvió nada, se narra
+      // el texto de respaldo, que es neutro.
+      const personaAplicada = enablePersonality && Boolean(spokenText);
 
       if (!spokenText) {
         spokenText = targetLang === 'en'
@@ -4058,7 +4109,6 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         voiceboxUrl,
         profile: chosenProfile,
         language: targetLang,
-        personality: enablePersonality,
         localPlayback: playLocally,
         sendTelegram: args.send_telegram !== false,
         motor: destino.motor
@@ -4085,7 +4135,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         emision,
         voiceboxUrl,
         voiceResolution,
-        destino
+        destino,
+        personaAplicada
       });
       out += `\n**Contexto del Checkpoint detectado:**\n`;
       out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
@@ -4165,6 +4216,19 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         }
       }
 
+      // personality sin polish: agy reescribe en persona (con polish, el prompt
+      // de pulido ya la incluye). Antes lo hacía el LLM de Voicebox.
+      let personaAplicada = enablePersonality && polishApplied;
+      let personaDuracion = 0;
+      if (enablePersonality && !args.polish) {
+        const r = await reescribirEnPersona({ texto: rawText, destino, args, config });
+        if (r.aplicado) {
+          textoBase = r.texto;
+          personaAplicada = true;
+          personaDuracion = r.duracion;
+        }
+      }
+
       const { text: spokenText, truncated, originalLength } = normalizeSpokenText(textoBase);
 
       if (!spokenText) {
@@ -4183,7 +4247,6 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         voiceboxUrl,
         profile: chosenProfile,
         language: targetLang,
-        personality: enablePersonality,
         localPlayback: playLocally,
         sendTelegram: args.send_telegram !== false,
         motor: destino.motor
@@ -4208,9 +4271,13 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         emision,
         voiceboxUrl,
         voiceResolution,
-        destino
+        destino,
+        personaAplicada
       });
-      out += `- **Origen del guión**: ${polishApplied ? `✨ Pulido por agy (${polishDuration.toFixed(1)}s)` : '📝 Texto del llamante, saneado localmente'}\n`;
+      let origen = '📝 Texto del llamante, saneado localmente';
+      if (polishApplied) origen = `✨ Pulido por agy (${polishDuration.toFixed(1)}s)`;
+      else if (personaAplicada) origen = `🎭 Reescrito en personaje por agy (${personaDuracion.toFixed(1)}s)`;
+      out += `- **Origen del guión**: ${origen}\n`;
       if (truncated) {
         out += `- **⚠️ Truncado**: el texto tenía ${originalLength} caracteres y se cortó en ${spokenText.length}. Usa \`polish: true\` para condensarlo en vez de recortarlo.\n`;
       } else if (!polishApplied && originalLength > POLISH_SUGGESTED_OVER) {
