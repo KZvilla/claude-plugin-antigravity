@@ -606,17 +606,23 @@ class SentenceSequencer:
 # herramienta usa. Una clave por categoria; el orden es la prioridad de
 # generacion. Sin puntos suspensivos ni exclamaciones: con Qwen, la
 # puntuacion forzada hizo alucinar la voz (evaluacion del 2026-09-11).
-# Cuatro claves y no una por herramienta (auditoria del plan v2): en la charla
-# no se editan archivos, y cada clave extra es GPU al arrancar con la cache fria.
-ORDEN_SENALES = ["pensando", "web", "pagina", "herramienta"]
+# Pocas claves y no una por herramienta (auditoria del plan v2): en la charla
+# no se editan archivos, y cada clave extra es GPU al arrancar con la cache
+# fria. "archivos" se sumo a pedido del usuario: aparece en busquedas reales,
+# cuando agy lee lo que descargo.
+ORDEN_SENALES = ["pensando", "web", "pagina", "archivos", "herramienta"]
 FRASES_SENAL = {
     "es": {"pensando": "Pensando.", "web": "Buscando en la web.", "pagina": "Leyendo la página.",
-           "herramienta": "Usando una herramienta."},
+           "archivos": "Revisando archivos.", "herramienta": "Usando una herramienta."},
     "en": {"pensando": "Thinking.", "web": "Searching the web.", "pagina": "Reading the page.",
-           "herramienta": "Using a tool."},
+           "archivos": "Looking through files.", "herramienta": "Using a tool."},
 }
 # Inventario de agy observado (mcp-server/agents/registry.js); el resto cae en "herramienta".
-CATEGORIA_HERRAMIENTA = {"search_web": "web", "read_url_content": "pagina"}
+CATEGORIA_HERRAMIENTA = {
+    "search_web": "web",
+    "read_url_content": "pagina",
+    "view_file": "archivos", "list_dir": "archivos", "grep_search": "archivos", "find_by_name": "archivos",
+}
 SENALES_DIR = os.path.join(STATE_DIR, "senales")
 SEPARACION_SENALES_MS = 8000
 # Tras "Pensando", nombrar la herramienta no espera los 8 s: es informacion nueva.

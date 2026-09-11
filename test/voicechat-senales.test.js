@@ -65,7 +65,8 @@ r["falla_una_sigue"] = s4.elegir("pensando") is None and s4.elegir("web") is not
 r["vacia_devuelve_none"] = common.Senales(perfil, "en", "qwen", None, "omnivoice", None, sintetizar=sintetizar, directorio=cache, arrancar=False).elegir("pensando") is None
 
 r["mapeo"] = [common.clave_de_herramienta(x) for x in
-              ["search_web", "read_url_content", "grep_search", "call_mcp_tool", None]]
+              ["search_web", "read_url_content", "view_file", "list_dir", "grep_search", "find_by_name",
+               "call_mcp_tool", None]]
 
 def d(**kw):
     base = dict(hubo_texto=False, reproduciendo=False, vigente=True, herramienta=None, ultima_clave=None,
@@ -89,6 +90,7 @@ r["decision"] = [
     d(herramienta="grep_search", ultima_clave="pagina", desde_ultima_ms=9000, sonaron=3),
     d(herramienta="search_web", ultima_clave="pensando", desde_ultima_ms=3500, sonaron=1),
     d(herramienta="search_web", ultima_clave="pensando", desde_ultima_ms=1000, sonaron=1),
+    d(herramienta="view_file", ultima_clave="pagina", desde_ultima_ms=9000, sonaron=2),
 ]
 
 reloj = [10.0]
@@ -168,8 +170,8 @@ async function main() {
       check('una muestra más nueva regenera', x.muestra_nueva_regenera);
       check('una señal que falla no rompe las otras', x.falla_una_sigue);
       check('sin señales listas devuelve None', x.vacia_devuelve_none);
-      check('mapeo de herramientas a claves', JSON.stringify(x.mapeo) === JSON.stringify(['web', 'pagina', 'herramienta', 'herramienta', 'herramienta']), JSON.stringify(x.mapeo));
-      check('tabla de decidir_senal', JSON.stringify(x.decision) === JSON.stringify(['web', null, null, 'pagina', null, 'pensando', null, 'web', null, null, null, null, null, 'web', null]), JSON.stringify(x.decision));
+      check('mapeo de herramientas a claves', JSON.stringify(x.mapeo) === JSON.stringify(['web', 'pagina', 'archivos', 'archivos', 'archivos', 'archivos', 'herramienta', 'herramienta']), JSON.stringify(x.mapeo));
+      check('tabla de decidir_senal', JSON.stringify(x.decision) === JSON.stringify(['web', null, null, 'pagina', null, 'pensando', null, 'web', null, null, null, null, null, 'web', null, 'archivos']), JSON.stringify(x.decision));
       check('cada marca se toma una vez', x.marca_una_vez);
       check('línea de tiempos', x.linea === '⏱ transcripción 0.7 s · primer texto 5.9 s', x.linea);
       check('barge_in no borra señales', x.barge_in_respeta_borrar);
