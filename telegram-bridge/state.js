@@ -334,6 +334,32 @@ export function clearConversationId(chatId) {
   });
 }
 
+// FEAT-025 — El último workspace sobre el que el chat casteó. Es solo una
+// preferencia de orden del teclado de /cast: nunca decide qué se castea, así
+// que /reset (que reinicia la conversación) no lo borra. Se guarda el `id` de
+// getKnownWorkspaces, que es un hash de la ruta y no cambia entre reinicios.
+const FORMA_ID_WORKSPACE = /^[0-9a-f]{8}$/;
+
+/** El id guardado, o `null` si no hay, el chat no existe o no tiene la forma de un id. */
+export function getUltimoWorkspaceCast(chatId) {
+  const guardado = loadState().chats?.[String(chatId)]?.ultimoWorkspaceCast;
+  return typeof guardado === 'string' && FORMA_ID_WORKSPACE.test(guardado) ? guardado : null;
+}
+
+/** Recuerda el workspace de un cast. Un id con otra forma no se escribe. */
+export function setUltimoWorkspaceCast(chatId, wsId) {
+  if (typeof wsId !== 'string' || !FORMA_ID_WORKSPACE.test(wsId)) return false;
+  mutateState((state) => {
+    const idStr = String(chatId);
+    state.chats[idStr] = {
+      ...(state.chats[idStr] || {}),
+      ultimoWorkspaceCast: wsId,
+      updatedAt: new Date().toISOString()
+    };
+  });
+  return true;
+}
+
 // ==============================================================================
 // Human-in-the-loop
 // ==============================================================================

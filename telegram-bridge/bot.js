@@ -25,7 +25,9 @@ import {
   clearConversationId,
   resolvePendingAsk,
   getPendingAsk,
-  getStateFilePath
+  getStateFilePath,
+  getUltimoWorkspaceCast,
+  setUltimoWorkspaceCast
 } from './state.js';
 import { enqueueTask, dequeueTask, getQueueLength, getQueueSnapshot, clearQueue, CARRILES } from './queue.js';
 import {
@@ -577,10 +579,19 @@ export function validarCastDesdeChat(nombre, homeDir = os.homedir()) {
   return { ok: true };
 }
 
-export function buildCastWorkspacesKeyboard(castId, workspaces) {
+/**
+ * FEAT-025 — Con `favoritoId` (el último workspace del chat), ese va primero y
+ * con ⭐ en lugar de 📁. Ordenar y marcar van juntos a propósito: así no puede
+ * quedar una ⭐ en un botón que no esté primero. El `callback_data` es el mismo
+ * con o sin favorito, así que el callback lo sigue validando igual: el
+ * favorito cambia el orden, nunca qué se castea.
+ */
+export function buildCastWorkspacesKeyboard(castId, workspaces, favoritoId = null) {
   const keyboard = new InlineKeyboard();
-  for (const ws of workspaces) {
-    keyboard.text(`📁 ${ws.displayName}`, `cast_ws:${castId}:${ws.id}`).row();
+  const favorito = favoritoId ? workspaces.find((ws) => ws.id === favoritoId) : null;
+  const orden = favorito ? [favorito, ...workspaces.filter((ws) => ws !== favorito)] : workspaces;
+  for (const ws of orden) {
+    keyboard.text(`${ws === favorito ? '⭐' : '📁'} ${ws.displayName}`, `cast_ws:${castId}:${ws.id}`).row();
   }
   keyboard.text('❌ Cancelar', `cast_cancel:${castId}`);
   return keyboard;
@@ -1063,7 +1074,7 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
 
     const castId = guardarCastPendiente({ chatId: ctx.chat.id, agent: agente, prompt: pedido.trim() });
     await sendSafeChunk(ctx, `🎭 *Cast de* \`${agente}\`\n\n¿Sobre qué proyecto trabaja?\n\nSe le pide que lea solo esa carpeta, pero es una instrucción, no un permiso: puede leer cualquier ruta de tu usuario.`, {
-      reply_markup: buildCastWorkspacesKeyboard(castId, workspaces)
+      reply_markup: buildCastWorkspacesKeyboard(castId, workspaces, getUltimoWorkspaceCast(ctx.chat.id))
     });
   });
 
@@ -1186,6 +1197,14 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
       if (!ws) {
         await ctx.answerCallbackQuery({ text: 'Proyecto no encontrado o ya no existe en disco.' });
         return;
+      }
+
+      // FEAT-025 — Solo un workspace que de verdad se usó para un cast válido.
+      // Es cosmético: si el estado no se puede escribir, el cast sigue igual.
+      try {
+        setUltimoWorkspaceCast(ctx.chat.id, ws.id);
+      } catch (err) {
+        console.warn(`[cast] No se pudo recordar el workspace: ${redactSecrets(err.message)}`);
       }
 
       await ctx.answerCallbackQuery({ text: `Casteando sobre ${ws.name}...` });

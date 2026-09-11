@@ -2679,6 +2679,126 @@ console.log('✔ Test 64 [FEAT-034]: runAgyTask por stream-json respeta el contr
 }
 console.log('✔ Test 66 [FEAT-034]: la rama principal cablea onActividad');
 
+// ==============================================================================
+// Rama feat/cast-favorito: FEAT-025 recortada, el último workspace primero.
+// ==============================================================================
+
+// Test 67 [FEAT-025]: el teclado de /cast pone el último workspace primero, con
+// ⭐ en lugar de 📁. Ordenar y marcar van juntos: no puede quedar una ⭐ fuera
+// del primer lugar.
+{
+  const botMod = await import('./bot.js');
+  const ws = [
+    { id: 'aaaaaaaa', displayName: 'uno (a)' },
+    { id: 'bbbbbbbb', displayName: 'dos (b)' },
+    { id: 'cccccccc', displayName: 'tres (c)' }
+  ];
+  const textos = (kb) => kb.inline_keyboard.flat().map((b) => b.text);
+  assert.deepStrictEqual(textos(botMod.buildCastWorkspacesKeyboard('0a1b2c3d', ws)).slice(0, 3),
+    ['📁 uno (a)', '📁 dos (b)', '📁 tres (c)'], 'sin favorito, el orden y los íconos de siempre');
+
+  const conFav = botMod.buildCastWorkspacesKeyboard('0a1b2c3d', ws, 'cccccccc').inline_keyboard.flat();
+  assert.strictEqual(conFav[0].text, '⭐ tres (c)', 'el favorito va primero y la ⭐ reemplaza al 📁');
+  assert.strictEqual(conFav[0].callback_data, 'cast_ws:0a1b2c3d:cccccccc', 'el callback_data no cambia');
+  assert.strictEqual(conFav.filter((b) => b.text.startsWith('⭐')).length, 1, 'una sola ⭐');
+  assert.deepStrictEqual(conFav.slice(1, 3).map((b) => b.text), ['📁 uno (a)', '📁 dos (b)'], 'el resto conserva su orden');
+  assert(conFav.every((b) => Buffer.byteLength(b.callback_data, 'utf8') <= 64), 'todo callback_data entra en 64 bytes');
+  assert.deepStrictEqual(ws.map((w) => w.id), ['aaaaaaaa', 'bbbbbbbb', 'cccccccc'], 'no muta la lista');
+
+  const fantasma = textos(botMod.buildCastWorkspacesKeyboard('0a1b2c3d', ws, 'dddddddd'));
+  assert(fantasma[0] === '📁 uno (a)' && !fantasma.some((t) => t.startsWith('⭐')), 'un favorito que ya no existe no marca nada');
+}
+console.log('✔ Test 67 [FEAT-025]: el favorito va primero con ⭐ y el callback no cambia');
+
+// Test 68 [FEAT-025]: el favorito se guarda por chat, con la forma de un id, y
+// /reset (que reinicia la conversación) no lo borra.
+{
+  assert.strictEqual(state.getUltimoWorkspaceCast(777000), null, 'chat sin registro → null');
+  assert.strictEqual(state.setUltimoWorkspaceCast(777000, 'abcdef12'), true);
+  assert.strictEqual(state.getUltimoWorkspaceCast('777000'), 'abcdef12', 'número y string son el mismo chat');
+  assert.strictEqual(state.setUltimoWorkspaceCast(777000, '../x'), false, 'un id con otra forma no se escribe');
+  assert.strictEqual(state.getUltimoWorkspaceCast(777000), 'abcdef12', 'y el anterior queda');
+  state.setConversationId(777000, 'conv-x');
+  state.clearConversationId(777000);
+  assert.strictEqual(state.getUltimoWorkspaceCast(777000), 'abcdef12', '/reset no borra el favorito');
+}
+console.log('✔ Test 68 [FEAT-025]: el favorito se guarda por chat y sobrevive a /reset');
+
+// Test 69 [FEAT-025]: de punta a punta. /cast, tocar el segundo proyecto, y el
+// siguiente /cast lo ofrece primero. Home falso y sin allowlist del entorno:
+// el test no puede depender de la configuración real de la máquina.
+{
+  const botMod = await import('./bot.js');
+  const homeFalso = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fav-home-'));
+  const proyA = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fav-a-')));
+  const proyB = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fav-b-')));
+  const previo = {
+    USERPROFILE: process.env.USERPROFILE,
+    HOME: process.env.HOME,
+    ALLOWED_CLAUDE_WORKSPACES: process.env.ALLOWED_CLAUDE_WORKSPACES,
+    ALLOWED_WORKSPACES: process.env.ALLOWED_WORKSPACES
+  };
+  process.env.USERPROFILE = homeFalso;
+  process.env.HOME = homeFalso;
+  delete process.env.ALLOWED_CLAUDE_WORKSPACES;
+  delete process.env.ALLOWED_WORKSPACES;
+  fs.mkdirSync(path.join(homeFalso, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(homeFalso, '.claude', 'antigravity-agents.json'), JSON.stringify({
+    agents: { lector: { skill: 'agency-code-reviewer', read_only: true } }
+  }));
+  fs.writeFileSync(path.join(homeFalso, '.claude.json'), JSON.stringify({
+    projects: { [proyA]: { hasTrustDialogAccepted: true }, [proyB]: { hasTrustDialogAccepted: true } }
+  }));
+
+  const { bot, llamadas } = botDePrueba();
+  botMod.resetRuntimeState();
+  let casteos = 0;
+  botMod.usarEjecutoresDePrueba({
+    castear: async () => { casteos++; return { ok: true, respuesta: 'listo', memoria: {} }; }
+  });
+  const botonesDelUltimoTeclado = () => {
+    const m = llamadas.filter((c) => c.method === 'sendMessage' && c.payload.reply_markup).at(-1);
+    return m ? m.payload.reply_markup.inline_keyboard.flat().filter((b) => b.callback_data.startsWith('cast_ws:')) : [];
+  };
+
+  try {
+    await bot.handleUpdate(comandoDe('/cast lector revisá esto', 830));
+    const primero = botonesDelUltimoTeclado();
+    assert.strictEqual(primero.length, 2, `dos proyectos: ${JSON.stringify(primero)}`);
+    assert(!primero.some((b) => b.text.startsWith('⭐')), 'la primera vez no hay favorito');
+
+    const elegido = primero[1];
+    const idElegido = elegido.callback_data.split(':')[2];
+    await bot.handleUpdate({
+      update_id: 831,
+      callback_query: {
+        id: '831',
+        from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+        chat_instance: 'ci',
+        data: elegido.callback_data,
+        message: { message_id: 5, date: 0, chat: { id: Number(USUARIO_OK), type: 'private' }, text: 'x' }
+      }
+    });
+    const limite = Date.now() + 2000;
+    while (casteos === 0 && Date.now() < limite) await new Promise((r) => setTimeout(r, 5));
+    assert.strictEqual(casteos, 1, 'se casteó');
+    assert.strictEqual(state.getUltimoWorkspaceCast(USUARIO_OK), idElegido, 'y se recordó ese workspace');
+
+    await bot.handleUpdate(comandoDe('/cast lector otra cosa', 832));
+    const segundo = botonesDelUltimoTeclado();
+    assert(segundo[0].text.startsWith('⭐') && segundo[0].callback_data.endsWith(`:${idElegido}`),
+      `el siguiente /cast lo ofrece primero: ${JSON.stringify(segundo)}`);
+  } finally {
+    botMod.resetRuntimeState();
+    for (const [k, v] of Object.entries(previo)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    for (const d of [homeFalso, proyA, proyB]) fs.rmSync(d, { recursive: true, force: true });
+  }
+}
+console.log('✔ Test 69 [FEAT-025]: el workspace del último cast aparece primero en el siguiente');
+
 // Limpieza: solo el directorio temporal de test
 try {
   fs.rmSync(path.dirname(TEST_STATE_FILE), { recursive: true, force: true });
