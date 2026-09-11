@@ -18,6 +18,31 @@ import { loadBridgeEnv, describeEnvSearch, estadoDaemon } from './paths.js';
 // Límite propio del caption de Telegram, muy por debajo de los 4096 del texto.
 const CAPTION_LIMIT = 1024;
 
+/**
+ * Caption de nota de voz en HTML escapado y dentro del límite de Telegram.
+ *
+ * Antes iba en Markdown sin escapar: un `_` o `*` suelto (habitual en el texto
+ * hablado de una narración) hacía fallar la nota con «can't parse entities».
+ * El recorte busca el prefijo más largo cuyo HTML escapado cabe: recortar el
+ * texto y escapar después no alcanza, porque `&` pasa a `&amp;`. Medir sobre
+ * el escapado es conservador (Telegram cuenta cada entidad como un carácter).
+ */
+export function captionHtml(texto, limite = CAPTION_LIMIT) {
+  const t = String(texto ?? '');
+  const entero = escapeHtml(t);
+  if (entero.length <= limite) return entero;
+  // Sin surrogate alto huérfano al final: no partir un emoji.
+  const prefijo = (n) => t.slice(0, n).replace(/[\uD800-\uDBFF]$/, '');
+  let lo = 0;
+  let hi = Math.min(t.length, limite);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (escapeHtml(prefijo(mid)).length + 1 <= limite) lo = mid;
+    else hi = mid - 1;
+  }
+  return `${escapeHtml(prefijo(lo))}…`;
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -300,8 +325,8 @@ export async function sendTelegramVoice(options = {}) {
   try {
     uploadResult = await telegramUploadCall('sendVoice', 'voice', resolvedPath, {
       chat_id: chatId,
-      caption,
-      parse_mode: 'Markdown'
+      caption: captionHtml(caption),
+      parse_mode: 'HTML'
     });
   } catch (voiceErr) {
     // Un rechazo por política no es un fallo de formato: reintentar con
@@ -312,8 +337,8 @@ export async function sendTelegramVoice(options = {}) {
     // Fallback a reproductor de audio integrado (sendAudio) para archivos .wav
     uploadResult = await telegramUploadCall('sendAudio', 'audio', resolvedPath, {
       chat_id: chatId,
-      caption,
-      parse_mode: 'Markdown',
+      caption: captionHtml(caption),
+      parse_mode: 'HTML',
       title: path.basename(resolvedPath, path.extname(resolvedPath)),
       performer: 'Voicebox'
     });

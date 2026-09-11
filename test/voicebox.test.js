@@ -167,7 +167,8 @@ async function main() {
         estadoModelos: async () => modelos,
         descargarModelo: async (_u, n) => { descargados.push(n); },
         cargarQwen: async (_u, s) => { cargas.push(s); },
-        vram: () => ({ usadoMb: 0, libreMb, totalMb: 24576 })
+        vram: () => ({ usadoMb: 0, libreMb, totalMb: 24576 }),
+        generacionesActivas: async () => []
       });
       const qwenCargado = [
         { model_name: 'qwen-tts-1.7B', loaded: true, size_mb: 4333 },
@@ -194,6 +195,90 @@ async function main() {
       descargados.length = 0;
       r = await vb.aplicarModeloActivo('http://x', { engine: 'kokoro', fijar: true }, deps(qwenCargado));
       check('cambiar el pin explícitamente sí hace el swap', r.ok && vb.leerPin(env).model === 'kokoro');
+    });
+  } finally { removeFixture(dir); }
+
+  await group('uso externo de Voicebox (v0.22.1): fechas, TTL y NaN', () => {
+    const ahora = Date.UTC(2026, 8, 11, 18, 45, 0);
+    const iso = (ms) => new Date(ms).toISOString().replace('Z', ''); // como las da Voicebox: sin zona
+    check('fecha sin zona = UTC', vb.fechaVoicebox('2026-09-11T18:41:05.970748') === Date.UTC(2026, 8, 11, 18, 41, 5, 970));
+    check('fecha con Z se respeta', vb.fechaVoicebox('2026-09-11T18:41:05Z') === Date.UTC(2026, 8, 11, 18, 41, 5));
+    check('basura → null, nunca NaN', vb.fechaVoicebox('ayer') === null && vb.fechaVoicebox('') === null && vb.fechaVoicebox(null) === null);
+
+    const historial = [
+      { engine: 'qwen', model_size: '1.7B', status: 'completed', created_at: iso(ahora - 2 * MIN) },
+      { engine: 'kokoro', model_size: null, status: 'generating', created_at: iso(ahora - 20000) },
+      { engine: 'qwen', model_size: '0.6B', status: 'generating', created_at: iso(ahora - 60 * MIN) },
+      { engine: null, status: 'completed', created_at: iso(ahora) },
+      { engine: 'qwen', model_size: '1.7B', status: 'completed', created_at: 'roto' }
+    ];
+    const u = vb.usosDesdeVoicebox({ historial, ahora });
+    check('completada: uso = su created_at', u['qwen-tts-1.7B'] === ahora - 2 * MIN, JSON.stringify(u));
+    check('generating reciente: uso = ahora', u.kokoro === ahora);
+    check('generating huérfana de hace 1 h: uso = su created_at', u['qwen-tts-0.6B'] === ahora - 60 * MIN);
+    check('sin engine o fecha rota: ignorado, sin claves espurias', Object.keys(u).length === 3);
+    const cargando = vb.usosDesdeVoicebox({ ahora, historial: [{ engine: 'qwen', model_size: '1.7B', status: 'loading_model', created_at: iso(ahora - 5000) }] });
+    check('loading_model (visto en vivo) también cuenta como en curso', cargando['qwen-tts-1.7B'] === ahora, JSON.stringify(cargando));
+    const fallida = vb.usosDesdeVoicebox({ ahora, historial: [{ engine: 'qwen', model_size: '1.7B', status: 'failed', created_at: iso(ahora - 5000) }] });
+    check('una fallida cuenta desde su created_at, no como en curso', fallida['qwen-tts-1.7B'] === ahora - 5000, JSON.stringify(fallida));
+    check('nunca valores no finitos', Object.values(u).every(Number.isFinite));
+
+    const cargados = ['qwen-tts-1.7B', 'kokoro'];
+    const fresca = [{ started_at: iso(ahora - 30000) }];
+    const colgada = [{ started_at: iso(ahora - 10 * MIN) }];
+    const futura = [{ started_at: iso(ahora + 5 * MIN) }];
+    check('activa fresca → todos los cargados = ahora', JSON.stringify(vb.usosDesdeVoicebox({ activas: fresca, cargados, ahora })) === JSON.stringify({ 'qwen-tts-1.7B': ahora, kokoro: ahora }));
+    check('activa colgada (10 min) → no cuenta', Object.keys(vb.usosDesdeVoicebox({ activas: colgada, cargados, ahora })).length === 0);
+    check('activa 5 min en el futuro → no cuenta', !vb.hayGeneracionFresca(futura, ahora));
+
+    const efectivos = vb.usosEfectivos({ cargados: ['qwen3-0.6b', 'kokoro'], usos: { kokoro: NaN, 'qwen-tts-1.7B': 500 }, vistoDesde: {} });
+    check('usosEfectivos filtra NaN', Object.values(efectivos).every(Number.isFinite), JSON.stringify(efectivos));
+
+    // El BLOCKER de la auditoría: una tarea colgada no puede frenar el keeper.
+    const usosColgada = vb.usosEfectivos({ cargados, usos: vb.usosDesdeVoicebox({ activas: colgada, cargados, ahora }), vistoDesde: {} });
+    check('con una generación colgada, el keeper sí descarga', vb.decidirAccionKeeper({ ownsServer: true, cargados, usos: usosColgada, ahora, idleUnloadMs: 10 * MIN, idleShutdownMs: 30 * MIN }).accion === 'descargar');
+  });
+
+  dir = tmp();
+  try {
+    await group('swap con una generación en curso (v0.22.1)', async () => {
+      const env = { ...process.env, LAGRANGE_VOICEBOX_DIR: dir };
+      const descargados = [];
+      const iso = (ms) => new Date(ms).toISOString().replace('Z', '');
+      const deps = (libreMb, activas) => ({
+        env,
+        estadoModelos: async () => [
+          { model_name: 'kokoro', loaded: true, size_mb: 312 },
+          { model_name: 'qwen-tts-1.7B', loaded: false, size_mb: 4333 }
+        ],
+        descargarModelo: async (_u, n) => { descargados.push(n); },
+        cargarQwen: async () => {},
+        vram: () => ({ usadoMb: 0, libreMb, totalMb: 24576 }),
+        generacionesActivas: async () => activas
+      });
+      const enCurso = [{ task_id: 't', started_at: iso(Date.now() - 20000) }];
+      let r = await vb.aplicarModeloActivo('http://x', { engine: 'qwen', modelSize: '1.7B' }, deps(20000, enCurso));
+      check('con VRAM holgada: no descarga nada, kokoro queda postergado', r.ok && descargados.length === 0 && r.postergados[0] === 'kokoro', JSON.stringify(r));
+      r = await vb.aplicarModeloActivo('http://x', { engine: 'qwen', modelSize: '1.7B' }, deps(100, enCurso));
+      check('con VRAM justa: error que nombra la generación en curso', !r.ok && /generación en curso/.test(r.error), r.error);
+    });
+  } finally { removeFixture(dir); }
+
+  dir = tmp();
+  try {
+    await group('swap con una generación colgada no se bloquea (v0.22.1)', async () => {
+      const env = { ...process.env, LAGRANGE_VOICEBOX_DIR: dir };
+      const descargados = [];
+      const colgada = [{ task_id: 't', started_at: new Date(Date.now() - 10 * MIN).toISOString().replace('Z', '') }];
+      const r = await vb.aplicarModeloActivo('http://x', { engine: 'qwen', modelSize: '1.7B' }, {
+        env,
+        estadoModelos: async () => [{ model_name: 'kokoro', loaded: true, size_mb: 312 }],
+        descargarModelo: async (_u, n) => { descargados.push(n); },
+        cargarQwen: async () => {},
+        vram: () => ({ usadoMb: 0, libreMb: 20000, totalMb: 24576 }),
+        generacionesActivas: async () => colgada
+      });
+      check('descarga kokoro igual', r.ok && descargados.includes('kokoro'), JSON.stringify(r));
     });
   } finally { removeFixture(dir); }
 

@@ -144,8 +144,16 @@ async function main() {
     const pin = vb.leerPin();
     const pinModel = pin ? pin.model : null;
     const usosCrudos = vb.leerUsos();
+    // Uso de clientes que no pasan por el plugin (GUI, scripts): Voicebox lo
+    // expone en /tasks/active y /history. Sin esto, el keeper descargaba un
+    // modelo a mitad de una generación ajena.
+    if (ownsServer && h.ok) {
+      const [activas, historial] = await Promise.all([vb.generacionesActivas(baseUrl), vb.historialReciente(baseUrl)]);
+      const externos = vb.usosDesdeVoicebox({ historial, activas, cargados, ahora });
+      for (const [m, ms] of Object.entries(externos)) usosCrudos[m] = Math.max(usosCrudos[m] || 0, ms);
+    }
     const usos = vb.usosEfectivos({ cargados, usos: usosCrudos, vistoDesde });
-    const ultimoUso = Math.max(inicio, ...Object.values(usosCrudos));
+    const ultimoUso = Math.max(inicio, ...Object.values(usosCrudos).filter(Number.isFinite));
 
     const decision = vb.decidirAccionKeeper({ pinModel, cargados, usos, ahora, idleUnloadMs, idleShutdownMs, ownsServer, ultimoUso, fallosSeguidos });
 

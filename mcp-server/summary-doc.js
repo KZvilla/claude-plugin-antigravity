@@ -38,7 +38,7 @@ const SUMMARY_OUTPUT_RULES = `## Output Rules (mandatory):
 // plantilla, no el modelo. Vive aca como `focus` y no como herramienta aparte
 // porque dos tools que dicen "resume una sesion" degradan la seleccion — el
 // mismo argumento que abre test/narrate.test.js.
-function getHandoffPrompt(conDigest = false) {
+function getHandoffPrompt(conDigest = false, persona = null) {
   return `You are a Session Handoff Specialist. Analyze the following transcript of a Claude Code development session and produce a handoff document that lets a FRESH session resume the work with no access to this conversation.
 
 Optimize for one reader: an agent starting cold. Anything they can get from \`git log\`, \`git diff\` or by reading the code is cheap — spend the space on what exists only in this conversation.
@@ -70,11 +70,11 @@ Numbered, concrete, in execution order. Mark anything already resolved during th
 ### Prompt para Iniciar Nueva Sesion
 A copy-paste block the user can hand to a fresh session, containing: a 3-5 line state summary, the key files, and the immediate task.
 
-${SUMMARY_OUTPUT_RULES}${conDigest ? INSTRUCCION_DIGEST : ''}`;
+${SUMMARY_OUTPUT_RULES}${conDigest ? instruccionDigest(persona) : ''}`;
 }
 
-function getSummaryPrompt(focus = 'full', conDigest = false) {
-  if (focus === 'handoff') return getHandoffPrompt(conDigest);
+function getSummaryPrompt(focus = 'full', conDigest = false, persona = null) {
+  if (focus === 'handoff') return getHandoffPrompt(conDigest, persona);
 
   const focusInstructions = {
     full: 'Cover all sections thoroughly and equally.',
@@ -116,7 +116,7 @@ function getSummaryPrompt(focus = 'full', conDigest = false) {
 ## Focus: ${focusInstructions[focus] || focusInstructions.full}
 
 ${SUMMARY_OUTPUT_RULES}
-- Be thorough but bounded: the document should not exceed 500 lines${conDigest ? INSTRUCCION_DIGEST : ''}`;
+- Be thorough but bounded: the document should not exceed 500 lines${conDigest ? instruccionDigest(persona) : ''}`;
 }
 
 // Red de seguridad para el modo de fallo observado: pese a la regla del prompt,
@@ -185,6 +185,21 @@ After the document, add one final section headed exactly \`${MARCA_DIGEST}\` con
 - Plain spoken prose: no markdown, no bullets, no file paths, no code, no version strings read out character by character (say "cero doce uno" style only if it reads naturally, otherwise omit it).
 - It must not contradict the document, and it must not add anything that is not in it.
 - This section is extracted and spoken aloud; everything above it is what gets saved.`;
+
+/**
+ * Instrucción del digest, con la persona del perfil de voz si se pidió
+ * `personality`. Va en la misma llamada que el documento: reescribir el digest
+ * en otra llamada solo sumaba latencia (auditoría del plan v0.22.1). La persona
+ * toca el tono del digest, nunca su contenido ni el documento.
+ */
+function instruccionDigest(persona = null) {
+  if (!persona) return INSTRUCCION_DIGEST;
+  return `${INSTRUCCION_DIGEST}
+- Write ONLY the spoken digest (not the document) in the voice of this speaker persona, derived from its Voicebox profile. It changes the tone and wording, never the facts:
+  - Name: "${persona.name || 'Voice Assistant'}"
+  - Description: "${persona.description || 'Voice Assistant'}"
+  - Personality: "${persona.personality || 'Natural and expressive'}"`;
+}
 
 const MIN_LONGITUD_DOCUMENTO = 400;
 
