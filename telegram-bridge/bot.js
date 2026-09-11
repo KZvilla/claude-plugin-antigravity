@@ -327,9 +327,13 @@ async function processTaskQueue(carril) {
 
   // Un único mensaje de estado que se va editando. Para una tarea de 2 a 15
   // minutos, `typing` cada 4,5 s no dice si algo avanza o si se colgó.
-  const updateProgress = async (prefix, separador = ' · ') => {
+  // Recibe el texto ya armado: en vivo lo compone `lineaDeProgreso` (con la
+  // herramienta activa, FEAT-034); al cierre, la etiqueta final, nunca con
+  // actividad.
+  const segundos = () => (Date.now() - startedAt) / 1000;
+  let actividad = null;
+  const updateProgress = async (texto) => {
     if (!task.statusMessageId) return;
-    const texto = `${prefix}${separador}${formatElapsed((Date.now() - startedAt) / 1000)}`;
     try {
       await botRef.api.editMessageText(chatId, task.statusMessageId, texto);
     } catch {
@@ -347,8 +351,8 @@ async function processTaskQueue(carril) {
     const etiqueta = task.kind === 'cast'
       ? `🎭 ${task.agent} trabajando`
       : (mode === 'plan' ? '🧠 Generando plan' : '⚙️ Ejecutando tarea');
-    await updateProgress(etiqueta);
-    progressInterval = setInterval(() => { updateProgress(etiqueta); }, 15000);
+    await updateProgress(lineaDeProgreso(etiqueta, segundos()));
+    progressInterval = setInterval(() => { updateProgress(lineaDeProgreso(etiqueta, segundos(), actividad)); }, 15000);
 
     // FEAT-022 — Rama propia, separada a propósito del cierre de abajo: ese
     // cierre guarda el hilo como sesión del chat y ofrece `exec_plan`, y
@@ -374,7 +378,7 @@ async function processTaskQueue(carril) {
       typingInterval = null;
       clearInterval(progressInterval);
       progressInterval = null;
-      await updateProgress(finalProgressLabel({ success: cast.ok, cancelled: cast.cancelled }), ' ');
+      await updateProgress(`${finalProgressLabel({ success: cast.ok, cancelled: cast.cancelled })} ${formatElapsed(segundos())}`);
       await responderCast(ctx, task, cast, (Date.now() - startedAt) / 1000);
       return;
     }
@@ -383,7 +387,10 @@ async function processTaskQueue(carril) {
       prompt,
       mode,
       conversationId,
-      onSpawn: (cancel) => { estado.cancelar = cancel; }
+      onSpawn: (cancel) => { estado.cancelar = cancel; },
+      // FEAT-034 — La última herramienta activa, para la próxima edición del
+      // progreso. Solo la rama principal: los casts no van por stream.
+      onActividad: (texto) => { actividad = recortarActividad(texto); }
     });
 
     clearInterval(typingInterval);
@@ -395,7 +402,7 @@ async function processTaskQueue(carril) {
     // texto final ya lleva su propia preposición y quedaba «Completado en · 23s».
     // Una cancelación no es éxito, pero tampoco un error: sin su propia etiqueta
     // se anunciaba como «Terminado con error» y parecía que algo había fallado.
-    await updateProgress(finalProgressLabel(result), ' ');
+    await updateProgress(`${finalProgressLabel(result)} ${formatElapsed(segundos())}`);
 
     if (result.cancelled) {
       // El aviso ya lo dio /cancel; aquí solo se cierra el ciclo.
@@ -472,6 +479,29 @@ export function avisoDeDespacho({ habiaTareaEnCurso, posEnCola, mode }) {
   // equivocada.
   if (mode === 'cast') return `⏳ Ya hay un cast en curso. El tuyo queda en la posición #${posicion}.`;
   return `⏳ Antigravity está ocupado con otra tarea. Tu solicitud queda en la posición #${posicion}.`;
+}
+
+/**
+ * Texto vivo del mensaje de progreso: etiqueta, tiempo y, si la hay, la última
+ * herramienta que abrió el agente (FEAT-034). Pura y exportada, como
+ * `avisoDeDespacho`, para poder afirmarla sin lanzar `agy`.
+ */
+export function lineaDeProgreso(etiqueta, segundos, actividad = null) {
+  return `${etiqueta} · ${formatElapsed(segundos)}${actividad ? ` · ${actividad}` : ''}`;
+}
+
+const ACTIVIDAD_MAX = 60;
+
+/**
+ * La actividad sale a Telegram en el mensaje de progreso, y un `CommandLine`
+ * puede traer un secreto (`curl -H "Authorization: …"`). Se redacta ANTES de
+ * recortar —recortar primero podría partir un token y dejarlo irreconocible
+ * para el redactor— y se acota a una línea corta. `redactSecrets` solo conoce
+ * tokens de Telegram: el recorte limita la exposición, no la elimina.
+ */
+export function recortarActividad(texto) {
+  const plano = redactSecrets(String(texto ?? '')).replace(/\s+/g, ' ').trim();
+  return plano.length > ACTIVIDAD_MAX ? `${plano.slice(0, ACTIVIDAD_MAX - 1)}…` : plano;
 }
 
 /**

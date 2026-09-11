@@ -824,6 +824,12 @@ console.log('✔ Test 34 [BE-007]: TELEGRAM_BRIDGE_STATE_FILE tiene precedencia 
     path.join(raiz, 'mcp-server', 'agents'),
     { recursive: true }
   );
+  // FEAT-034: executor.js carga el lector del stream de mcp-server/. Archivo por
+  // archivo, igual que agents/: lo que se demuestra es que el árbol MÍNIMO real
+  // alcanza para arrancar el bot.
+  for (const f of ['agy-stream.js', 'fanout-tail.js', 'prompt-offload.js']) {
+    fs.copyFileSync(path.join(import.meta.dirname, '..', 'mcp-server', f), path.join(raiz, 'mcp-server', f));
+  }
   fs.symlinkSync(path.join(import.meta.dirname, 'node_modules'), path.join(codigo, 'node_modules'), 'junction');
   fs.writeFileSync(path.join(codigo, 'bridge.lock'), JSON.stringify({ pid: 999999, startedAt: null, bootId: null }));
   fs.writeFileSync(path.join(codigo, 'state.json'), '{"chats":{},"pendingAsks":{}}');
@@ -2537,6 +2543,141 @@ console.log('✔ Test 61 [FEAT-026]: /status muestra los dos carriles');
   assert(!encolado.includes('Antigravity está ocupado'), 'no culpa al carril principal');
 }
 console.log('✔ Test 62 [FEAT-026]: el aviso de un cast encolado nombra al otro cast');
+
+// ==============================================================================
+// Rama feat/bot-breadcrumb: FEAT-034, la herramienta activa en el progreso.
+// ==============================================================================
+
+// Test 63 [FEAT-034]: el texto del progreso y el recorte de la actividad.
+{
+  const botMod = await import('./bot.js');
+  assert.strictEqual(botMod.lineaDeProgreso('⚙️ Ejecutando tarea', 135), `⚙️ Ejecutando tarea · ${formatElapsed(135)}`, 'sin actividad, el texto de siempre');
+  assert.strictEqual(
+    botMod.lineaDeProgreso('⚙️ Ejecutando tarea', 135, 'write_to_file → src/a.js'),
+    `⚙️ Ejecutando tarea · ${formatElapsed(135)} · write_to_file → src/a.js`,
+    'con actividad, al final'
+  );
+  const larga = botMod.recortarActividad(`run_command → npm test ${'x'.repeat(200)}`);
+  assert(larga.length === 60 && larga.endsWith('…'), 'recorta a 60 con …');
+  assert.strictEqual(botMod.recortarActividad('run_command →\n  npm\ttest'), 'run_command → npm test', 'colapsa espacios y saltos');
+  const conToken = botMod.recortarActividad('run_command → curl -H 1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+  assert(conToken.includes('[REDACTED]') && !conToken.includes('AAAAAAAAAAAAAAAAAAAA'), 'redacta un token antes de recortar');
+}
+console.log('✔ Test 63 [FEAT-034]: lineaDeProgreso y recortarActividad');
+
+// Test 64 [FEAT-034]: runAgyTask por stream-json, con un agy falso. Cada guion
+// fija un camino del cierre: éxito, error de agy, crash con y sin NDJSON,
+// stream sin `result`, basura intercalada y cancelación a mitad.
+{
+  const executor = await import('./executor.js');
+  const { spawn: spawnReal } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-falso-'));
+  const script = path.join(dir, 'agy-falso.js');
+  fs.writeFileSync(script, `
+    const modo = process.argv[2];
+    const e = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+    const tool = (i, params) => ({ event: 'step_update', step_update: { step_index: i, step_type: 'tool', state: 'ACTIVE', tool_name: params.CommandLine ? 'run_command' : 'write_to_file', tool_info: { parameters: params } } });
+    if (modo === 'feliz') {
+      e({ event: 'init', conversation_id: 'conv-1', init: {} });
+      e(tool(1, { TargetFile: 'src/a.js' }));
+      e({ event: 'step_update', step_update: { step_index: 2, step_type: 'agent_response', text_delta: 'Hola' } });
+      e({ event: 'result', result: { conversation_id: 'conv-1', status: 'SUCCESS', response: 'Listo.', duration_seconds: 42, usage: { input_tokens: 10, output_tokens: 5 } } });
+    } else if (modo === 'error-agy') {
+      e({ event: 'init', conversation_id: 'conv-2' });
+      e({ event: 'result', result: { status: 'ERROR', error: 'cuota agotada' } });
+    } else if (modo === 'crash-texto') {
+      process.stdout.write('panic: flag desconocido --xyz\\n');
+      process.exitCode = 1;
+    } else if (modo === 'crash-stderr') {
+      process.stderr.write('boom en stderr\\n');
+      process.exitCode = 1;
+    } else if (modo === 'sin-result') {
+      e({ event: 'init', conversation_id: 'conv-3' });
+      e({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'parcial' } });
+    } else if (modo === 'basura') {
+      process.stdout.write('aviso raro de agy\\n');
+      e({ event: 'result', result: { conversation_id: 'conv-4', status: 'SUCCESS', response: 'ok' } });
+    } else if (modo === 'lento') {
+      e({ event: 'init', conversation_id: 'conv-5' });
+      let i = 0;
+      setInterval(() => e(tool(i, { CommandLine: 'npm test ' + i++ })), 20);
+      setTimeout(() => process.exit(0), 5000);
+    } else if (modo === 'json') {
+      process.stdout.write(JSON.stringify({ conversation_id: 'c', response: 'r', status: 'SUCCESS' }));
+    }
+  `);
+  const falso = (modo) => (bin, args, opts) => spawnReal(process.execPath, [script, modo], opts);
+  const correr = (modo, extra = {}) => executor.runAgyTask({ prompt: 'x', spawnFn: falso(modo), ...extra });
+
+  const actividades = [];
+  const feliz = await correr('feliz', { onActividad: (t) => actividades.push(t) });
+  assert(feliz.success && feliz.responseText === 'Listo.', `feliz: ${JSON.stringify(feliz).slice(0, 200)}`);
+  assert.strictEqual(feliz.conversationId, 'conv-1', 'conversationId del stream');
+  assert.strictEqual(feliz.data.usage.output_tokens, 5, 'data.usage para formatExecutionMeta');
+  assert.strictEqual(feliz.sessionSeconds, 42, 'sessionSeconds desde duration_seconds, como con json');
+  assert.deepStrictEqual(actividades, ['write_to_file → src/a.js'], 'onActividad recibe la herramienta activa');
+
+  const errorAgy = await correr('error-agy');
+  assert(!errorAgy.success && errorAgy.error.includes('cuota agotada'), `error de agy: ${errorAgy.error}`);
+
+  const crashTexto = await correr('crash-texto');
+  assert(!crashTexto.success && crashTexto.error.includes('flag desconocido'), `crash sin NDJSON conserva el diagnóstico: ${crashTexto.error}`);
+
+  const crashStderr = await correr('crash-stderr');
+  assert(!crashStderr.success && crashStderr.error.includes('boom en stderr'), 'crash con stderr');
+
+  const sinResult = await correr('sin-result');
+  assert(sinResult.success && sinResult.responseText === 'parcial' && sinResult.sessionSeconds === 0, 'sin result y código 0: éxito tolerante con los deltas');
+
+  const basura = await correr('basura');
+  assert(basura.success && basura.responseText === 'ok', 'una línea ilegible no rompe el resultado');
+  assert(!basura.responseText.includes('{'), 'y nunca vuelca NDJSON crudo');
+
+  const tardias = [];
+  let cancelar = null;
+  const promesa = correr('lento', { onActividad: (t) => tardias.push(t), onSpawn: (c) => { cancelar = c; } });
+  const limite = Date.now() + 3000;
+  while (tardias.length < 2 && Date.now() < limite) await new Promise((r) => setTimeout(r, 10));
+  assert(tardias.length >= 2, 'el guion lento emitió herramientas');
+  assert.strictEqual(cancelar(), true, 'cancelar a mitad');
+  const alCancelar = tardias.length;
+  const cancelada = await promesa;
+  await new Promise((r) => setTimeout(r, 200));
+  assert(cancelada.cancelled, 'la tarea queda cancelada');
+  assert.strictEqual(tardias.length, alCancelar, 'ninguna actividad después de cancelar');
+
+  // Test 65 [FEAT-034]: los casts siguen por json, sin cambios.
+  const cast = await executor.runAgyArgs(['--agent', 'x'], { spawnFn: falso('json') });
+  assert(cast.success && cast.data.response === 'r', `runAgyArgs sigue en json: ${JSON.stringify(cast).slice(0, 200)}`);
+  console.log('✔ Test 65 [FEAT-034]: los casts siguen por --output-format json');
+
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+}
+console.log('✔ Test 64 [FEAT-034]: runAgyTask por stream-json respeta el contrato y los diagnósticos');
+
+// Test 66 [FEAT-034]: processTaskQueue le pasa onActividad a runAgyTask.
+{
+  const botMod = await import('./bot.js');
+  const { bot } = botDePrueba();
+  botMod.resetRuntimeState();
+  let recibido = null;
+  botMod.usarEjecutoresDePrueba({
+    runAgyTask: async ({ onActividad }) => {
+      recibido = onActividad;
+      onActividad('write_to_file → src/a.js');
+      return { success: false, cancelled: true };
+    }
+  });
+  try {
+    await bot.handleUpdate(comandoDe('/run algo', 820));
+    const limite = Date.now() + 2000;
+    while (recibido === null && Date.now() < limite) await new Promise((r) => setTimeout(r, 5));
+    assert.strictEqual(typeof recibido, 'function', 'la rama principal cablea onActividad');
+  } finally {
+    botMod.resetRuntimeState();
+  }
+}
+console.log('✔ Test 66 [FEAT-034]: la rama principal cablea onActividad');
 
 // Limpieza: solo el directorio temporal de test
 try {

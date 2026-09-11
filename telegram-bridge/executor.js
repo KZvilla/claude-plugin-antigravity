@@ -2,6 +2,8 @@ import { spawn, execFile, execFileSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import readline from 'node:readline';
+import { createRequire } from 'node:module';
 import {
   loadPolicy,
   resolveWorkspace,
@@ -14,6 +16,13 @@ import {
 // este módulo (ver la cabecera de policy.js). Se reexporta porque `bot.js`, los
 // tests y el servidor MCP la importan históricamente desde aquí.
 export { loadPolicy, resolveWorkspace, resolveExtraDirs } from './policy.js';
+
+// FEAT-034 — El lector del stream de `agy` es el mismo que usa el fan-out del
+// servidor MCP: el acumulador reconstruye la respuesta y `interpretarEvento`
+// dice qué herramienta abrió el agente. Ninguno toca el disco al cargarse.
+const requireCjs = createRequire(import.meta.url);
+const { crearAcumuladorStream } = requireCjs('../mcp-server/agy-stream.js');
+const { interpretarEvento } = requireCjs('../mcp-server/fanout-tail.js');
 
 /**
  * Resuelve la ruta del binario agy.exe de Antigravity
@@ -200,6 +209,9 @@ export function offloadLargePrompt(args) {
  * @param {boolean} [options.sandbox] Fuerza (o desactiva) `--sandbox` para esta tarea
  * @param {(cancel: () => boolean) => void} [options.onSpawn] Recibe una función para
  *        abortar esta tarea. Permite implementar /cancel sin exponer el ChildProcess.
+ * @param {(texto: string) => void} [options.onActividad] FEAT-034: recibe cada
+ *        herramienta que el agente abre («write_to_file → src/a.js»).
+ * @param {Function} [options.spawnFn] Solo para los tests: lanza un agy falso.
  */
 export function runAgyTask(options = {}) {
   const {
@@ -211,7 +223,9 @@ export function runAgyTask(options = {}) {
     conversationId = null,
     cwd = resolveWorkspace(),
     sandbox = undefined,
-    onSpawn = null
+    onSpawn = null,
+    onActividad = null,
+    spawnFn = spawn
   } = options;
 
   const policy = loadPolicy(cwd);
@@ -220,7 +234,9 @@ export function runAgyTask(options = {}) {
   // Construcción de argumentos CLI
   const cliArgs = [
     '--print-timeout', `${timeoutMinutes}m`,
-    '--output-format', 'json',
+    // stream-json y no json (FEAT-034): con json no hay nada que leer hasta el
+    // final, y el progreso no podía decir qué estaba haciendo el agente.
+    '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
     '--mode', mode,
     '--effort', effort
@@ -253,6 +269,9 @@ export function runAgyTask(options = {}) {
     timeoutMinutes,
     conversationId,
     onSpawn,
+    formato: 'stream-json',
+    onActividad,
+    spawnFn,
     descripcion: `modo: ${mode}, sandbox: ${useSandbox ? 'sí' : 'no'}, conv: ${conversationId || 'nueva'}, cwd: ${cwd}`
   });
 }
@@ -270,12 +289,16 @@ export function runAgyTask(options = {}) {
 export async function runAgyArgs(cliArgs, {
   cwd = resolveWorkspace(),
   timeoutMinutes = parseInt(process.env.AGY_TIMEOUT_MINUTES, 10) || 15,
-  onSpawn = null
+  onSpawn = null,
+  spawnFn = spawn
 } = {}) {
+  // Sigue en json: los args los arma cast.js con `--output-format json`, y el
+  // cast no muestra actividad (FEAT-034 lo dejó fuera a propósito).
   const r = await lanzarAgy(['--print-timeout', `${timeoutMinutes}m`, ...cliArgs], {
     cwd,
     timeoutMinutes,
     onSpawn,
+    spawnFn,
     descripcion: `cast, cwd: ${cwd}`
   });
   return {
@@ -290,7 +313,16 @@ export async function runAgyArgs(cliArgs, {
 /**
  * El ciclo de vida del proceso hijo, común a `runAgyTask` y `runAgyArgs`.
  */
-function lanzarAgy(cliArgs, { cwd, timeoutMinutes, conversationId = null, onSpawn = null, descripcion = '' }) {
+function lanzarAgy(cliArgs, {
+  cwd,
+  timeoutMinutes,
+  conversationId = null,
+  onSpawn = null,
+  descripcion = '',
+  formato = 'json',
+  onActividad = null,
+  spawnFn = spawn
+}) {
   const timeoutMs = (timeoutMinutes + 1) * 60 * 1000;
   const { args: finalArgs, cleanup: limpiarPrompt } = offloadLargePrompt(cliArgs);
 
@@ -313,15 +345,44 @@ function lanzarAgy(cliArgs, { cwd, timeoutMinutes, conversationId = null, onSpaw
     // ejecutar comandos, así que heredar `TELEGRAM_BOT_TOKEN` equivale a
     // publicarlo — un `echo` bastaría, y su salida vuelve al chat. Las
     // herramientas salientes no se rompen: `notify.js` lee el `.env` de disco.
-    const child = spawn(AGY_BIN, finalArgs, {
+    const child = spawnFn(AGY_BIN, finalArgs, {
       cwd,
       shell: false,
       env: sanitizeEnv()
     });
 
+    // FEAT-034 — En stream, cada línea alimenta al acumulador (que al cierre
+    // reconstruye lo que antes daba el JSON final) y, si es una herramienta que
+    // arranca, se avisa por `onActividad`. `readline` convive con el listener
+    // `data` de abajo: los dos reciben los mismos buffers.
+    const enStream = formato === 'stream-json';
+    const acumulador = enStream ? crearAcumuladorStream() : null;
+    let lector = null;
+    if (enStream) {
+      lector = readline.createInterface({ input: child.stdout, terminal: false });
+      lector.on('line', (linea) => {
+        acumulador.onLine(linea);
+        // Tras cancelar o vencer, el proceso puede seguir escribiendo mientras
+        // muere: esas líneas no deben mover el progreso de una tarea cerrada.
+        if (settled || typeof onActividad !== 'function') return;
+        try {
+          const ev = interpretarEvento(linea);
+          if (ev && ev.tipo === 'tool') onActividad(ev.texto);
+        } catch (err) {
+          console.warn(`[executor] onActividad falló: ${redactSecrets(err.message)}`);
+        }
+      });
+    }
+    const cerrarLector = () => {
+      if (lector) {
+        try { lector.close(); } catch {}
+      }
+    };
+
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      cerrarLector();
       terminate(child);
       limpiarPrompt();
       resolve({
@@ -338,6 +399,7 @@ function lanzarAgy(cliArgs, { cwd, timeoutMinutes, conversationId = null, onSpaw
         if (settled) return false;
         settled = true;
         clearTimeout(timer);
+        cerrarLector();
         terminate(child);
         limpiarPrompt();
         resolve({
@@ -364,6 +426,9 @@ function lanzarAgy(cliArgs, { cwd, timeoutMinutes, conversationId = null, onSpaw
       clearTimeout(timer);
       if (settled) return;
       settled = true;
+      // Igual que timeout y cancelación: tras el fallo de spawn, nada más del
+      // lector.
+      cerrarLector();
       limpiarPrompt();
       resolve({
         success: false,
@@ -381,10 +446,29 @@ function lanzarAgy(cliArgs, { cwd, timeoutMinutes, conversationId = null, onSpaw
       if (settled) return;
       settled = true;
 
+      // En stream no hay un JSON final que parsear: se arma el mismo `parsed`
+      // desde el acumulador, y todo lo de abajo queda igual. `readline` emite
+      // sus últimas líneas antes del `close` del hijo, así que ya está completo.
       let parsed = null;
-      try {
-        parsed = JSON.parse(stdout.trim());
-      } catch {}
+      let respuestaStream = '';
+      let eventosStream = 0;
+      if (enStream) {
+        const r = acumulador.resultado();
+        eventosStream = r.eventos;
+        respuestaStream = r.response || '';
+        parsed = r.eventos > 0 ? {
+          response: r.response,
+          conversation_id: r.conversationId,
+          duration_seconds: r.durationSeconds,
+          usage: r.usage,
+          status: r.error ? 'ERROR' : undefined,
+          error: r.error || undefined
+        } : null;
+      } else {
+        try {
+          parsed = JSON.parse(stdout.trim());
+        } catch {}
+      }
 
       const activeConvId = (parsed && parsed.conversation_id) || conversationId || null;
       // Reloj de pared de ESTA tarea. `parsed.duration_seconds` es acumulado de
@@ -394,7 +478,10 @@ function lanzarAgy(cliArgs, { cwd, timeoutMinutes, conversationId = null, onSpaw
       const sessionSeconds = (parsed && parsed.duration_seconds) || 0;
 
       if (code === 0 && (!parsed || parsed.status !== 'ERROR')) {
-        const responseText = (parsed && parsed.response) || stdout || '(Sin respuesta generada)';
+        // En stream, `stdout` es NDJSON crudo: jamás se entrega como respuesta.
+        const responseText = (parsed && parsed.response)
+          || (enStream ? '' : stdout)
+          || '(Sin respuesta generada)';
         resolve({
           success: true,
           data: parsed,
@@ -411,7 +498,13 @@ function lanzarAgy(cliArgs, { cwd, timeoutMinutes, conversationId = null, onSpaw
         } else if (stderr.trim()) {
           errorMsg += `\nDetalles: ${redactSecrets(stderr.trim())}`;
         } else if (stdout.trim()) {
-          errorMsg += `\nSalida: ${redactSecrets(stdout.trim())}`;
+          // Con eventos y texto de respuesta, eso; si `agy` murió antes de
+          // emitir NDJSON (o nada fue legible), lo crudo: ahí está el motivo, y
+          // sin él el error llegaba al chat sin un solo detalle.
+          const salida = enStream && eventosStream > 0 && respuestaStream.trim()
+            ? respuestaStream.trim()
+            : stdout.trim();
+          errorMsg += `\nSalida: ${redactSecrets(salida)}`;
         }
 
         resolve({
