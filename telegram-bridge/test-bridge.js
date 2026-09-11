@@ -824,6 +824,12 @@ console.log('✔ Test 34 [BE-007]: TELEGRAM_BRIDGE_STATE_FILE tiene precedencia 
     path.join(raiz, 'mcp-server', 'agents'),
     { recursive: true }
   );
+  // FEAT-034: executor.js carga el lector del stream de mcp-server/. Archivo por
+  // archivo, igual que agents/: lo que se demuestra es que el árbol MÍNIMO real
+  // alcanza para arrancar el bot.
+  for (const f of ['agy-stream.js', 'fanout-tail.js', 'prompt-offload.js']) {
+    fs.copyFileSync(path.join(import.meta.dirname, '..', 'mcp-server', f), path.join(raiz, 'mcp-server', f));
+  }
   fs.symlinkSync(path.join(import.meta.dirname, 'node_modules'), path.join(codigo, 'node_modules'), 'junction');
   fs.writeFileSync(path.join(codigo, 'bridge.lock'), JSON.stringify({ pid: 999999, startedAt: null, bootId: null }));
   fs.writeFileSync(path.join(codigo, 'state.json'), '{"chats":{},"pendingAsks":{}}');
@@ -2089,6 +2095,7 @@ console.log('✔ Test 50 [FEAT-022]: /cast solo castea agentes read-only y nada 
   const ayuda = llamadas.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text).join('\n');
   assert(ayuda.includes('/plan') && ayuda.includes('/cast'), '/help responde y lista los comandos, /cast incluido');
   assert(ayuda.includes('/diff') && ayuda.includes('/logs'), '/help lista /diff y /logs');
+  assert(ayuda.includes('/cancel cast'), '/help explica /cancel cast');
   resetRuntimeState();
 }
 console.log('✔ Test 51: /help responde con la lista de comandos');
@@ -2384,6 +2391,413 @@ console.log('✔ Test 57 [fix/telegram-ask]: estadoDaemon reconoce un bot vivo, 
   }
 }
 console.log('✔ Test 58 [fix/telegram-ask]: sin daemon, el ask falla rápido y sin tocar la red');
+
+// ==============================================================================
+// Rama feat/bot-carril-cast: FEAT-026, un carril de casts al lado del principal.
+// ==============================================================================
+
+// Test 59 [FEAT-026]: una cola por carril. Con [run, cast] esperando, el cast
+// sale por su carril aunque el run esté primero: con una sola cola y un
+// shift(), quedaba bloqueado detrás (head-of-line).
+{
+  queue.clearQueue();
+  const run = { prompt: 'run', mode: 'accept-edits' };
+  const cast = { prompt: 'cast', mode: 'cast', kind: 'cast', agent: 'lector' };
+  assert.strictEqual(queue.enqueueTask(run), 1, 'posición dentro del carril principal');
+  assert.strictEqual(queue.enqueueTask(cast), 1, 'posición dentro del carril de casts');
+  assert.strictEqual(run.carril, 'principal');
+  assert.strictEqual(cast.carril, 'cast');
+  assert.strictEqual(queue.getQueueLength(), 2, 'sin carril: el total');
+  assert.strictEqual(queue.getQueueLength('cast'), 1);
+
+  const todo = queue.getQueueSnapshot();
+  assert.deepStrictEqual(todo.map((t) => t.carril), ['principal', 'cast'], 'snapshot: primero el principal');
+  assert.strictEqual(todo[1].agent, 'lector', 'el snapshot trae el agente del cast');
+  assert.strictEqual(todo[1].kind, 'cast');
+  assert.strictEqual(queue.getQueueSnapshot('cast').length, 1, 'snapshot de un solo carril');
+
+  assert.strictEqual(queue.dequeueTask('cast'), cast, 'el cast sale aunque el run esté antes');
+  assert.strictEqual(queue.getQueueLength('principal'), 1, 'y el run sigue en su cola');
+  queue.enqueueTask({ ...cast });
+  assert.strictEqual(queue.clearQueue('cast'), 1, 'vaciar un carril');
+  assert.strictEqual(queue.getQueueLength(), 1, 'deja el otro intacto');
+  assert.strictEqual(queue.clearQueue(), 1);
+  assert.throws(() => queue.dequeueTask('otro'), /Carril desconocido/);
+}
+console.log('✔ Test 59 [FEAT-026]: una cola por carril, sin head-of-line blocking');
+
+// Test 60 [FEAT-026]: un cast arranca mientras un /run sigue en curso, un
+// segundo cast espera al primero, y /cancel cast corta solo su carril. Con
+// ejecutores falsos: la rama de ejecución real lanza agy.
+{
+  const botMod = await import('./bot.js');
+  const { bot, llamadas } = botDePrueba();
+  botMod.resetRuntimeState();
+  // Espera determinista: sondea la condición en vez de dormir un tiempo fijo,
+  // que bajo carga daría falsos rojos. Si no se cumple en 2 s, falla con motivo.
+  const esperarQue = async (condicion, motivo) => {
+    const limite = Date.now() + 2000;
+    while (!condicion()) {
+      if (Date.now() > limite) throw new Error(`Test 60: no se cumplió a tiempo: ${motivo}`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
+  const diferido = () => { let resolver; const promesa = new Promise((r) => { resolver = r; }); return { promesa, resolver }; };
+
+  const run = diferido();
+  let runIniciado = 0;
+  let cancelRun = 0;
+  let llamadasCastear = 0;
+  let cancelCast = 0;
+  botMod.usarEjecutoresDePrueba({
+    runAgyTask: async ({ onSpawn }) => {
+      runIniciado++;
+      onSpawn(() => { cancelRun++; run.resolver({ success: false, cancelled: true }); return true; });
+      return run.promesa;
+    },
+    castear: async ({ opciones }) => {
+      llamadasCastear++;
+      const d = diferido();
+      opciones.onSpawn(() => { cancelCast++; d.resolver({ ok: false, cancelled: true }); return true; });
+      return d.promesa;
+    }
+  });
+  assert.strictEqual(botMod.ejecutoresSonLosReales(), false, 'los ejecutores falsos están puestos');
+
+  const avisosCast = [];
+  const ctxCast = {
+    chat: { id: Number(USUARIO_OK) },
+    reply: async (t) => { avisosCast.push(t); return { message_id: 900 + avisosCast.length }; }
+  };
+  const cast = { agent: 'lector', prompt: 'revisá el último commit', cwd: os.tmpdir(), workspaceName: 'tmp' };
+
+  try {
+    await bot.handleUpdate(comandoDe('/run correr la suite completa', 800));
+    await esperarQue(() => runIniciado === 1, 'el run arranca');
+
+    await botMod.dispatchCast(ctxCast, cast);
+    await esperarQue(() => llamadasCastear === 1, 'el cast arranca');
+    assert(cancelRun === 0 && botMod.carrilOcupado('principal'), 'el cast arrancó CON el run todavía en curso');
+    assert(avisosCast[0].includes('Casteando'), 'y su aviso no dice que está esperando');
+
+    // Sin espera a propósito: dispatchCast ya dejó el cast en su cola y el
+    // carril está ocupado, así que no hay nada asíncrono que pudiera arrancarlo.
+    await botMod.dispatchCast(ctxCast, { ...cast, prompt: 'segundo pedido' });
+    assert.strictEqual(llamadasCastear, 1, 'el segundo cast no arranca: uno a la vez por carril');
+    assert(avisosCast[1].includes('Ya hay un cast en curso') && avisosCast[1].includes('#2'), 'y su aviso lo dice');
+    assert.strictEqual(queue.getQueueLength('cast'), 1, 'queda en la cola de casts');
+
+    llamadas.length = 0;
+    await bot.handleUpdate(comandoDe('/queue', 801));
+    const vista = textosEnviados(llamadas);
+    assert(vista.includes('Principal') && vista.includes('Casts') && vista.includes('lector'), '/queue muestra los dos carriles');
+
+    llamadas.length = 0;
+    await bot.handleUpdate(comandoDe('/cancel cast', 802));
+    assert(cancelCast === 1 && cancelRun === 0, '/cancel cast corta el cast y no el run');
+    assert.strictEqual(queue.getQueueLength('cast'), 0, 'y vacía la cola de casts');
+    assert(textosEnviados(llamadas).includes('cast en curso abortado'), 'el mensaje dice qué se cortó');
+    await esperarQue(() => !botMod.carrilOcupado('cast'), 'el carril de casts queda libre');
+    assert(botMod.carrilOcupado('principal'), 'y el run sigue en curso');
+
+    llamadas.length = 0;
+    await bot.handleUpdate(comandoDe('/cancel foo', 803));
+    assert(textosEnviados(llamadas).includes('No se canceló nada') && cancelRun === 0, 'un argumento desconocido no cancela nada');
+
+    llamadas.length = 0;
+    await bot.handleUpdate(comandoDe('/cancel CAST', 804));
+    assert(textosEnviados(llamadas).includes('No hay ningún cast'), 'sin cast: su propio mensaje, y el argumento se normaliza');
+
+    llamadas.length = 0;
+    await bot.handleUpdate(comandoDe('/cancel', 805));
+    assert.strictEqual(cancelRun, 1, '/cancel corta el run');
+    assert(textosEnviados(llamadas).includes('tarea en curso abortada'));
+    await esperarQue(() => !botMod.carrilOcupado('principal'), 'el carril principal queda libre');
+
+    llamadas.length = 0;
+    await bot.handleUpdate(comandoDe('/queue', 806));
+    assert(textosEnviados(llamadas).includes('No hay nada en curso'), 'los dos carriles quedaron libres');
+  } finally {
+    botMod.resetRuntimeState();
+  }
+  assert.strictEqual(botMod.ejecutoresSonLosReales(), true, 'resetRuntimeState vuelve a los ejecutores reales');
+}
+console.log('✔ Test 60 [FEAT-026]: el cast corre al lado del run, uno a la vez, y /cancel cast corta solo su carril');
+
+// Test 61 [FEAT-026]: /status informa cada carril por separado.
+{
+  const { bot, llamadas } = botDePrueba();
+  resetRuntimeState();
+  await bot.handleUpdate(comandoDe('/status', 810));
+  const estado = textosEnviados(llamadas);
+  assert(estado.includes('Cola principal') && estado.includes('Cola de casts'), '/status muestra los dos carriles');
+  resetRuntimeState();
+}
+console.log('✔ Test 61 [FEAT-026]: /status muestra los dos carriles');
+
+// Test 62 [FEAT-026]: el aviso de un cast encolado da la razón correcta.
+{
+  assert(avisoDeDespacho({ habiaTareaEnCurso: false, posEnCola: 1, mode: 'cast' }).includes('Casteando'), 'cast sin espera');
+  const encolado = avisoDeDespacho({ habiaTareaEnCurso: true, posEnCola: 1, mode: 'cast' });
+  assert(encolado.includes('Ya hay un cast en curso') && encolado.includes('#2'), 'cast detrás de otro cast');
+  assert(!encolado.includes('Antigravity está ocupado'), 'no culpa al carril principal');
+}
+console.log('✔ Test 62 [FEAT-026]: el aviso de un cast encolado nombra al otro cast');
+
+// ==============================================================================
+// Rama feat/bot-breadcrumb: FEAT-034, la herramienta activa en el progreso.
+// ==============================================================================
+
+// Test 63 [FEAT-034]: el texto del progreso y el recorte de la actividad.
+{
+  const botMod = await import('./bot.js');
+  assert.strictEqual(botMod.lineaDeProgreso('⚙️ Ejecutando tarea', 135), `⚙️ Ejecutando tarea · ${formatElapsed(135)}`, 'sin actividad, el texto de siempre');
+  assert.strictEqual(
+    botMod.lineaDeProgreso('⚙️ Ejecutando tarea', 135, 'write_to_file → src/a.js'),
+    `⚙️ Ejecutando tarea · ${formatElapsed(135)} · write_to_file → src/a.js`,
+    'con actividad, al final'
+  );
+  const larga = botMod.recortarActividad(`run_command → npm test ${'x'.repeat(200)}`);
+  assert(larga.length === 60 && larga.endsWith('…'), 'recorta a 60 con …');
+  assert.strictEqual(botMod.recortarActividad('run_command →\n  npm\ttest'), 'run_command → npm test', 'colapsa espacios y saltos');
+  const conToken = botMod.recortarActividad('run_command → curl -H 1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+  assert(conToken.includes('[REDACTED]') && !conToken.includes('AAAAAAAAAAAAAAAAAAAA'), 'redacta un token antes de recortar');
+}
+console.log('✔ Test 63 [FEAT-034]: lineaDeProgreso y recortarActividad');
+
+// Test 64 [FEAT-034]: runAgyTask por stream-json, con un agy falso. Cada guion
+// fija un camino del cierre: éxito, error de agy, crash con y sin NDJSON,
+// stream sin `result`, basura intercalada y cancelación a mitad.
+{
+  const executor = await import('./executor.js');
+  const { spawn: spawnReal } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-falso-'));
+  const script = path.join(dir, 'agy-falso.js');
+  fs.writeFileSync(script, `
+    const modo = process.argv[2];
+    const e = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+    const tool = (i, params) => ({ event: 'step_update', step_update: { step_index: i, step_type: 'tool', state: 'ACTIVE', tool_name: params.CommandLine ? 'run_command' : 'write_to_file', tool_info: { parameters: params } } });
+    if (modo === 'feliz') {
+      e({ event: 'init', conversation_id: 'conv-1', init: {} });
+      e(tool(1, { TargetFile: 'src/a.js' }));
+      e({ event: 'step_update', step_update: { step_index: 2, step_type: 'agent_response', text_delta: 'Hola' } });
+      e({ event: 'result', result: { conversation_id: 'conv-1', status: 'SUCCESS', response: 'Listo.', duration_seconds: 42, usage: { input_tokens: 10, output_tokens: 5 } } });
+    } else if (modo === 'error-agy') {
+      e({ event: 'init', conversation_id: 'conv-2' });
+      e({ event: 'result', result: { status: 'ERROR', error: 'cuota agotada' } });
+    } else if (modo === 'crash-texto') {
+      process.stdout.write('panic: flag desconocido --xyz\\n');
+      process.exitCode = 1;
+    } else if (modo === 'crash-stderr') {
+      process.stderr.write('boom en stderr\\n');
+      process.exitCode = 1;
+    } else if (modo === 'sin-result') {
+      e({ event: 'init', conversation_id: 'conv-3' });
+      e({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'parcial' } });
+    } else if (modo === 'basura') {
+      process.stdout.write('aviso raro de agy\\n');
+      e({ event: 'result', result: { conversation_id: 'conv-4', status: 'SUCCESS', response: 'ok' } });
+    } else if (modo === 'lento') {
+      e({ event: 'init', conversation_id: 'conv-5' });
+      let i = 0;
+      setInterval(() => e(tool(i, { CommandLine: 'npm test ' + i++ })), 20);
+      setTimeout(() => process.exit(0), 5000);
+    } else if (modo === 'json') {
+      process.stdout.write(JSON.stringify({ conversation_id: 'c', response: 'r', status: 'SUCCESS' }));
+    }
+  `);
+  const falso = (modo) => (bin, args, opts) => spawnReal(process.execPath, [script, modo], opts);
+  const correr = (modo, extra = {}) => executor.runAgyTask({ prompt: 'x', spawnFn: falso(modo), ...extra });
+
+  const actividades = [];
+  const feliz = await correr('feliz', { onActividad: (t) => actividades.push(t) });
+  assert(feliz.success && feliz.responseText === 'Listo.', `feliz: ${JSON.stringify(feliz).slice(0, 200)}`);
+  assert.strictEqual(feliz.conversationId, 'conv-1', 'conversationId del stream');
+  assert.strictEqual(feliz.data.usage.output_tokens, 5, 'data.usage para formatExecutionMeta');
+  assert.strictEqual(feliz.sessionSeconds, 42, 'sessionSeconds desde duration_seconds, como con json');
+  assert.deepStrictEqual(actividades, ['write_to_file → src/a.js'], 'onActividad recibe la herramienta activa');
+
+  const errorAgy = await correr('error-agy');
+  assert(!errorAgy.success && errorAgy.error.includes('cuota agotada'), `error de agy: ${errorAgy.error}`);
+
+  const crashTexto = await correr('crash-texto');
+  assert(!crashTexto.success && crashTexto.error.includes('flag desconocido'), `crash sin NDJSON conserva el diagnóstico: ${crashTexto.error}`);
+
+  const crashStderr = await correr('crash-stderr');
+  assert(!crashStderr.success && crashStderr.error.includes('boom en stderr'), 'crash con stderr');
+
+  const sinResult = await correr('sin-result');
+  assert(sinResult.success && sinResult.responseText === 'parcial' && sinResult.sessionSeconds === 0, 'sin result y código 0: éxito tolerante con los deltas');
+
+  const basura = await correr('basura');
+  assert(basura.success && basura.responseText === 'ok', 'una línea ilegible no rompe el resultado');
+  assert(!basura.responseText.includes('{'), 'y nunca vuelca NDJSON crudo');
+
+  const tardias = [];
+  let cancelar = null;
+  const promesa = correr('lento', { onActividad: (t) => tardias.push(t), onSpawn: (c) => { cancelar = c; } });
+  const limite = Date.now() + 3000;
+  while (tardias.length < 2 && Date.now() < limite) await new Promise((r) => setTimeout(r, 10));
+  assert(tardias.length >= 2, 'el guion lento emitió herramientas');
+  assert.strictEqual(cancelar(), true, 'cancelar a mitad');
+  const alCancelar = tardias.length;
+  const cancelada = await promesa;
+  await new Promise((r) => setTimeout(r, 200));
+  assert(cancelada.cancelled, 'la tarea queda cancelada');
+  assert.strictEqual(tardias.length, alCancelar, 'ninguna actividad después de cancelar');
+
+  // Test 65 [FEAT-034]: los casts siguen por json, sin cambios.
+  const cast = await executor.runAgyArgs(['--agent', 'x'], { spawnFn: falso('json') });
+  assert(cast.success && cast.data.response === 'r', `runAgyArgs sigue en json: ${JSON.stringify(cast).slice(0, 200)}`);
+  console.log('✔ Test 65 [FEAT-034]: los casts siguen por --output-format json');
+
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+}
+console.log('✔ Test 64 [FEAT-034]: runAgyTask por stream-json respeta el contrato y los diagnósticos');
+
+// Test 66 [FEAT-034]: processTaskQueue le pasa onActividad a runAgyTask.
+{
+  const botMod = await import('./bot.js');
+  const { bot } = botDePrueba();
+  botMod.resetRuntimeState();
+  let recibido = null;
+  botMod.usarEjecutoresDePrueba({
+    runAgyTask: async ({ onActividad }) => {
+      recibido = onActividad;
+      onActividad('write_to_file → src/a.js');
+      return { success: false, cancelled: true };
+    }
+  });
+  try {
+    await bot.handleUpdate(comandoDe('/run algo', 820));
+    const limite = Date.now() + 2000;
+    while (recibido === null && Date.now() < limite) await new Promise((r) => setTimeout(r, 5));
+    assert.strictEqual(typeof recibido, 'function', 'la rama principal cablea onActividad');
+  } finally {
+    botMod.resetRuntimeState();
+  }
+}
+console.log('✔ Test 66 [FEAT-034]: la rama principal cablea onActividad');
+
+// ==============================================================================
+// Rama feat/cast-favorito: FEAT-025 recortada, el último workspace primero.
+// ==============================================================================
+
+// Test 67 [FEAT-025]: el teclado de /cast pone el último workspace primero, con
+// ⭐ en lugar de 📁. Ordenar y marcar van juntos: no puede quedar una ⭐ fuera
+// del primer lugar.
+{
+  const botMod = await import('./bot.js');
+  const ws = [
+    { id: 'aaaaaaaa', displayName: 'uno (a)' },
+    { id: 'bbbbbbbb', displayName: 'dos (b)' },
+    { id: 'cccccccc', displayName: 'tres (c)' }
+  ];
+  const textos = (kb) => kb.inline_keyboard.flat().map((b) => b.text);
+  assert.deepStrictEqual(textos(botMod.buildCastWorkspacesKeyboard('0a1b2c3d', ws)).slice(0, 3),
+    ['📁 uno (a)', '📁 dos (b)', '📁 tres (c)'], 'sin favorito, el orden y los íconos de siempre');
+
+  const conFav = botMod.buildCastWorkspacesKeyboard('0a1b2c3d', ws, 'cccccccc').inline_keyboard.flat();
+  assert.strictEqual(conFav[0].text, '⭐ tres (c)', 'el favorito va primero y la ⭐ reemplaza al 📁');
+  assert.strictEqual(conFav[0].callback_data, 'cast_ws:0a1b2c3d:cccccccc', 'el callback_data no cambia');
+  assert.strictEqual(conFav.filter((b) => b.text.startsWith('⭐')).length, 1, 'una sola ⭐');
+  assert.deepStrictEqual(conFav.slice(1, 3).map((b) => b.text), ['📁 uno (a)', '📁 dos (b)'], 'el resto conserva su orden');
+  assert(conFav.every((b) => Buffer.byteLength(b.callback_data, 'utf8') <= 64), 'todo callback_data entra en 64 bytes');
+  assert.deepStrictEqual(ws.map((w) => w.id), ['aaaaaaaa', 'bbbbbbbb', 'cccccccc'], 'no muta la lista');
+
+  const fantasma = textos(botMod.buildCastWorkspacesKeyboard('0a1b2c3d', ws, 'dddddddd'));
+  assert(fantasma[0] === '📁 uno (a)' && !fantasma.some((t) => t.startsWith('⭐')), 'un favorito que ya no existe no marca nada');
+}
+console.log('✔ Test 67 [FEAT-025]: el favorito va primero con ⭐ y el callback no cambia');
+
+// Test 68 [FEAT-025]: el favorito se guarda por chat, con la forma de un id, y
+// /reset (que reinicia la conversación) no lo borra.
+{
+  assert.strictEqual(state.getUltimoWorkspaceCast(777000), null, 'chat sin registro → null');
+  assert.strictEqual(state.setUltimoWorkspaceCast(777000, 'abcdef12'), true);
+  assert.strictEqual(state.getUltimoWorkspaceCast('777000'), 'abcdef12', 'número y string son el mismo chat');
+  assert.strictEqual(state.setUltimoWorkspaceCast(777000, '../x'), false, 'un id con otra forma no se escribe');
+  assert.strictEqual(state.getUltimoWorkspaceCast(777000), 'abcdef12', 'y el anterior queda');
+  state.setConversationId(777000, 'conv-x');
+  state.clearConversationId(777000);
+  assert.strictEqual(state.getUltimoWorkspaceCast(777000), 'abcdef12', '/reset no borra el favorito');
+}
+console.log('✔ Test 68 [FEAT-025]: el favorito se guarda por chat y sobrevive a /reset');
+
+// Test 69 [FEAT-025]: de punta a punta. /cast, tocar el segundo proyecto, y el
+// siguiente /cast lo ofrece primero. Home falso y sin allowlist del entorno:
+// el test no puede depender de la configuración real de la máquina.
+{
+  const botMod = await import('./bot.js');
+  const homeFalso = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fav-home-'));
+  const proyA = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fav-a-')));
+  const proyB = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fav-b-')));
+  const previo = {
+    USERPROFILE: process.env.USERPROFILE,
+    HOME: process.env.HOME,
+    ALLOWED_CLAUDE_WORKSPACES: process.env.ALLOWED_CLAUDE_WORKSPACES,
+    ALLOWED_WORKSPACES: process.env.ALLOWED_WORKSPACES
+  };
+  process.env.USERPROFILE = homeFalso;
+  process.env.HOME = homeFalso;
+  delete process.env.ALLOWED_CLAUDE_WORKSPACES;
+  delete process.env.ALLOWED_WORKSPACES;
+  fs.mkdirSync(path.join(homeFalso, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(homeFalso, '.claude', 'antigravity-agents.json'), JSON.stringify({
+    agents: { lector: { skill: 'agency-code-reviewer', read_only: true } }
+  }));
+  fs.writeFileSync(path.join(homeFalso, '.claude.json'), JSON.stringify({
+    projects: { [proyA]: { hasTrustDialogAccepted: true }, [proyB]: { hasTrustDialogAccepted: true } }
+  }));
+
+  const { bot, llamadas } = botDePrueba();
+  botMod.resetRuntimeState();
+  let casteos = 0;
+  botMod.usarEjecutoresDePrueba({
+    castear: async () => { casteos++; return { ok: true, respuesta: 'listo', memoria: {} }; }
+  });
+  const botonesDelUltimoTeclado = () => {
+    const m = llamadas.filter((c) => c.method === 'sendMessage' && c.payload.reply_markup).at(-1);
+    return m ? m.payload.reply_markup.inline_keyboard.flat().filter((b) => b.callback_data.startsWith('cast_ws:')) : [];
+  };
+
+  try {
+    await bot.handleUpdate(comandoDe('/cast lector revisá esto', 830));
+    const primero = botonesDelUltimoTeclado();
+    assert.strictEqual(primero.length, 2, `dos proyectos: ${JSON.stringify(primero)}`);
+    assert(!primero.some((b) => b.text.startsWith('⭐')), 'la primera vez no hay favorito');
+
+    const elegido = primero[1];
+    const idElegido = elegido.callback_data.split(':')[2];
+    await bot.handleUpdate({
+      update_id: 831,
+      callback_query: {
+        id: '831',
+        from: { id: Number(USUARIO_OK), is_bot: false, first_name: 'Test' },
+        chat_instance: 'ci',
+        data: elegido.callback_data,
+        message: { message_id: 5, date: 0, chat: { id: Number(USUARIO_OK), type: 'private' }, text: 'x' }
+      }
+    });
+    const limite = Date.now() + 2000;
+    while (casteos === 0 && Date.now() < limite) await new Promise((r) => setTimeout(r, 5));
+    assert.strictEqual(casteos, 1, 'se casteó');
+    assert.strictEqual(state.getUltimoWorkspaceCast(USUARIO_OK), idElegido, 'y se recordó ese workspace');
+
+    await bot.handleUpdate(comandoDe('/cast lector otra cosa', 832));
+    const segundo = botonesDelUltimoTeclado();
+    assert(segundo[0].text.startsWith('⭐') && segundo[0].callback_data.endsWith(`:${idElegido}`),
+      `el siguiente /cast lo ofrece primero: ${JSON.stringify(segundo)}`);
+  } finally {
+    botMod.resetRuntimeState();
+    for (const [k, v] of Object.entries(previo)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    for (const d of [homeFalso, proyA, proyB]) fs.rmSync(d, { recursive: true, force: true });
+  }
+}
+console.log('✔ Test 69 [FEAT-025]: el workspace del último cast aparece primero en el siguiente');
 
 // Limpieza: solo el directorio temporal de test
 try {

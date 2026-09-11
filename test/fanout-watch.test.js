@@ -638,6 +638,138 @@ async function main() {
     }
   });
 
+  await group('FEAT-032: accesibilidad del visor', () => {
+    const fan = paginaHtml('lote', 'tok');
+    const ag = paginaAgentes('tok', true);
+    for (const [nombre, html] of [['fan-out', fan], ['agentes', ag]]) {
+      check(`${nombre}: sin #4d5566 (2.35:1)`, !html.includes('#4d5566'));
+      check(`${nombre}: sin #6b7385 (≈3.7:1)`, !html.includes('#6b7385'));
+    }
+    check('agentes: cada fila tiene un botón con aria-expanded', ag.includes('class="expandir" aria-expanded="false"'));
+    check('agentes: la tabla hace scroll horizontal', ag.includes('class="tabla-scroll"'));
+    check('agentes: el resumen se anuncia', /id="resumen" aria-live="polite"/.test(ag));
+    check('fan-out: el anuncio vive en un span aparte', /class="sr-only" aria-live="polite" id="anuncio"/.test(fan));
+    check('fan-out: #resumen (se reescribe cada segundo) no lleva aria-live', !/id="resumen"[^>]*aria-live/.test(fan));
+    check('fan-out: la grilla no desborda en pantallas angostas', fan.includes('minmax(min(100%, 360px), 1fr)'));
+    // Se recorta el cuerpo de pintarDiff y se afirma lo que hace, no lo que no
+    // aparece en toda la página: el contenido del diff viaja solo por textContent.
+    const inicioDiff = fan.indexOf('function pintarDiff(');
+    const cuerpoDiff = inicioDiff === -1 ? '' : fan.slice(inicioDiff, fan.indexOf('\nconst MARCA', inicioDiff));
+    check('fan-out: pintarDiff existe', cuerpoDiff.length > 0);
+    check('fan-out: pintarDiff escribe con textContent', cuerpoDiff.includes('.textContent = texto'));
+    check('fan-out: pintarDiff nunca usa innerHTML', cuerpoDiff.length > 0 && !cuerpoDiff.includes('innerHTML'));
+  });
+
+  await group('FEAT-033: GET /api/diff muestra lo del subagente y respeta deny_paths', async () => {
+    const { execFileSync } = require('node:child_process');
+    const { diffDeTarea } = require('../mcp-server/fanout-watch.js');
+    const git = (dir, ...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'watch-diff-')));
+    let servidor;
+    try {
+      execFileSync('git', ['init', '-q', '-b', 'main', repo], { stdio: 'ignore' });
+      git(repo, 'config', 'user.email', 'test@example.com');
+      git(repo, 'config', 'user.name', 'Test');
+      git(repo, 'config', 'commit.gpgsign', 'false');
+      // Política propia del repo: el test no depende del ~/.claude/antigravity.json de la máquina.
+      fs.mkdirSync(path.join(repo, '.claude'), { recursive: true });
+      fs.writeFileSync(path.join(repo, '.claude', 'antigravity.json'),
+        JSON.stringify({ permissions: { deny_paths: ['.env*', '**/*.key', '**/*.pem'] } }));
+      fs.writeFileSync(path.join(repo, '.gitignore'), '.claude/\n');
+      fs.writeFileSync(path.join(repo, 'a.js'), 'uno\n');
+      fs.writeFileSync(path.join(repo, '.env'), 'SECRETO=base\n');
+      git(repo, 'add', '-A');
+      git(repo, 'commit', '-q', '-m', 'inicial');
+
+      const slug = 'lote';
+      const rama = 'wt/agy-lote-1';
+      const wt = path.join(repo, '.claude', 'worktrees', 'agy-lote-1');
+      git(repo, 'worktree', 'add', '-q', '-b', rama, wt, 'main');
+      // Lo del subagente: un commit propio (con un secreto bajo un nombre con
+      // espacio y ñ, el que habría roto un parser de encabezados) y cambios
+      // sin commitear.
+      fs.writeFileSync(path.join(wt, 'b.js'), 'nuevo en la rama\n');
+      fs.mkdirSync(path.join(wt, 'dir con ñ'));
+      fs.writeFileSync(path.join(wt, 'dir con ñ', '.env.local'), 'SECRETO=rama\n');
+      git(wt, 'add', '-A');
+      git(wt, 'commit', '-q', '-m', 'del subagente');
+      fs.writeFileSync(path.join(wt, 'a.js'), 'uno\ndos\n');
+      fs.writeFileSync(path.join(wt, '.env'), 'SECRETO=cambiado\n');
+      fs.writeFileSync(path.join(wt, 'nuevo.js'), 'sin trackear\n');
+      // La base avanza DESPUÉS: con `git diff <ramaBase>` c.js saldría como borrado.
+      fs.writeFileSync(path.join(repo, 'c.js'), 'de main\n');
+      git(repo, 'add', 'c.js');
+      git(repo, 'commit', '-q', '-m', 'main avanza');
+
+      const escritor = crearEscritorDeEstado(repo, slug, [{ id: 't1' }]);
+      escritor.iniciar({ ramaBase: 'main', concurrencia: 1, meta: { t1: { rama } } });
+      escritor.marcar('t1', { estado: 'error' });
+
+      const lanzado = await levantar(repo, slug);
+      servidor = lanzado.servidor;
+      const { puerto, token } = lanzado;
+      const pedirDiff = async (taskId, conElToken = true) => {
+        const r = await pedir(puerto, '/api/diff?taskId=' + encodeURIComponent(taskId), conElToken ? token : null);
+        let json = null;
+        try { json = JSON.parse(r.cuerpo); } catch {}
+        return { status: r.status, json };
+      };
+
+      check('sin token → 403', (await pedirDiff('t1', false)).status === 403);
+      check('tarea desconocida → 404', (await pedirDiff('nope')).status === 404);
+      check('un taskId con ../ no es una ruta → 404', (await pedirDiff('../../x')).status === 404);
+
+      const feliz = await pedirDiff('t1');
+      const d = feliz.json || {};
+      check('camino feliz → ok', feliz.status === 200 && d.ok === true, JSON.stringify(d).slice(0, 200));
+      check('trae el cambio sin commitear de a.js', /\+dos/.test(d.diff || ''));
+      check('trae el commit propio (b.js)', (d.diff || '').includes('b.js'));
+      check('no muestra como borrado lo que la base sumó después (merge-base)', !(d.diff || '').includes('c.js'));
+      check('.env queda oculto', (d.ocultos || []).includes('.env'), JSON.stringify(d.ocultos));
+      check('el denegado con espacio y ñ también', (d.ocultos || []).includes('dir con ñ/.env.local'), JSON.stringify(d.ocultos));
+      check('ninguna línea de un secreto viaja', !(d.diff || '').includes('SECRETO'));
+      check('el status lista el sin trackear', (d.status || '').includes('?? nuevo.js'));
+
+      escritor.marcar('t1', { rama: '--output=/tmp/x' });
+      check('una rama con forma rara en el estado → 409', (await pedirDiff('t1')).status === 409);
+      escritor.marcar('t1', { rama });
+
+      fs.writeFileSync(path.join(wt, 'grande.txt'), ('x'.repeat(99) + '\n').repeat(3000));
+      git(wt, 'add', 'grande.txt');
+      const grande = await pedirDiff('t1');
+      check('más de 200 KB → truncado', grande.json && grande.json.truncado === true);
+
+      // Más que el maxBuffer de 5 MB: execFileSync corta con ENOBUFS, y aun así
+      // se muestra el principio en vez de un error.
+      fs.writeFileSync(path.join(wt, 'grande.txt'), ('y'.repeat(99) + '\n').repeat(60000));
+      const enorme = await pedirDiff('t1');
+      check('más de 5 MB → sigue mostrando el principio, truncado',
+        enorme.json && enorme.json.ok === true && enorme.json.truncado === true && (enorme.json.diff || '').length > 0,
+        JSON.stringify(enorme.json).slice(0, 200));
+
+      // Más de 200 archivos: la lista no entraría en argv de Windows.
+      fs.mkdirSync(path.join(wt, 'muchos'));
+      for (let i = 0; i < 205; i++) fs.writeFileSync(path.join(wt, 'muchos', `f${i}.js`), `${i}\n`);
+      git(wt, 'add', 'muchos');
+      const muchos = await pedirDiff('t1');
+      check('más de 200 archivos → aviso en vez de diff',
+        muchos.json && muchos.json.ok === true && /demasiados archivos/.test(muchos.json.aviso || '') && !muchos.json.diff,
+        JSON.stringify(muchos.json).slice(0, 200));
+
+      const sinPolitica = await diffDeTarea(repo, slug, 't1', { cargarPoliticaFn: async () => { throw new Error('x'); } });
+      check('sin política no hay diff (falla cerrado)',
+        sinPolitica.cuerpo.ok === false && /política/.test(sinPolitica.cuerpo.motivo));
+
+      git(repo, 'worktree', 'remove', '--force', wt);
+      const ido = await pedirDiff('t1');
+      check('worktree borrado → aviso legible',
+        ido.json && ido.json.ok === false && /no disponible/.test(ido.json.motivo), JSON.stringify(ido.json));
+    } finally {
+      if (servidor) await new Promise(r => servidor.close(r));
+      borrar(repo);
+    }
+  });
+
   process.exit(report() ? 0 : 1);
 
 

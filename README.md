@@ -31,6 +31,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Deep Web Research (`/lagrange:research`)](#-deep-web-research-lagrangeresearch)
 - [Components](#-components)
 - [Installation & Setup](#-installation--setup)
+- [Other MCP Clients (opencode, Codex)](#other-mcp-clients)
 - [Telegram Bridge & Remote Control](#-telegram-bridge-setup-manual--never-automated)
 
 ---
@@ -775,6 +776,74 @@ Restart Claude Code, then verify from a terminal:
 claude plugin list
 claude plugin details lagrange@kzvilla-lagrange
 ```
+
+### Other MCP Clients
+
+The MCP server is plain JSON-RPC over stdio: it does not depend on Claude Code
+and reads no `CLAUDE_*` variable. What ties it to Claude Code is only how it is
+registered (`.mcp.json` points at `${CLAUDE_PLUGIN_ROOT}`). Any MCP client can
+run it with `node` and the **absolute path** to `mcp-server/index.js` in a clone:
+
+```bash
+git clone https://github.com/KZvilla/claude-plugin-antigravity.git
+```
+
+The server has **no npm dependencies**, so no `npm install` is needed for it.
+The Telegram bridge does need one (`npm install --prefix telegram-bridge`).
+
+**opencode** (`opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "lagrange": {
+      "type": "local",
+      "command": ["node", "/abs/path/claude-plugin-antigravity/mcp-server/index.js"],
+      "enabled": true
+    }
+  }
+}
+```
+
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.lagrange]
+command = "node"
+args = ["/abs/path/claude-plugin-antigravity/mcp-server/index.js"]
+```
+
+**Clients with an `mcpServers` block:**
+
+```json
+{ "mcpServers": { "lagrange": { "command": "node", "args": ["/abs/path/claude-plugin-antigravity/mcp-server/index.js"] } } }
+```
+
+These formats belong to each client and change more often than this README:
+check them against your client's docs.
+
+**What works:** every MCP tool (`agy_*`, `cast_agent`, `telegram_*`), the same
+as in Claude Code. `agy` has to be installed either way.
+
+**What does not carry over:**
+
+- **Slash commands and skills** (`/lagrange:*`) are Claude Code features. In
+  another client you call the tools directly.
+- **Config and state stay in `~/.claude/`** (`antigravity.json`, usage, the agent
+  registry), even if you never use Claude Code. This is deliberate: one
+  directory per client would split the persistent agents' memory.
+- **`agy_session_summary` and `agy_narrate` read Claude Code session logs**
+  (`~/.claude/projects/`). Elsewhere the summary has nothing to read, and the
+  narration falls back to a generic checkpoint.
+- **The fan-out statusline** relies on Claude Code's `statusLine` contract.
+- **Telegram:** the outbound tools (`telegram_notify`, `telegram_ask`,
+  `telegram_send_voice`) work from any client. The bot's `/claude` command
+  (Remote Control) launches Claude Code only.
+- **`agy_fanout` creates `.claude/worktrees/` in your repo.** Add `.claude/` to
+  your `.gitignore`.
+- **Tool descriptions still mention Claude and `.claude/antigravity.json`**, so the
+  model in another client will read those names.
 
 ### 🔐 Telegram Bridge Setup (Manual — Never Automated)
 
