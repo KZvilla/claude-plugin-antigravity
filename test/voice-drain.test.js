@@ -4,7 +4,7 @@
  */
 const { check, group, report } = require('./lib/assert');
 const { SentenceChunker } = require('../mcp-server/lib/sentence-chunker');
-const { PRIMING_CHARLA, PRIMING_CONFIRMACION, procesarEventosDrain } = require('../mcp-server/lib/voice-drain');
+const { PRIMING_CHARLA, PRIMING_CONFIRMACION, conDirectorio, procesarEventosDrain } = require('../mcp-server/lib/voice-drain');
 
 const texto = (t, i = 1) => ({ event: 'step_update', step_update: { step_index: i, state: 'ACTIVE', step_type: 'agent_response', text_delta: t } });
 const tool = (nombre, i, state = 'ACTIVE') => ({ event: 'step_update', step_update: { step_index: i, state, step_type: 'tool', tool_name: nombre } });
@@ -109,6 +109,17 @@ async function main() {
     check('no prohíbe planificar ni actuar', !/ni planifiques/.test(PRIMING_CONFIRMACION));
     check('mantiene la confirmación OK', /OK\.$/.test(PRIMING_CONFIRMACION));
     check('el priming sin freno no cambia', /No escribas, edites ni planifiques archivos/.test(PRIMING_CHARLA));
+  });
+
+  await group('el priming nombra el directorio del proyecto (V6)', () => {
+    const ruta = 'C:\\vs work\\x$&y';
+    const p = conDirectorio(PRIMING_CONFIRMACION, ruta);
+    check('nombra la ruta tal cual (sin interpolar $&)', p.includes(`El proyecto está en ${ruta}.`), p);
+    check('antes del cierre', p.indexOf('El proyecto está en') < p.indexOf('Confirmá que entendiste'));
+    check('admite subdirectorios y no pide cd', /o un subdirectorio suyo/.test(p) && /no antepongas cd/.test(p));
+    check('sigue terminando en OK.', /OK\.$/.test(p));
+    check('sin cwd no cambia nada', [undefined, '', '  ', 123].every((c) => conDirectorio(PRIMING_CONFIRMACION, c) === PRIMING_CONFIRMACION));
+    check('sin cierre no cambia nada', conDirectorio('hola', ruta) === 'hola');
   });
 
   await group('ignora el eco y lo que no es texto del agente', () => {

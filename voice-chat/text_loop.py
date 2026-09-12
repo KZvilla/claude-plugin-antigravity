@@ -19,6 +19,7 @@ Uso:
 
 import argparse
 import json
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -117,7 +118,8 @@ def main():
     print("[voice-loop] Iniciando sesion agy_voice_stream" +
           (" (con pre-warm de Voicebox en paralelo)" if con_prewarm else "") + "...")
     start_text = mcp.call_tool("agy_voice_stream", {
-        "action": "start", "effort": args.effort, "confirmacion": True,
+        # cwd: sin el, agy corre los comandos en su scratch/ y no en el proyecto.
+        "action": "start", "effort": args.effort, "confirmacion": True, "cwd": os.getcwd(),
         "prewarm_voicebox": con_prewarm, "voicebox_model_size": model_size or "1.7B"
     })
     stream_id = start_text.split("stream_id: `")[1].split("`")[0]

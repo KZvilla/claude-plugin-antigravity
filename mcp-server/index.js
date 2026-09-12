@@ -54,7 +54,7 @@ function leerTagsDelRepo(cwd) {
 }
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
-const { PRIMING_CHARLA, PRIMING_CONFIRMACION, procesarEventosDrain } = require('./lib/voice-drain');
+const { PRIMING_CHARLA, PRIMING_CONFIRMACION, conDirectorio, procesarEventosDrain } = require('./lib/voice-drain');
 
 // Resolve agy binary location
 function resolveAgyBin() {
@@ -3524,7 +3524,9 @@ async function handleToolCall(name, args) {
         let primingNote = '';
         if (args.prime_conversational !== false) {
           // Incluye la regla del aviso previo antes de usar herramientas (lib/voice-drain.js).
-          const primingText = session.confirmacion ? PRIMING_CONFIRMACION : PRIMING_CHARLA;
+          // Solo el cwd que paso el llamador: nombrarle a agy como proyecto el
+          // process.cwd() de respaldo seria elegir por el usuario (auditoria).
+          const primingText = conDirectorio(session.confirmacion ? PRIMING_CONFIRMACION : PRIMING_CHARLA, args.cwd);
           try {
             sendVoiceStreamTurn(session, primingText);
             const primingDeadline = Date.now() + 10000;

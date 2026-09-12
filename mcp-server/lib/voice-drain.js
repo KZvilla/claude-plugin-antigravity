@@ -145,4 +145,24 @@ function procesarEventosDrain(events, chunker, estado = {}) {
   return { sentences, deltas, herramientas, detalles, negadas, escrituras, resultEvent };
 }
 
-module.exports = { PRIMING_CHARLA, PRIMING_CONFIRMACION, procesarEventosDrain };
+// La shell de agy arranca en su scratch/ aunque el spawn tenga el cwd del
+// proyecto: "git status" daba "not a git repository" (V6 en vivo). Nombrarle
+// el directorio lo corrige sin anteponer `cd`, que cambiaria el comando y lo
+// sacaria de las reglas `command(...)` exactas del usuario.
+const CIERRE_PRIMING = 'Confirmá que entendiste';
+
+/**
+ * Inserta el directorio del proyecto antes del cierre del priming. Con
+ * `slice` y no `replace`: un `$&` en la ruta se interpolaria. Sin cwd o sin
+ * cierre, el priming queda igual.
+ */
+function conDirectorio(priming, cwd) {
+  if (typeof cwd !== 'string' || !cwd.trim()) return priming;
+  const i = priming.indexOf(CIERRE_PRIMING);
+  if (i < 0) return priming;
+  const frase = `El proyecto está en ${cwd}. Cuando uses run_command, por defecto usá ese directorio como Cwd, ` +
+    'o un subdirectorio suyo si el comando lo necesita, y no antepongas cd al comando. ';
+  return priming.slice(0, i) + frase + priming.slice(i);
+}
+
+module.exports = { PRIMING_CHARLA, PRIMING_CONFIRMACION, conDirectorio, procesarEventosDrain };

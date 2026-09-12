@@ -23,6 +23,7 @@ Uso:
 import argparse
 import io
 import json
+import os
 import queue
 import sys
 import threading
@@ -281,7 +282,8 @@ def main():
 
     print("[voice-loop] Iniciando sesion agy_voice_stream" +
           (" (con pre-warm de Voicebox en paralelo)" if is_qwen_engine and proveedor == "voicebox" else "") + "...")
-    start_args = {"action": "start", "effort": args.effort, "confirmacion": True,
+    # cwd: sin el, agy corre los comandos en su scratch/ y no en el proyecto.
+    start_args = {"action": "start", "effort": args.effort, "confirmacion": True, "cwd": os.getcwd(),
                   "prewarm_voicebox": is_qwen_engine and proveedor == "voicebox"}
     if is_qwen_engine:
         start_args["voicebox_model_size"] = model_size or "1.7B"

@@ -74,6 +74,12 @@ async function main() {
       check('confirm: error', esError(await llamar('confirm', { stream_id: id })));
       check('stop_exec: no hace nada', /No hay ninguna ejecución/.test(texto(await llamar('stop_exec', { stream_id: id }))));
       await llamar('stop', { stream_id: id });
+
+      // Sin cwd del llamador, el priming no nombra el process.cwd() de respaldo.
+      const r = await server.callTool('agy_voice_stream', { action: 'start', prewarm_voicebox: false, confirmacion: true });
+      const sinCwd = /stream_id: `([^`]+)`/.exec(texto(r))[1];
+      check('sin cwd, el priming no nombra ningún directorio', !JSON.parse(ultimoTurno().linea).message.content.includes('El proyecto está en'));
+      await llamar('stop', { stream_id: sinCwd });
     });
 
     await group('con confirmacion: niega, confirma, ejecuta y vuelve', async () => {
@@ -83,6 +89,7 @@ async function main() {
       check('accept-edits', valor(a, '--mode') === 'accept-edits', JSON.stringify(a));
       check('sin skip', !skip(a));
       check('priming con freno', /la charla me pregunta/.test(ultimoTurno().linea));
+      check('el priming nombra el cwd que pasó el llamador', JSON.parse(ultimoTurno().linea).message.content.includes(`El proyecto está en ${dir}.`));
       check('confirm sin nada negado: error', esError(await llamar('confirm', { stream_id: id })));
 
       await llamar('send', { stream_id: id, text: 'commiteá NEGAR_COMANDO git status' });
