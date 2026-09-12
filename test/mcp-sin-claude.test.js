@@ -37,7 +37,7 @@ async function main() {
       const init = await server.initialize();
       check('initialize responde', !!(init.result && init.result.serverInfo), JSON.stringify(init).slice(0, 200));
       const nombres = (((await server.listTools()).result || {}).tools || []).map((t) => t.name);
-      for (const t of ['agy_run', 'agy_plan', 'agy_usage', 'cast_agent', 'telegram_notify']) {
+      for (const t of ['agy_run', 'agy_plan', 'agy_usage', 'cast_agent', 'telegram_notify', 'agy_alma']) {
         check(`tools/list trae ${t}`, nombres.includes(t));
       }
     });

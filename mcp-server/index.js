@@ -31,6 +31,7 @@ const estadoAgentes = require('./agents/estado.js');
 const memoriaAgentes = require('./agents/memoria.js');
 const aprendizajeAgentes = require('./agents/aprendizaje.js');
 const castAgentes = require('./agents/cast.js');
+const almas = require('./almas/index.js');
 // BE-015 — Reglas de `--model`/`--effort` compartidas con el bot de Telegram.
 const { esfuerzoParaCli, validarModeloEsfuerzo } = require('./lib/cli-compat.js');
 const vb = require('./voicebox-server.js');
@@ -1492,6 +1493,36 @@ const TOOLS = [
         timeout_minutes: {
           type: 'number',
           description: 'Timeout in minutes. Defaults to 15.'
+        }
+      }
+    }
+  },
+  {
+    name: 'agy_alma',
+    description: 'Souls for the voices (phase 0: data layer only, no surface uses them yet). Each voice can have an identity file (alma.md, seeded once from its Voicebox profile and then edited by hand), a bounded memory of the relationship (memoria.md, entries with stable ids like m3), a file shared by every voice with what is known about the user (usuario.md, ids like u2), and a diary written by code. Actions: "listar" lists the souls on disk and the voices without one; "ver" shows one soul in full; "olvidar" deletes one memory entry by id; "semilla" seeds alma.md from a Voicebox profile (exact name match, never a fallback voice); "agente" installs and verifies the tool-less lagrange-alma agent that soul calls will run as. Never launches agy.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['listar', 'ver', 'olvidar', 'semilla', 'agente'],
+          description: 'What to do. Defaults to "listar".'
+        },
+        voz: {
+          type: 'string',
+          description: 'Voice name (e.g. "Alya", "Diego Alvarez"). Required for ver, olvidar and semilla.'
+        },
+        id: {
+          type: 'string',
+          description: 'Entry id for olvidar: m<n> for the soul memory, u<n> for what is known about the user.'
+        },
+        forzar: {
+          type: 'boolean',
+          description: 'For semilla: re-seed a soul that already has alma.md. The current file is kept as alma.md.anterior. Defaults to false.'
+        },
+        voicebox_url: {
+          type: 'string',
+          description: 'Custom Voicebox endpoint to read voice profiles from. When Voicebox does not answer, the voice cache is used.'
         }
       }
     }
@@ -3183,6 +3214,159 @@ async function handleToolCall(name, args) {
       }
 
       return { content: [{ type: 'text', text: texto }] };
+    }
+
+    case 'agy_alma': {
+      const accion = args.action || 'listar';
+      const texto = t => ({ content: [{ type: 'text', text: t }] });
+      const error = t => ({ isError: true, content: [{ type: 'text', text: t }] });
+      const { rutas, archivos, recuerdos, diario, semilla, agente } = almas;
+
+      // Perfiles de Voicebox, o de la caché de voces si no responde. Solo lee:
+      // listar almas no es motivo para levantar Voicebox.
+      const perfilesDeVoz = async () => {
+        try {
+          const p = await getVoiceboxProfiles(resolveVoiceboxUrl(args, config));
+          if (Array.isArray(p) && p.length) return { perfiles: p, origen: 'Voicebox' };
+        } catch {}
+        const cache = om.leerCacheVoces();
+        return { perfiles: cache && Array.isArray(cache.perfiles) ? cache.perfiles : [], origen: 'la caché de voces' };
+      };
+
+      // La voz pedida contra las almas que ya existen, con la misma regla que la
+      // semilla: "Diego" encuentra `diego-alvarez`, "Ana" no encuentra `anabel`.
+      const claveExistente = voz => {
+        const directa = rutas.claveDeVoz(voz);
+        if (!directa) return null;
+        const hallada = semilla.perfilPorNombre(rutas.listarClaves().map(name => ({ name })), voz);
+        return hallada ? hallada.name : directa;
+      };
+
+      const nombreEnAlma = ruta => {
+        const m = /^#\s+(.+)$/m.exec(archivos.leerTexto(ruta));
+        return m ? m[1].trim() : null;
+      };
+
+      const listaEntradas = modelo => {
+        const e = recuerdos.entradas(modelo);
+        if (!e.length) return '_(vacía)_';
+        return e.map(x => `- \`${x.id || 'sin id: se asigna al próximo guardado'}\` [${x.fecha || '—'}] ${x.texto}`).join('\n');
+      };
+
+      try {
+        if (accion === 'listar') {
+          const claves = rutas.listarClaves();
+          const lineas = claves.map(c => {
+            const r = rutas.rutasDe(c);
+            const m = recuerdos.leer(r.memoria, 'm');
+            const nombre = nombreEnAlma(r.alma);
+            const ultima = diario.ultimas(c, 1)[0];
+            return `- \`${c}\`${nombre ? ` (${nombre})` : ''}: memoria ${recuerdos.entradas(m).length} entradas, `
+              + `${recuerdos.usado(m)}/${recuerdos.TOPE_MEMORIA} car.`
+              + `${ultima ? `, última interacción ${ultima.ts}` : ''}`
+              + `${fs.existsSync(r.alma) ? '' : ' — sin alma.md'}`;
+          });
+          const usuario = recuerdos.leer(rutas.rutaUsuario(), 'u');
+          const { perfiles, origen } = await perfilesDeVoz();
+          const sinAlma = perfiles
+            .map(p => p && p.name)
+            .filter(n => n && !claves.includes(rutas.claveDeVoz(n)));
+
+          let out = '### 🫀 Almas\n\n';
+          out += lineas.length
+            ? lineas.join('\n')
+            : 'Todavía no hay ninguna. Sembrá una con `agy_alma action:"semilla" voz:"<nombre>"`.';
+          out += `\n\nLo que saben de vos (compartido): ${recuerdos.entradas(usuario).length} entradas, `
+            + `${recuerdos.usado(usuario)}/${recuerdos.TOPE_USUARIO} car.`;
+          if (sinAlma.length) out += `\n\nVoces sin alma (según ${origen}): ${sinAlma.join(', ')}.`;
+          out += `\n\nDirectorio: \`${rutas.dirAlmas()}\``;
+          return texto(out);
+        }
+
+        if (accion === 'ver') {
+          const clave = claveExistente(args.voz);
+          if (!clave) return error('Falta `voz`: el nombre de la voz cuya alma querés ver.');
+          const r = rutas.rutasDe(clave);
+          if (!fs.existsSync(r.alma) && !fs.existsSync(r.memoria)) {
+            return error(`No hay alma para \`${clave}\`. Sembrala con \`agy_alma action:"semilla" voz:"${args.voz}"\`.`);
+          }
+          const alma = archivos.leerTexto(r.alma);
+          const memoria = recuerdos.leer(r.memoria, 'm');
+          const usuario = recuerdos.leer(rutas.rutaUsuario(), 'u');
+          const ultimas = diario.ultimas(clave, 10);
+
+          let out = `### 🫀 Alma \`${clave}\`\n\n`;
+          out += `**alma.md** (${alma.length} car.`
+            + `${alma.length > semilla.MAX_ALMA ? `; al inyectarse se recorta a ${semilla.MAX_ALMA}` : ''})\n\n`;
+          out += alma ? `\`\`\`markdown\n${alma.trimEnd()}\n\`\`\`\n\n` : '_(no existe todavía)_\n\n';
+          out += `**Memoria** (${recuerdos.usado(memoria)}/${recuerdos.TOPE_MEMORIA} car.)\n\n${listaEntradas(memoria)}\n\n`;
+          out += `**Lo que sabe de vos** (compartido, ${recuerdos.usado(usuario)}/${recuerdos.TOPE_USUARIO} car.)\n\n${listaEntradas(usuario)}\n\n`;
+          out += `**Diario** (últimas ${ultimas.length})\n\n`;
+          out += ultimas.length
+            ? ultimas.map(e => `- ${e.ts} · ${e.superficie || '—'} · ${e.resumen || e.tipo || ''}${e.motivo ? ` (${e.motivo})` : ''}`).join('\n')
+            : '_(vacío)_';
+          out += `\n\n**Archivos:** \`${r.alma}\`, \`${r.memoria}\`, \`${rutas.rutaUsuario()}\`, \`${r.diario}\``;
+          return texto(out);
+        }
+
+        if (accion === 'olvidar') {
+          const clave = claveExistente(args.voz);
+          if (!clave) return error('Falta `voz`.');
+          const id = String(args.id || '').trim().toLowerCase();
+          if (!/^[mu]\d+$/.test(id)) {
+            return error('`id` tiene que ser `m<n>` (memoria del alma) o `u<n>` (lo que sabe de vos). Mirá los ids con `action:"ver"`.');
+          }
+          const prefijo = id[0];
+          const ruta = prefijo === 'm' ? rutas.rutasDe(clave).memoria : rutas.rutaUsuario();
+          const tope = prefijo === 'm' ? recuerdos.TOPE_MEMORIA : recuerdos.TOPE_USUARIO;
+          const r = recuerdos.aplicar(ruta, prefijo, [{ tipo: 'olvidar', id }], tope);
+          if (!r.aplicadas.length) {
+            return error(`No hay una entrada \`${id}\` ${prefijo === 'm' ? `en la memoria de \`${clave}\`` : 'en lo que saben de vos'}.`);
+          }
+          diario.anotar(clave, { superficie: 'agy_alma', tipo: 'olvidar', id });
+          return texto(`🧹 Olvidado \`${id}\`: "${r.aplicadas[0].texto}".`);
+        }
+
+        if (accion === 'semilla') {
+          if (!args.voz) return error('Falta `voz`: el nombre del perfil de Voicebox.');
+          const { perfiles, origen } = await perfilesDeVoz();
+          const perfil = semilla.perfilPorNombre(perfiles, args.voz);
+          if (!perfil) {
+            const nombres = perfiles.map(p => p && p.name).filter(Boolean);
+            return error(`No hay un único perfil que se llame "${args.voz}" (según ${origen}). `
+              + (nombres.length
+                ? `Disponibles: ${nombres.join(', ')}.`
+                : 'No hay perfiles: levantá Voicebox (`agy_voice_model`) o narrá una vez para llenar la caché.'));
+          }
+          const clave = rutas.claveDeVoz(perfil.name);
+          const r = semilla.sembrar(clave, perfil, { forzar: Boolean(args.forzar) });
+          if (!r.creado) {
+            return texto(`\`${clave}\` ya tiene alma (\`${r.ruta}\`) y no se tocó. `
+              + 'Con `forzar: true` se re-siembra, y el archivo actual queda en `alma.md.anterior`.');
+          }
+          diario.anotar(clave, { superficie: 'agy_alma', tipo: 'semilla', resumen: r.existia ? 're-sembrada' : 'sembrada' });
+          return texto(`🌱 Alma de **${perfil.name}** sembrada desde el perfil (según ${origen}): \`${r.ruta}\``
+            + `${r.respaldo ? `\nLa anterior quedó en \`${r.respaldo}\`.` : ''}`
+            + '\n\nEditala a gusto: desde ahora manda ese archivo.');
+        }
+
+        if (accion === 'agente') {
+          const instalado = agente.asegurarAgente(os.homedir());
+          const verificacion = await agente.verificar(AGY_BIN);
+          const out = `### Agente \`${agente.AGENTE}\`\n\n`
+            + `- **agent.md:** \`${instalado.ruta}\` (${instalado.cambiado ? 'instalado o actualizado' : 'ya estaba al día'})\n`
+            + `- **Resuelve en \`agy agents\`:** ${verificacion.ok ? '✅ sí' : `❌ no — ${verificacion.motivo}`}\n`
+            + '- **Tools nativas:** ninguna (`tools: []`; ojo, `tools:` sin ítems no es lo mismo).\n'
+            + '- **Roster MCP:** llega igual (`call_mcp_tool`, SEC-010), pero las llamadas del alma corren sin '
+            + '`--dangerously-skip-permissions` y agy lo niega sola.';
+          return verificacion.ok ? texto(out) : error(out);
+        }
+
+        return error(`Acción desconocida: "${accion}". Usá listar, ver, olvidar, semilla o agente.`);
+      } catch (err) {
+        if (err && err.name === 'ErrorLock') return error(err.message);
+        return error(`agy_alma falló: ${err && err.message ? err.message : String(err)}`);
+      }
     }
 
     case 'cast_agent': {
