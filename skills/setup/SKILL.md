@@ -97,6 +97,19 @@ omnivoice:install` downloads ~8 GB (Python 3.12, torch CUDA, weights) into
 `%LOCALAPPDATA%\lagrange-omnivoice`. Tell them the weights are CC-BY-NC
 (non-commercial use).
 
+**Voice chat** (`voice-chat/`, optional). Once Voicebox has a voice, they can
+talk with agy: `python voice-chat/text_loop.py` (console, no extra
+dependencies) or `python voice-chat/voice_loop.py` (microphone), which first
+needs `pip install -r voice-chat/requirements.txt`. Tell them three things
+before they start:
+- launch it **from the project folder**: agy runs its commands there;
+- it has a brake: agy does not run commands, use MCP tools (browsing included)
+  or read pages until they say "sí" to the question the chat asks, and that
+  "sí" gives that one turn full permissions ("pará" stops it, microphone only);
+- agy does not gate file writes, so the chat says when agy changed a file
+  without asking. Commands already allowed in agy's own `settings.json`
+  (`permissions.allow`) run without a question.
+
 Non-default port: `voicebox_url` / `voicebox_port` on the narration tools, or
 persist it with `agy_set_config`.
 
