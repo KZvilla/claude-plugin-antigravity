@@ -17,6 +17,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
+const { resolverBash } = require('./lib/bash');
 
 const TTL_TERMINADO_MIN = 10;
 const PRIMER_BYTE_TIMEOUT_MS = 250;
@@ -165,11 +166,13 @@ function ejecutarDelegado(comando, stdinCrudo) {
     // el propio comando de claude-hud) usa sintaxis POSIX (`case`, `${var:-x}`,
     // `$( )`) porque así es como Claude Code invoca `statusLine.command` — pero
     // el default de `execSync` en Windows es `cmd.exe` (ComSpec), que no
-    // entiende nada de eso y falla con "cols no se reconoce como...". Pedirle
-    // `bash` explícitamente reproduce el shell real que usa Claude Code, no el
-    // default de Node. Si `bash` no está en PATH, execSync tira y cae al
-    // catch: se pierde ese segmento, no se rompe nada.
-    return execSync(comando, { input: stdinCrudo || '', encoding: 'utf8', timeout: 5000, shell: 'bash' }).trimEnd();
+    // entiende nada de eso y falla con "cols no se reconoce como...". Hace falta
+    // el bash que usa Claude Code (Git Bash), y no cualquier `bash` del PATH:
+    // en Windows ese suele ser el lanzador de WSL, que no entiende rutas C:\
+    // (lib/bash.js). Sin bash de Git se pierde este segmento, no se rompe nada.
+    const shell = resolverBash();
+    if (!shell) return '';
+    return execSync(comando, { input: stdinCrudo || '', encoding: 'utf8', timeout: 5000, shell }).trimEnd();
   } catch {
     return '';
   }

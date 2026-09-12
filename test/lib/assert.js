@@ -21,6 +21,9 @@ function report() {
   const failed = results.filter(r => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
   if (failed.length) {
+    // Una suite que llama a report() sin process.exit salia en 0 con FAILs, y
+    // run.js solo mira el codigo de salida: asi se escondian fallos.
+    process.exitCode = 1;
     console.log('\nFailures:');
     for (const f of failed) console.log(`  - ${f.label}${f.detail ? ` — ${f.detail}` : ''}`);
   }

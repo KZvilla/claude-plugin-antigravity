@@ -16,6 +16,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { execFileSync } = require('node:child_process');
 const { check, group, report } = require('./lib/assert');
+const { resolverBash } = require('../mcp-server/lib/bash');
 
 const { crearEscritorDeEstado } = require('../mcp-server/fanout-estado.js');
 
@@ -53,6 +54,13 @@ async function main() {
     await group('delegado con sintaxis POSIX (la regresión del shell en Windows)', () => {
       // `case` y `${VAR:-x}` no los entiende cmd.exe. Si ejecutarDelegado deja
       // de pedir `bash` explícitamente, esto vuelve a fallar en Windows.
+      // Windows sin bash de Git: el script pierde el segmento a propósito
+      // (lib/bash.js), así que no hay shell POSIX que probar.
+      if (process.platform === 'win32' && !resolverBash()) {
+        console.log('  (sin bash de Git: se omite)');
+        check('el delegado corrió con un shell POSIX — omitido, sin bash de Git', true);
+        return;
+      }
       escribirDelegado(cwd, 'x=${NO_EXISTE:-marca-delegado}; case "$x" in marca-*) echo "$x";; esac');
       const salida = correr(cwd);
       check('el delegado corrió con un shell POSIX', salida.trim() === 'marca-delegado', JSON.stringify(salida));
