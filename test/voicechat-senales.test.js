@@ -81,7 +81,8 @@ def d(**kw):
 r["pasos"] = [common.clave_de_paso(x) for x in [
     {"nombre": "call_mcp_tool", "servidor": "playwright", "accion": "browser_navigate"},
     {"nombre": "call_mcp_tool", "servidor": "mcp-memory", "accion": "search"},
-    {"nombre": "call_mcp_tool", "servidor": "schedule-x", "accion": "list"},
+    {"nombre": "call_mcp_tool", "servidor": "google-calendar", "accion": "list"},
+    {"nombre": "call_mcp_tool", "servidor": "schedule-x", "accion": "docs"},
     {"nombre": "call_mcp_tool", "servidor": "file-browser", "accion": "ls"},
     {"nombre": "call_mcp_tool", "servidor": "task-scheduler", "accion": "run"},
     {"nombre": "call_mcp_tool", "servidor": None, "accion": None},
@@ -193,7 +194,7 @@ async function main() {
       check('línea de tiempos', x.linea === '⏱ transcripción 0.7 s · primer texto 5.9 s', x.linea);
       check('barge_in no borra señales', x.barge_in_respeta_borrar);
       check('clave_de_paso por servidor MCP (tokens exactos)', JSON.stringify(x.pasos) === JSON.stringify(
-        ['navegador', 'memoria', 'agenda', 'herramienta', 'herramienta', 'herramienta', 'herramienta', 'web', 'archivos']), JSON.stringify(x.pasos));
+        ['navegador', 'memoria', 'agenda', 'herramienta', 'herramienta', 'herramienta', 'herramienta', 'herramienta', 'web', 'archivos']), JSON.stringify(x.pasos));
       check('una clave de servidor llega intacta a decidir_senal', x.navegador_suena);
       check('descarta y borra el audio de un turno cortado', x.descarta_turno_cortado);
       check('una síntesis vieja en curso no traba al turno nuevo', x.no_traba_turno_nuevo);

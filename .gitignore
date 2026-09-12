@@ -44,6 +44,10 @@ telegram-bridge/daemon.log
 state.json
 *.lock
 
+# Snapshots que deja el MCP de playwright en el cwd de agy (la charla navega
+# con el repo como directorio de trabajo).
+.playwright-mcp/
+
 # Agent rules & workspace customizations (excluded from repo)
 AGENTS.md
 .agents/

@@ -652,10 +652,12 @@ def clave_de_herramienta(nombre):
 
 # Tokens exactos del nombre del servidor, no substrings (auditoria del plan):
 # "file-browser" no es un navegador y "task-scheduler" no es una agenda.
+# Sin "schedule": schedule-x es un MCP de documentacion de esa libreria, no
+# una agenda (observacion del usuario tras probarlo con el microfono).
 TOKENS_SERVIDOR = {
     "navegador": {"playwright", "puppeteer", "chrome", "chromium"},
     "memoria": {"memory", "memoria", "mem0"},
-    "agenda": {"calendar", "agenda", "schedule"},
+    "agenda": {"calendar", "agenda"},
 }
 
 
