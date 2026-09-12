@@ -86,7 +86,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 | 👁️ | **Live Fan-Out Viewer** | Watch every subagent in your browser — streamed prose, tool calls, elapsed time, failure reasons, and a stop button (`/lagrange:watch`) |
 | 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (3.8 / 3.7 Flash, 3.1 Pro) with configurable reasoning effort |
 | 🎙️ | **Voice Checkpoint Narration** | Zero-Claude-token spoken status updates via Voicebox TTS with automatic profile fallback |
-| 🗣️ | **Real-Time Voice Mode** | Full-duplex spoken conversation with barge-in, mic capture, and Silero VAD (`voice-chat/`) — zero-cloud audio via a local Voicebox TTS/STT engine |
+| 🗣️ | **Real-Time Voice Mode** | Full-duplex spoken conversation with barge-in, mic capture, and Silero VAD (`voice-chat/`), spoken progress cues, and a confirmation brake: agy asks for your "sí" before running commands or MCP tools — zero-cloud audio via a local Voicebox TTS/STT engine |
 | 📋 | **Anti-Compaction Session Summary** | Analyzes raw JSONL session logs with Gemini (1M-2M context) to generate persistent, structured Markdown docs before context degrades |
 | 🌐 | **Cited Web Research** | Leverages Antigravity's native web search and synthesis capabilities that Claude Code lacks out of the box |
 | 📱 | **Telegram Bridge & Remote Control** | Control tasks from your phone, approve plans, receive voice notes, and launch `claude --remote-control` sessions |
@@ -665,6 +665,12 @@ Full-duplex spoken conversation with Antigravity — not a Claude Code slash com
 - `voice-chat/voice_loop.py` — real microphone input via Silero VAD, with real barge-in: the instant it detects you starting to speak, it cuts playback and cancels any in-flight Voicebox synthesis.
 
 Both use a local Voicebox at `http://127.0.0.1:17493` (or `VOICEBOX_URL`) for TTS/STT, started headless through the MCP server if it is not running; they refuse to open the mic if another voice's model is pinned (`--soltar-pin` releases it); `voice_loop.py` additionally needs `pip install -r voice-chat/requirements.txt` (`sounddevice`, `silero-vad`, `numpy`).
+
+**Progress signals.** While agy works, the chat plays short pre-recorded cues in the chat voice (OmniVoice only, cached between sessions): "Pensando", "Buscando en la web", "Leyendo la página", "Revisando archivos", and, named after the MCP server agy is calling, "Usando el navegador" (playwright, puppeteer, chrome), "Consultando la memoria" and "Revisando la agenda" (calendar servers). Any other tool is "Usando una herramienta"; during a turn you authorized, "Ejecutando un comando" and "Escribiendo el archivo" as well. At most three per turn and never the same one twice; `--senal-ms 0` turns them off.
+
+**Project directory.** The chat treats the directory you launch it from as the project: agy runs its commands there. Without it, agy's shell starts in its own `~/.gemini/antigravity-cli/scratch/` folder, and `git status` answers "not a git repository".
+
+**Confirmation brake.** Both loops open the session with `confirmacion: true`. agy then runs without `--dangerously-skip-permissions`, so it denies shell commands, MCP calls (browsing included) and `read_url` on its own. When a turn ends with something denied, the chat asks out loud ("Agy quiere ejecutar el comando git status. ¿Lo hago?"). A short "sí" (four words or fewer) relaunches agy with full permissions on the same conversation for that turn only, and the chat goes back to the braked session right after; any other answer drops the question. In `voice_loop.py`, saying "pará" during that turn stops it. agy does not gate `write_to_file`, so the chat says when agy changed a file without asking. `--mode plan` is not a brake: it does not stop shell commands.
 
 ```bash
 # Console-only, zero extra dependencies

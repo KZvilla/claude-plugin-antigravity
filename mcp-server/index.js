@@ -54,7 +54,7 @@ function leerTagsDelRepo(cwd) {
 }
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
-const { PRIMING_CHARLA, procesarEventosDrain } = require('./lib/voice-drain');
+const { PRIMING_CHARLA, PRIMING_CONFIRMACION, conDirectorio, procesarEventosDrain } = require('./lib/voice-drain');
 
 // Resolve agy binary location
 function resolveAgyBin() {
@@ -1074,13 +1074,13 @@ const TOOLS = [
   },
   {
     name: 'agy_voice_stream',
-    description: 'Manage a persistent, streaming `agy.exe` process for low-latency conversational use ("Modo Charla"). Unlike agy_run, which blocks until the entire response is generated and then exits, this keeps one long-lived agy process alive across many turns and exposes incremental text_delta events for polling, avoiding per-turn cold starts and enabling sentence-level TTS pipelining. Actions: "start" (spawn the persistent process, optionally pre-warming Voicebox TTS in parallel), "send" (write one user turn to the running process), "drain" (retrieve and clear buffered stream events since the last drain — poll this in a loop while a turn is in flight), "status" (inspect a session without consuming its events), "stop" (terminate the process).',
+    description: 'Manage a persistent, streaming `agy.exe` process for low-latency conversational use ("Modo Charla"). Unlike agy_run, which blocks until the entire response is generated and then exits, this keeps one long-lived agy process alive across many turns and exposes incremental text_delta events for polling, avoiding per-turn cold starts and enabling sentence-level TTS pipelining. Actions: "start" (spawn the persistent process, optionally pre-warming Voicebox TTS in parallel), "send" (write one user turn to the running process), "drain" (retrieve and clear buffered stream events since the last drain — poll this in a loop while a turn is in flight), "status" (inspect a session without consuming its events), "stop" (terminate the process). With `confirmacion: true` on "start", agy runs without auto-approved permissions: whatever it gets denied (commands, MCP calls, read_url) comes back in `negadas` when the turn closes, "confirm" retries exactly that with full permissions on the same conversation, and "stop_exec" cuts that authorized turn.',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['start', 'send', 'drain', 'status', 'stop'],
+          enum: ['start', 'send', 'drain', 'status', 'stop', 'confirm', 'stop_exec'],
           description: 'Operation to perform on the voice stream session.'
         },
         stream_id: {
@@ -1103,7 +1103,11 @@ const TOOLS = [
         mode: {
           type: 'string',
           enum: ['accept-edits', 'plan'],
-          description: 'Agent execution mode for "start". Defaults to "plan" — voice chat is conversational by default, not a coding session.'
+          description: 'Agent execution mode for "start". Defaults to "plan" — voice chat is conversational by default, not a coding session — or to "accept-edits" with `confirmacion`.'
+        },
+        confirmacion: {
+          type: 'boolean',
+          description: 'Voice chat with a confirmation brake, for "start". agy runs without --dangerously-skip-permissions (and in accept-edits unless `mode` is given), so it denies commands, MCP calls and read_url by itself; the denials come back in `drain.negadas` and "confirm" relaunches agy with full permissions on the same conversation for that turn only. Note: agy does not gate write_to_file; `drain.escrituras` reports those writes. Defaults to false (unchanged behavior).'
         },
         conversation_id: {
           type: 'string',
@@ -2715,30 +2719,15 @@ const voiceStreamSessions = new Map();
 
 function createVoiceStreamSession(options = {}) {
   const streamId = `vs_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  const cwd = options.cwd || process.cwd();
-
-  const cliArgs = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
-  const voiceEffort = esfuerzoParaCli({ modelo: options.model, pedido: options.effort, porDefecto: 'low' });
-  if (voiceEffort) cliArgs.push('--effort', voiceEffort);
-  if (options.model) cliArgs.push('--model', options.model);
-  if (options.mode) cliArgs.push('--mode', options.mode);
-  if (options.conversation_id) cliArgs.push('--conversation', options.conversation_id);
-  if (options.dangerously_skip_permissions !== false) cliArgs.push('--dangerously-skip-permissions');
-
-  process.stderr.write(`[antigravity-mcp] Starting voice stream session ${streamId}: ${AGY_BIN} ${cliArgs.join(' ')} (cwd: ${cwd})\n`);
-
-  const child = spawn(AGY_BIN, cliArgs, {
-    cwd,
-    shell: false,
-    env: { ...process.env }
-  });
 
   const session = {
     id: streamId,
-    child,
-    cwd,
+    child: null,
+    cwd: options.cwd || process.cwd(),
     model: options.model || null,
     effort: options.effort || 'low',
+    // Lo pedido tal cual: cada relanzamiento arma los mismos flags que el primero.
+    effortPedido: options.effort,
     conversationId: options.conversation_id || null,
     status: 'starting',
     events: [],
@@ -2748,12 +2737,55 @@ function createVoiceStreamSession(options = {}) {
     stderrTail: [],
     exitCode: null,
     createdAt: Date.now(),
-    lastActivity: Date.now()
+    lastActivity: Date.now(),
+    // Charla con freno (plan-charla-modo-agente). Sin `confirmacion` nada de
+    // esto se usa y la sesion se comporta como siempre.
+    confirmacion: !!options.confirmacion,
+    modoBase: options.mode,
+    skipBase: options.dangerously_skip_permissions !== false,
+    negadasTurno: [],
+    negadasPendientes: [],
+    ejecutando: false,
+    relanzamiento: null,
+    retirados: new WeakSet()
   };
+
+  lanzarHijoVoz(session, { mode: session.modoBase, skip: session.skipBase });
+  voiceStreamSessions.set(streamId, session);
+  return session;
+}
+
+/**
+ * Lanza el agy de la sesion y le cuelga los listeners. Lo usan el arranque y
+ * cada relanzamiento (plan-charla-modo-agente), que cambian de hijo sin
+ * cambiar de sesion: mismo stream_id, mismos eventos, misma conversacion.
+ */
+function lanzarHijoVoz(session, { mode, skip }) {
+  const cliArgs = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
+  const voiceEffort = esfuerzoParaCli({ modelo: session.model || undefined, pedido: session.effortPedido, porDefecto: 'low' });
+  if (voiceEffort) cliArgs.push('--effort', voiceEffort);
+  if (session.model) cliArgs.push('--model', session.model);
+  if (mode) cliArgs.push('--mode', mode);
+  if (session.conversationId) cliArgs.push('--conversation', session.conversationId);
+  if (skip) cliArgs.push('--dangerously-skip-permissions');
+
+  process.stderr.write(`[antigravity-mcp] ${session.child ? 'Relaunching' : 'Starting'} voice stream session ${session.id}: ${AGY_BIN} ${cliArgs.join(' ')} (cwd: ${session.cwd})\n`);
+
+  const child = spawn(AGY_BIN, cliArgs, {
+    cwd: session.cwd,
+    shell: false,
+    env: { ...process.env }
+  });
+  session.child = child;
+  session.status = 'starting';
+  // Un hijo retirado sigue emitiendo hasta morir: nada suyo puede tocar la
+  // sesion, ni eventos ni `close` (auditoria del plan).
+  const vigente = () => session.child === child && !session.retirados.has(child);
+  child.once('close', () => { child.cerradoVoz = true; });
 
   const rlOut = readline.createInterface({ input: child.stdout, terminal: false });
   rlOut.on('line', (line) => {
-    if (!line.trim()) return;
+    if (!vigente() || !line.trim()) return;
     session.lastActivity = Date.now();
 
     let parsed;
@@ -2774,25 +2806,27 @@ function createVoiceStreamSession(options = {}) {
   });
 
   child.stderr.on('data', (chunk) => {
+    if (!vigente()) return;
     const text = chunk.toString('utf8');
     session.stderrTail.push(text);
     if (session.stderrTail.length > 20) session.stderrTail.shift();
-    process.stderr.write(`[agy voice-stream ${streamId} stderr] ${text}`);
+    process.stderr.write(`[agy voice-stream ${session.id} stderr] ${text}`);
   });
 
   child.on('error', (err) => {
+    if (!vigente()) return;
     session.status = 'error';
     session.events.push({ event: 'process_error', error: err.message, ts: Date.now() });
   });
 
   child.on('close', (code) => {
+    if (!vigente()) return;
     session.status = 'stopped';
     session.exitCode = code;
     session.events.push({ event: 'process_closed', code, ts: Date.now() });
   });
 
-  voiceStreamSessions.set(streamId, session);
-  return session;
+  return child;
 }
 
 function sendVoiceStreamTurn(session, text) {
@@ -2802,6 +2836,75 @@ function sendVoiceStreamTurn(session, text) {
   const line = JSON.stringify({ event: 'user', message: { content: text } }) + '\n';
   session.child.stdin.write(line);
   session.lastActivity = Date.now();
+}
+
+const esperarMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function esperarCierre(child, ms) {
+  if (child.cerradoVoz) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const listo = () => { clearTimeout(t); resolve(true); };
+    const t = setTimeout(() => { child.removeListener('close', listo); resolve(false); }, ms);
+    child.once('close', listo);
+  });
+}
+
+/**
+ * Cambia el agy de la sesion por uno nuevo con otros permisos, sobre la misma
+ * conversacion (plan-charla-modo-agente). El nuevo arranca recien cuando el
+ * viejo cerro: antes, agy puede no haber guardado el historial que el nuevo
+ * retoma con --conversation. `matar` corta un turno en curso (stop_exec); sin
+ * el, el viejo termina por fin de stdin. Devuelve false si la sesion se
+ * detuvo mientras tanto.
+ */
+async function relanzarHijoVoz(session, { mode, skip, matar = false }) {
+  const viejo = session.child;
+  session.retirados.add(viejo);
+  session.status = 'restarting';
+  if (matar) {
+    terminateTree(viejo);
+  } else {
+    try { viejo.stdin.end(); } catch {}
+  }
+  if (!(await esperarCierre(viejo, matar ? 5000 : 3000)) && !matar) {
+    terminateTree(viejo);
+    await esperarCierre(viejo, 2000);
+  }
+  // Un `stop` durante la espera ya cerro la sesion: no dejar un hijo huerfano.
+  if (session.status === 'stopped') return false;
+  try {
+    lanzarHijoVoz(session, { mode, skip });
+    return true;
+  } catch (err) {
+    session.status = 'error';
+    session.events.push({ event: 'process_error', error: err.message, ts: Date.now() });
+    return false;
+  }
+}
+
+/** Encadena relanzamientos: nunca dos a la vez sobre la misma sesion. */
+function programarRelanzamiento(session, opciones) {
+  const previo = session.relanzamiento || Promise.resolve();
+  const p = previo.then(() => relanzarHijoVoz(session, opciones));
+  session.relanzamiento = p;
+  p.finally(() => { if (session.relanzamiento === p) session.relanzamiento = null; }).catch(() => {});
+  return p;
+}
+
+/** Espera el `init` del hijo actual (y cualquier relanzamiento en curso). */
+async function esperarListo(session, ms = 10000) {
+  if (session.relanzamiento) await session.relanzamiento;
+  const limite = Date.now() + ms;
+  while ((session.status === 'starting' || session.status === 'restarting') && Date.now() < limite) {
+    await esperarMs(50);
+  }
+  return session.status === 'ready';
+}
+
+function turnoDeAutorizacion(negadas) {
+  const lista = negadas.map((n) => `${n.tipo} ${n.objetivo}`).join('; ');
+  return `Autorizo por voz: ${lista}. Reintentá exactamente eso y lo mínimo necesario para terminar lo que pedí; ` +
+    'nada distinto. Respondé en una oración.';
 }
 
 function drainVoiceStreamEvents(session) {
@@ -3363,7 +3466,14 @@ async function handleToolCall(name, args) {
       if (action === 'start') {
         const effectiveModel = args.model || config.defaultModel;
         const effectiveEffort = args.effort || 'low';
-        const effectiveMode = args.mode || 'plan';
+        // Con freno, agy tiene que intentar la accion para que la niegue:
+        // accept-edits y sin skip. En plan, agy propone en vez de intentar
+        // (sonda D del plan-charla-modo-agente).
+        const confirmacion = args.confirmacion === true;
+        const effectiveMode = args.mode || (confirmacion ? 'accept-edits' : 'plan');
+        const skip = typeof args.dangerously_skip_permissions === 'boolean'
+          ? args.dangerously_skip_permissions
+          : !confirmacion;
 
         const session = createVoiceStreamSession({
           cwd: args.cwd,
@@ -3371,7 +3481,8 @@ async function handleToolCall(name, args) {
           effort: effectiveEffort,
           mode: effectiveMode,
           conversation_id: args.conversation_id,
-          dangerously_skip_permissions: args.dangerously_skip_permissions
+          dangerously_skip_permissions: skip,
+          confirmacion
         });
 
         let prewarmNote = '';
@@ -3413,7 +3524,9 @@ async function handleToolCall(name, args) {
         let primingNote = '';
         if (args.prime_conversational !== false) {
           // Incluye la regla del aviso previo antes de usar herramientas (lib/voice-drain.js).
-          const primingText = PRIMING_CHARLA;
+          // Solo el cwd que paso el llamador: nombrarle a agy como proyecto el
+          // process.cwd() de respaldo seria elegir por el usuario (auditoria).
+          const primingText = conDirectorio(session.confirmacion ? PRIMING_CONFIRMACION : PRIMING_CHARLA, args.cwd);
           try {
             sendVoiceStreamTurn(session, primingText);
             const primingDeadline = Date.now() + 10000;
@@ -3430,7 +3543,7 @@ async function handleToolCall(name, args) {
         return {
           content: [{
             type: 'text',
-            text: `Voice stream session started.\n- stream_id: \`${session.id}\`\n- conversation_id: \`${session.conversationId || 'pending'}\`\n- Model: \`${effectiveModel || 'default'}\` | Effort: \`${effectiveEffort}\` | Mode: \`${effectiveMode}\`\n- Status: \`${session.status}\`${prewarmNote}${primingNote}\n\nUse \`action: "send"\` with this stream_id to send a turn, then poll \`action: "drain"\` to read incremental text_delta events as they arrive.`
+            text: `Voice stream session started.\n- stream_id: \`${session.id}\`\n- conversation_id: \`${session.conversationId || 'pending'}\`\n- Model: \`${effectiveModel || 'default'}\` | Effort: \`${effectiveEffort}\` | Mode: \`${effectiveMode}\` | Skip permissions: \`${skip}\` | Confirmación: \`${confirmacion ? 'activa' : 'no'}\`\n- Status: \`${session.status}\`${prewarmNote}${primingNote}\n\nUse \`action: "send"\` with this stream_id to send a turn, then poll \`action: "drain"\` to read incremental text_delta events as they arrive.`
           }]
         };
       }
@@ -3443,10 +3556,24 @@ async function handleToolCall(name, args) {
         };
       }
 
+      const fallo = (text) => ({ isError: true, content: [{ type: 'text', text }] });
+
       if (action === 'send') {
         if (!args.text) {
           return { isError: true, content: [{ type: 'text', text: '"text" is required for action "send".' }] };
         }
+        // El hijo de una ejecucion autorizada corre con permisos plenos: un
+        // turno nuevo ahi heredaria la autorizacion.
+        if (session.ejecutando) {
+          return fallo('Hay una ejecución autorizada en curso: esperá a que cierre el turno o usá `stop_exec`.');
+        }
+        // Tras un relanzamiento, escribir antes del `init` puede perder el turno.
+        const listo = await esperarListo(session);
+        if (!listo && (session.status === 'starting' || session.status === 'restarting')) {
+          return fallo(`La sesión ${session.id} no terminó de arrancar agy (status: ${session.status}).`);
+        }
+        session.negadasTurno = [];
+        session.negadasPendientes = [];
         try {
           sendVoiceStreamTurn(session, args.text);
         } catch (err) {
@@ -3463,7 +3590,26 @@ async function handleToolCall(name, args) {
         // caller gets TTS-ready sentences. The chunker is flushed on turn completion
         // (short replies like "OK") and when a tool step starts, so a spoken
         // heads-up before a web search is not held until the search ends.
-        const { sentences, deltas, herramientas, resultEvent } = procesarEventosDrain(events, session.chunker, session.drainEstado || (session.drainEstado = {}));
+        const { sentences, deltas, herramientas, detalles, negadas, escrituras, resultEvent } = procesarEventosDrain(events, session.chunker, session.drainEstado || (session.drainEstado = {}));
+
+        // Charla con freno: las negadas se juntan por turno y, al cerrarlo,
+        // quedan pendientes de un `confirm`. El cierre de una ejecucion
+        // autorizada vuelve enseguida al hijo sin permisos plenos, asi el
+        // turno siguiente no paga el arranque (V3: ~7.5 s).
+        let negadasDelTurno = [];
+        if (session.confirmacion) {
+          session.negadasTurno.push(...negadas);
+          if (resultEvent) {
+            if (session.ejecutando) {
+              session.ejecutando = false;
+              programarRelanzamiento(session, { mode: session.modoBase, skip: session.skipBase });
+            } else {
+              negadasDelTurno = session.negadasTurno;
+              session.negadasPendientes = negadasDelTurno;
+            }
+            session.negadasTurno = [];
+          }
+        }
 
         return {
           content: [{
@@ -3476,11 +3622,66 @@ async function handleToolCall(name, args) {
               sentences,
               deltas,
               herramientas,
+              detalles,
+              negadas: negadasDelTurno,
+              escrituras,
+              ejecutando: session.ejecutando,
               result: resultEvent ? resultEvent.result : null,
               raw_event_count: events.length
             }, null, 2)
           }]
         };
+      }
+
+      if (action === 'confirm') {
+        if (!session.confirmacion) {
+          return fallo('Esta sesión no se abrió con `confirmacion: true`: no hay nada que autorizar.');
+        }
+        if (session.ejecutando) return fallo('Ya hay una ejecución autorizada en curso.');
+        const negadas = session.negadasPendientes;
+        if (!negadas.length) return fallo('No hay ninguna acción negada pendiente de autorizar.');
+        if (!session.conversationId) {
+          return fallo('La sesión todavía no tiene conversation_id: no se puede retomar la conversación.');
+        }
+        // Sincrono, antes de cualquier await: un "pará" justo despues del "sí"
+        // tiene que encontrar la ejecucion marcada (re-auditoria del plan).
+        session.ejecutando = true;
+        session.negadasPendientes = [];
+        const lanzado = await programarRelanzamiento(session, { mode: 'accept-edits', skip: true });
+        if (!lanzado) {
+          session.ejecutando = false;
+          return fallo(`La sesión ${session.id} se detuvo antes de ejecutar.`);
+        }
+        const listo = await esperarListo(session);
+        if (!session.ejecutando) {
+          return { content: [{ type: 'text', text: 'Ejecución cancelada antes de empezar.' }] };
+        }
+        if (!listo) {
+          session.ejecutando = false;
+          programarRelanzamiento(session, { mode: session.modoBase, skip: session.skipBase, matar: true });
+          return fallo(`agy no arrancó para ejecutar lo autorizado (status: ${session.status}).`);
+        }
+        sendVoiceStreamTurn(session, turnoDeAutorizacion(negadas));
+        return {
+          content: [{
+            type: 'text',
+            text: `Autorizado: ${negadas.map((n) => `${n.tipo} ${n.objetivo}`).join('; ')}. Este turno corre con permisos plenos; poll \`action: "drain"\` hasta que cierre.`
+          }]
+        };
+      }
+
+      if (action === 'stop_exec') {
+        if (!session.ejecutando) {
+          return { content: [{ type: 'text', text: 'No hay ninguna ejecución en curso.' }] };
+        }
+        session.ejecutando = false;
+        await programarRelanzamiento(session, { mode: session.modoBase, skip: session.skipBase, matar: true });
+        // El hijo cortado ya no emite nada: sin un result, el loop seguiria
+        // esperando el cierre de un turno que no va a llegar.
+        if (!session.events.slice(session.cursor).some((e) => e.event === 'result')) {
+          session.events.push({ event: 'result', result: { status: 'CANCELLED', response: '' }, _ts: Date.now() });
+        }
+        return { content: [{ type: 'text', text: 'Ejecución detenida; la charla sigue sin permisos plenos.' }] };
       }
 
       if (action === 'status') {
@@ -3493,6 +3694,8 @@ async function handleToolCall(name, args) {
               conversation_id: session.conversationId,
               model: session.model,
               effort: session.effort,
+              confirmacion: session.confirmacion,
+              ejecutando: session.ejecutando,
               pid: session.child.pid,
               buffered_undrained_events: session.events.length - session.cursor,
               created_at: new Date(session.createdAt).toISOString(),

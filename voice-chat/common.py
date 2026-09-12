@@ -7,10 +7,12 @@ reproductor local en cola FIFO. Sin dependencias pip - solo stdlib.
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -610,19 +612,36 @@ class SentenceSequencer:
 # no se editan archivos, y cada clave extra es GPU al arrancar con la cache
 # fria. "archivos" se sumo a pedido del usuario: aparece en busquedas reales,
 # cuando agy lee lo que descargo.
-ORDEN_SENALES = ["pensando", "web", "pagina", "archivos", "herramienta"]
+# navegador/memoria/agenda: por el servidor MCP que informa drain
+# (plan-senales-mcp). "navegador" va alto: es el caso agentico del usuario.
+# comando/escribiendo al final (plan-charla-modo-agente): solo suenan en una
+# ejecucion que el usuario autorizo, asi que no le quitan GPU al arranque de
+# las que usa toda charla.
+ORDEN_SENALES = ["pensando", "web", "navegador", "pagina", "archivos", "memoria", "agenda", "herramienta",
+                 "comando", "escribiendo"]
 FRASES_SENAL = {
-    "es": {"pensando": "Pensando.", "web": "Buscando en la web.", "pagina": "Leyendo la página.",
-           "archivos": "Revisando archivos.", "herramienta": "Usando una herramienta."},
-    "en": {"pensando": "Thinking.", "web": "Searching the web.", "pagina": "Reading the page.",
-           "archivos": "Looking through files.", "herramienta": "Using a tool."},
+    "es": {"pensando": "Pensando.", "web": "Buscando en la web.", "navegador": "Usando el navegador.",
+           "pagina": "Leyendo la página.", "archivos": "Revisando archivos.",
+           "memoria": "Consultando la memoria.", "agenda": "Revisando la agenda.",
+           "herramienta": "Usando una herramienta.",
+           "comando": "Ejecutando un comando.", "escribiendo": "Escribiendo el archivo."},
+    "en": {"pensando": "Thinking.", "web": "Searching the web.", "navegador": "Using the browser.",
+           "pagina": "Reading the page.", "archivos": "Looking through files.",
+           "memoria": "Checking memory.", "agenda": "Checking the calendar.",
+           "herramienta": "Using a tool.",
+           "comando": "Running a command.", "escribiendo": "Writing the file."},
 }
 # Inventario de agy observado (mcp-server/agents/registry.js); el resto cae en "herramienta".
 CATEGORIA_HERRAMIENTA = {
     "search_web": "web",
     "read_url_content": "pagina",
     "view_file": "archivos", "list_dir": "archivos", "grep_search": "archivos", "find_by_name": "archivos",
+    "run_command": "comando",
+    "write_to_file": "escribiendo", "replace_file_content": "escribiendo", "multi_replace_file_content": "escribiendo",
 }
+HERRAMIENTAS_ESCRITURA = {"write_to_file", "replace_file_content", "multi_replace_file_content"}
+# brain/ (planes) y scratch/ (el cwd de su shell) son de agy, no del usuario.
+RUTA_PROPIA_DE_AGY = re.compile(r"[\\/]antigravity-cli[\\/](brain|scratch)([\\/]|$)", re.IGNORECASE)
 SENALES_DIR = os.path.join(STATE_DIR, "senales")
 SEPARACION_SENALES_MS = 8000
 # Tras "Pensando", nombrar la herramienta no espera los 8 s: es informacion nueva.
@@ -641,6 +660,193 @@ def _borrar_resultado(future):
 
 def clave_de_herramienta(nombre):
     return CATEGORIA_HERRAMIENTA.get(nombre or "", "herramienta")
+
+
+# Tokens exactos del nombre del servidor, no substrings (auditoria del plan):
+# "file-browser" no es un navegador y "task-scheduler" no es una agenda.
+# Sin "schedule": schedule-x es un MCP de documentacion de esa libreria, no
+# una agenda (observacion del usuario tras probarlo con el microfono).
+TOKENS_SERVIDOR = {
+    "navegador": {"playwright", "puppeteer", "chrome", "chromium"},
+    "memoria": {"memory", "memoria", "mem0"},
+    "agenda": {"calendar", "agenda"},
+}
+
+
+def clave_de_servidor(servidor):
+    if not isinstance(servidor, str) or not servidor.strip():
+        return None
+    tokens = set(re.split(r"[^a-z0-9]+", servidor.lower()))
+    for clave, nombres in TOKENS_SERVIDOR.items():
+        if tokens & nombres:
+            return clave
+    return None
+
+
+def clave_de_paso(paso, ejecutando=True):
+    """Clave de senal de un paso de drain: un detalle {nombre, servidor,
+    accion, destino} o, de un MCP viejo, solo el nombre de la herramienta.
+    None si el paso no merece senal: agy escribiendo en su brain/ o scratch/,
+    o un comando fuera de una ejecucion autorizada (agy lo niega: anunciarlo
+    diria algo que no paso)."""
+    if isinstance(paso, dict):
+        nombre = paso.get("nombre")
+        if nombre == "call_mcp_tool":
+            return clave_de_servidor(paso.get("servidor")) or "herramienta"
+        destino = paso.get("destino")
+        if nombre in HERRAMIENTAS_ESCRITURA and isinstance(destino, str) and RUTA_PROPIA_DE_AGY.search(destino):
+            return None
+        clave = clave_de_herramienta(nombre)
+    else:
+        clave = clave_de_herramienta(paso)
+    if clave == "comando" and not ejecutando:
+        return None
+    return clave
+
+
+# Charla con freno (plan-charla-modo-agente). Solo frases cortas: una frase de
+# fondo mal transcripta no alcanza para autorizar. Sin tildes ni puntuacion:
+# para Whisper, "Sí." y "si" son lo mismo.
+MAX_PALABRAS_CONFIRMACION = 4
+VIGENCIA_PENDIENTE_S = 90
+CONFIRMACIONES = {
+    "es": {
+        "si": {"si", "dale", "hacelo", "hazlo", "confirmo", "adelante", "de una", "si dale", "dale si", "si hacelo",
+               "si por favor", "si adelante", "si confirmo"},
+        "no": {"no", "cancela", "cancelar", "mejor no", "espera", "no gracias", "no no", "no lo hagas"},
+    },
+    "en": {
+        "si": {"yes", "go ahead", "do it", "yes please", "yes go ahead", "yes do it", "confirm"},
+        "no": {"no", "cancel", "don t", "don t do it", "no thanks", "wait"},
+    },
+}
+PARADAS = {
+    "es": {"para", "para para", "para ya", "stop", "frena", "basta", "detente", "cancela"},
+    "en": {"stop", "cancel", "halt"},
+}
+TURNO_CANCELADO = {
+    "es": "No autorizo eso. No lo reintentes; respondé en una oración.",
+    "en": "I don't authorize that. Don't retry it; answer in one sentence.",
+}
+AVISO_CONFIRMACION = {
+    "es": "Charla con freno: agy no ejecuta comandos, usa MCP ni lee páginas sin tu sí. "
+          "Con tu sí, ese turno corre con permisos plenos. "
+          "Las escrituras de archivos no las frena agy: la charla te avisa cuando pasan.",
+    "en": "Chat with a brake: agy won't run commands, use MCP or read pages without your yes. "
+          "With your yes, that turn runs with full permissions. "
+          "agy doesn't gate file writes: the chat tells you when they happen.",
+}
+
+
+def _normalizar(texto):
+    sin_tildes = "".join(c for c in unicodedata.normalize("NFD", texto or "") if unicodedata.category(c) != "Mn")
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", sin_tildes.lower()).split())
+
+
+def _frase_corta(texto):
+    n = _normalizar(texto)
+    return n if n and len(n.split()) <= MAX_PALABRAS_CONFIRMACION else None
+
+
+def interpretar_confirmacion(texto, idioma):
+    """"si", "no" o None (no es una respuesta corta reconocible)."""
+    n = _frase_corta(texto)
+    if not n:
+        return None
+    tabla = CONFIRMACIONES.get(idioma) or CONFIRMACIONES["en"]
+    if n in tabla["si"]:
+        return "si"
+    if n in tabla["no"]:
+        return "no"
+    return None
+
+
+def es_parada(texto, idioma):
+    n = _frase_corta(texto)
+    return bool(n) and n in (PARADAS.get(idioma) or PARADAS["en"])
+
+
+def accion_para_turno(texto, idioma, pendiente_t, ahora, ejecutando=False):
+    """Que accion de agy_voice_stream corresponde a lo que dijo el usuario:
+    ("confirm" | "send" | "stop_exec", texto a mandar o None). La pendiente
+    vale solo para la frase inmediata siguiente: el llamador la descarta
+    siempre despues de llamar a esto."""
+    if ejecutando:
+        return ("stop_exec", None) if es_parada(texto, idioma) else ("send", texto)
+    if pendiente_t is not None and ahora - pendiente_t <= VIGENCIA_PENDIENTE_S:
+        respuesta = interpretar_confirmacion(texto, idioma)
+        if respuesta == "si":
+            return ("confirm", None)
+        if respuesta == "no":
+            return ("send", TURNO_CANCELADO.get(idioma) or TURNO_CANCELADO["en"])
+    return ("send", texto)
+
+
+def _limpiar_para_voz(texto, maximo=60):
+    """Primera linea, sin simbolos que el TTS lee mal, recortada en palabra."""
+    lineas = (texto or "").strip().splitlines()
+    t = " ".join(re.sub(r"[\"'`*$<>|&;{}\[\]\\]+", " ", lineas[0] if lineas else "").split())
+    if len(t) > maximo:
+        t = t[:maximo].rsplit(" ", 1)[0] or t[:maximo]
+    return t
+
+
+def _describir_negada(negada, idioma):
+    tipo = negada.get("tipo")
+    objetivo = negada.get("objetivo") or ""
+    es = idioma == "es"
+    if tipo == "command":
+        cmd = _limpiar_para_voz(objetivo)
+        if not cmd:
+            return "ejecutar un comando" if es else "run a command"
+        return f"ejecutar el comando {cmd}" if es else f"run the command {cmd}"
+    if tipo == "mcp":
+        servidor = objetivo.split("/")[0]
+        clave = clave_de_servidor(servidor)
+        if es:
+            return ({"navegador": "usar el navegador", "memoria": "usar la memoria", "agenda": "usar la agenda"}.get(clave)
+                    or f"usar {_limpiar_para_voz(servidor)}")
+        return ({"navegador": "use the browser", "memoria": "use memory", "agenda": "use the calendar"}.get(clave)
+                or f"use {_limpiar_para_voz(servidor)}")
+    if tipo == "read_url":
+        return f"leer {_limpiar_para_voz(objetivo)}" if es else f"read {_limpiar_para_voz(objetivo)}"
+    return "hacer algo que necesita permiso" if es else "do something that needs permission"
+
+
+def pregunta_de_negaciones(negadas, idioma):
+    """La pregunta que dice la charla al cerrar un turno con negaciones. La
+    arma la charla y no agy: tras una negacion su respuesta suele venir vacia
+    (sondas A, C, E). None si no hay nada que preguntar."""
+    descripciones = []
+    for n in negadas or []:
+        d = _describir_negada(n, idioma)
+        if d not in descripciones:
+            descripciones.append(d)
+    if not descripciones:
+        return None
+    resto = len(descripciones) - 1
+    if idioma == "es":
+        extra = "" if not resto else (" y una cosa más" if resto == 1 else f" y {resto} cosas más")
+        return f"Agy quiere {descripciones[0]}{extra}. ¿Lo hago?"
+    extra = "" if not resto else (" and one more thing" if resto == 1 else f" and {resto} more things")
+    return f"Agy wants to {descripciones[0]}{extra}. Should I?"
+
+
+def aviso_escrituras(rutas, idioma):
+    """Aviso de archivos que agy escribio sin pedir permiso (write_to_file no
+    pasa por el freno). None si no hubo."""
+    nombres = []
+    for r in rutas or []:
+        nombre = re.split(r"[\\/]", r)[-1] if isinstance(r, str) else ""
+        if nombre and nombre not in nombres:
+            nombres.append(nombre)
+    if not nombres:
+        return None
+    if len(nombres) == 1:
+        return f"Agy modificó {nombres[0]} sin preguntar." if idioma == "es" else f"Agy changed {nombres[0]} without asking."
+    if idioma == "es":
+        return f"Agy modificó {len(nombres)} archivos sin preguntar."
+    return f"Agy changed {len(nombres)} files without asking."
 
 
 def _slug(texto):
@@ -719,7 +925,7 @@ class Senales:
         self._parar.set()
 
 
-def decidir_senal(hubo_texto, reproduciendo, vigente, herramienta, ultima_clave, desde_ultima_ms,
+def decidir_senal(hubo_texto, reproduciendo, vigente, clave_pendiente, ultima_clave, desde_ultima_ms,
                   transcurrido_ms, umbral_ms, sonaron=0,
                   separacion_ms=SEPARACION_SENALES_MS, maximo=MAX_SENALES_TURNO,
                   separacion_tras_pensando_ms=SEPARACION_TRAS_PENSANDO_MS):
@@ -731,8 +937,10 @@ def decidir_senal(hubo_texto, reproduciendo, vigente, herramienta, ultima_clave,
     la quinta ya le sonaba a disco rayado."""
     if umbral_ms <= 0 or hubo_texto or reproduciendo or not vigente or sonaron >= maximo:
         return None
-    if herramienta:
-        clave = clave_de_herramienta(herramienta)
+    # clave_pendiente ya es una clave de senal (clave_de_paso en el loop): no
+    # se vuelve a mapear, o "navegador" caeria en "herramienta" (auditoria).
+    if clave_pendiente:
+        clave = clave_pendiente
         if clave == ultima_clave:
             return None
         separacion = separacion_tras_pensando_ms if ultima_clave == "pensando" else separacion_ms
