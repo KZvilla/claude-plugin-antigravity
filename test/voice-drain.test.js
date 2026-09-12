@@ -31,6 +31,15 @@ async function main() {
     check('la respuesta llega después', JSON.stringify(r2.sentences) === JSON.stringify(['Encontré tres noticias sobre eso.']));
   });
 
+  await group('oración con punto final y la herramienta en otro drain (plan-chunker-punto-interno)', () => {
+    const chunker = new SentenceChunker();
+    const estado = {};
+    const r = procesarEventosDrain([texto('Voy a revisar el archivo.')], chunker, estado);
+    check('espera el siguiente delta', r.sentences.length === 0, JSON.stringify(r.sentences));
+    const r2 = procesarEventosDrain([tool('view_file', 2)], chunker, estado);
+    check('el paso de herramienta la emite', JSON.stringify(r2.sentences) === JSON.stringify(['Voy a revisar el archivo.']), JSON.stringify(r2.sentences));
+  });
+
   await group('detalle del paso: servidor MCP (plan-senales-mcp)', () => {
     // Forma real capturada de agy (2026-09-11).
     const mcp = (i, state, extra = {}) => ({ event: 'step_update', step_update: {
