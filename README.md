@@ -666,6 +666,8 @@ Full-duplex spoken conversation with Antigravity — not a Claude Code slash com
 
 Both use a local Voicebox at `http://127.0.0.1:17493` (or `VOICEBOX_URL`) for TTS/STT, started headless through the MCP server if it is not running; they refuse to open the mic if another voice's model is pinned (`--soltar-pin` releases it); `voice_loop.py` additionally needs `pip install -r voice-chat/requirements.txt` (`sounddevice`, `silero-vad`, `numpy`).
 
+**Confirmation brake.** Both loops open the session with `confirmacion: true`. agy then runs without `--dangerously-skip-permissions`, so it denies shell commands, MCP calls (browsing included) and `read_url` on its own. When a turn ends with something denied, the chat asks out loud ("Agy quiere ejecutar el comando git status. ¿Lo hago?"). A short "sí" (four words or fewer) relaunches agy with full permissions on the same conversation for that turn only, and the chat goes back to the braked session right after; any other answer drops the question. In `voice_loop.py`, saying "pará" during that turn stops it. agy does not gate `write_to_file`, so the chat says when agy changed a file without asking. `--mode plan` is not a brake: it does not stop shell commands.
+
 ```bash
 # Console-only, zero extra dependencies
 python voice-chat/text_loop.py --voice "Diego Alvarez" --language es

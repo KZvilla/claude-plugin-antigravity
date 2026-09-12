@@ -51,7 +51,8 @@ from common import (  # noqa: E402
     resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
     get_model_status, resolve_engine_and_model, tts_model_name, unload_model, stt_full_model_name,
     unload_all_loaded_models, LatidoUso, activar_motor_chat,
-    Senales, TiemposTurno, decidir_senal, clave_de_paso
+    Senales, TiemposTurno, decidir_senal, clave_de_paso,
+    accion_para_turno, pregunta_de_negaciones, aviso_escrituras, AVISO_CONFIRMACION
 )
 
 SAMPLE_RATE = 16000
@@ -280,13 +281,14 @@ def main():
 
     print("[voice-loop] Iniciando sesion agy_voice_stream" +
           (" (con pre-warm de Voicebox en paralelo)" if is_qwen_engine and proveedor == "voicebox" else "") + "...")
-    start_args = {"action": "start", "effort": args.effort, "mode": "plan",
+    start_args = {"action": "start", "effort": args.effort, "confirmacion": True,
                   "prewarm_voicebox": is_qwen_engine and proveedor == "voicebox"}
     if is_qwen_engine:
         start_args["voicebox_model_size"] = model_size or "1.7B"
     start_text = mcp.call_tool("agy_voice_stream", start_args)
     stream_id = start_text.split("stream_id: `")[1].split("`")[0]
     print(f"[voice-loop] Sesion lista: {stream_id}")
+    print(f"[voice-loop] ⚠️ {AVISO_CONFIRMACION.get(args.language) or AVISO_CONFIRMACION['en']}")
 
     # Pre-warm de STT: sin esto, la PRIMERA transcripcion real paga el costo de
     # cargar el modelo Whisper (visto en vivo: "Whisper model base is being
@@ -305,6 +307,26 @@ def main():
     # que un turno interrumpido no "reviva" hablando despues del corte.
     generation_token = {"value": 0}
     turn_queue = queue.Queue()
+    # Charla con freno (plan-charla-modo-agente). `por_confirmar`: cuando se
+    # pregunto por algo que agy tuvo negado; vale solo para la frase
+    # siguiente. `ejecucion`: un turno autorizado en curso y si se pidio parar.
+    por_confirmar = {"t": None}
+    ejecucion = {"activa": False, "parar": False}
+
+    def revisar_parada(audio_samples, token, t0):
+        # Durante una ejecucion autorizada el turn worker esta ocupado
+        # drenando: un "pará" se reconoce aparte, sin esperar la cola.
+        try:
+            text = transcribe_wav_bytes(float32_to_wav_bytes(audio_samples), language=args.language, model=args.stt_model)
+        except Exception as err:
+            print(f"  ⚠️ Error transcribiendo: {err}")
+            return
+        accion, _ = accion_para_turno(text or "", args.language, None, time.monotonic(), True)
+        if accion == "stop_exec" and ejecucion["activa"]:
+            print(f"Vos> {text}  (parando la ejecución)")
+            ejecucion["parar"] = True
+        else:
+            turn_queue.put((audio_samples, token, t0))
 
     def on_speech_start():
         generation_token["value"] += 1
@@ -320,6 +342,10 @@ def main():
         # como si fuera vigente (asi sonaban dos respuestas identicas seguidas).
         # t0 de la medicion: el fin de la utterance segun el VAD (llega
         # --min-silence-ms despues de que el usuario deja de hablar).
+        if ejecucion["activa"]:
+            threading.Thread(target=revisar_parada, daemon=True,
+                             args=(audio_samples, generation_token["value"], time.monotonic())).start()
+            return
         turn_queue.put((audio_samples, generation_token["value"], time.monotonic()))
 
     def turn_worker():
@@ -348,10 +374,24 @@ def main():
                 t.marcar("primer_audio")
                 t.imprimir_una_vez()
 
+            # Un "sí" corto a la pregunta anterior autoriza; cualquier otra
+            # frase descarta la pregunta y va como turno normal.
+            accion, texto_envio = accion_para_turno(text, args.language, por_confirmar["t"], time.monotonic())
+            por_confirmar["t"] = None
+            es_ejecucion = accion == "confirm"
+            escrituras = []
+            negadas = []
+            corrio = []
+
             # Un error de MCP (timeout, isError) no debe matar este hilo: sin el,
             # la charla queda muda para siempre (auditoria de la implementacion).
             try:
-                mcp.call_tool("agy_voice_stream", {"action": "send", "stream_id": stream_id, "text": text})
+                if es_ejecucion:
+                    ejecucion["parar"] = False
+                    ejecucion["activa"] = True
+                    print("  ✅ " + mcp.call_tool("agy_voice_stream", {"action": "confirm", "stream_id": stream_id}))
+                else:
+                    mcp.call_tool("agy_voice_stream", {"action": "send", "stream_id": stream_id, "text": texto_envio})
                 t_envio = time.monotonic()
                 tiempos.marcar("envio")
                 # Estado de senales del turno. `pendiente`: la ultima herramienta
@@ -365,15 +405,25 @@ def main():
                 turn_complete = False
                 while not turn_complete:
                     time.sleep(0.15)
+                    if ejecucion["parar"]:
+                        ejecucion["parar"] = False
+                        print("  ✋ " + mcp.call_tool("agy_voice_stream", {"action": "stop_exec", "stream_id": stream_id}))
                     drain = json.loads(mcp.call_tool("agy_voice_stream", {"action": "drain", "stream_id": stream_id}))
                     turn_complete = drain["turn_complete"]
                     if drain.get("deltas"):
                         tiempos.marcar("primer_texto")
+                    escrituras += drain.get("escrituras") or []
+                    if turn_complete:
+                        negadas = drain.get("negadas") or []
                     # `detalles` trae el servidor MCP; un MCP viejo solo trae nombres.
                     for paso in drain.get("detalles") or drain.get("herramientas") or []:
                         tiempos.marcar("herramienta")
-                        clave_paso = clave_de_paso(paso)
-                        if clave_paso != ultima_clave:
+                        if es_ejecucion:
+                            corrio.append(paso if isinstance(paso, str) else
+                                          "/".join(x for x in (paso.get("servidor"), paso.get("accion")) if x)
+                                          or paso.get("nombre") or "?")
+                        clave_paso = clave_de_paso(paso, es_ejecucion)
+                        if clave_paso and clave_paso != ultima_clave:
                             pendiente = clave_paso
                     if senales:
                         ahora = time.monotonic()
@@ -402,10 +452,32 @@ def main():
                         del futuros[:-8]
                         sequencer.submit(future, sentence, al_empezar=al_primer_audio,
                                          vigente=lambda t=my_token: generation_token["value"] == t)
+
+                # Cierre del turno: lo que corrio con permisos plenos, lo que
+                # agy escribio sin preguntar y la pregunta por lo negado. Si
+                # el usuario hablo encima no oyo la pregunta: no se arma.
+                if corrio:
+                    print("  🔧 Corrió con permisos plenos: " + ", ".join(corrio))
+                if generation_token["value"] == my_token:
+                    for frase in (aviso_escrituras(escrituras, args.language),
+                                  pregunta_de_negaciones(negadas, args.language)):
+                        if not frase:
+                            continue
+                        print(f"Charla> {frase}")
+                        hubo_oracion = True
+                        future = executor.submit(synthesize_sentence, frase, profile, args.language, engine,
+                                                 model_size, proveedor, muestra)
+                        futuros.append(future)
+                        del futuros[:-8]
+                        sequencer.submit(future, frase, al_empezar=al_primer_audio,
+                                         vigente=lambda t=my_token: generation_token["value"] == t)
+                    if negadas:
+                        por_confirmar["t"] = time.monotonic()
             except Exception as err:
                 print(f"  ⚠️ Error en el turno: {err}")
             finally:
                 turno_en_curso["activo"] = False
+                ejecucion["activa"] = False
             # Un turno cortado no llega a primer_audio: la linea se imprime igual.
             if not hubo_oracion or generation_token["value"] != my_token:
                 tiempos.imprimir_una_vez()

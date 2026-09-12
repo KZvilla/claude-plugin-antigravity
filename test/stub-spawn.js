@@ -25,6 +25,89 @@ const USAGE_STUB = process.env.STUB_USAGE === '1'
   ? { input_tokens: 10, output_tokens: 5, thinking_tokens: 2, cache_read_tokens: 1, total_tokens: 15 }
   : undefined;
 
+/**
+ * `--input-format stream-json` (la charla y executeAgyStdin): el proceso queda
+ * vivo y responde un turno por cada línea de stdin, y se cierra cuando stdin
+ * termina y no queda nada por responder, o al matarlo. Antes stdin se tragaba
+ * todo y el proceso cerraba solo, así que no había forma de probar una sesión
+ * de varios turnos ni un relanzamiento.
+ *
+ * Turnos especiales (plan-charla-modo-agente):
+ *   - "NEGAR_COMANDO <cmd>" sin --dangerously-skip-permissions: la negación
+ *     real de agy (sondas A/C): run_command ACTIVE, ERROR de permiso y un
+ *     result con respuesta vacía y denied_actions.
+ *   - una autorización ("Autorizo por voz…") que nombra COLGAR no responde
+ *     nunca, para probar stop_exec.
+ * Con CAPTURE_STDIN_FILE, cada línea de stdin se anota ahí (no en
+ * CAPTURE_FILE: hay suites que cuentan sus líneas como lanzamientos).
+ */
+function procesoInteractivo(child, args, opts) {
+  const i = args.indexOf('--conversation');
+  const cid = i >= 0 ? args[i + 1] : 'stub-conversation-id';
+  const holdMs = parseInt(process.env.STUB_HOLD_MS, 10) || 0;
+  let cerrado = false;
+  let pendientes = 0;
+  let finPedido = false;
+  let paso = 0;
+
+  const emitir = (ev) => { if (!cerrado) child.stdout.write(JSON.stringify(ev) + '\n'); };
+  const cerrar = (code) => {
+    if (cerrado) return;
+    cerrado = true;
+    child.stdout.end();
+    child.stderr.end();
+    setImmediate(() => child.emit('close', code));
+  };
+  const quizasCerrar = () => { if (finPedido && pendientes === 0) cerrar(0); };
+
+  const responder = (contenido) => {
+    const base = paso;
+    paso += 10;
+    if (/Autorizo por voz/.test(contenido) && /COLGAR/.test(contenido)) return;
+    const m = /NEGAR_COMANDO (.+)$/.exec(contenido);
+    if (m && !args.includes('--dangerously-skip-permissions')) {
+      const p = { CommandLine: m[1] };
+      const pasoTool = (state, extra = {}) => ({ event: 'step_update', step_update: {
+        conversation_id: cid, step_index: base + 1, state, step_type: 'tool', tool_name: 'run_command',
+        tool_info: { name: 'run_command', parameters: p, ...extra }
+      } });
+      emitir(pasoTool('ACTIVE'));
+      emitir(pasoTool('ERROR', { error: { type: 'TOOL_ERROR', message: `permission check failed for command "${m[1]}": user denied permission to run command:\n${m[1]}` } }));
+      emitir({ event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: '', denied_actions: [{ action: 'command', display_name: 'RunCommand' }] } });
+      return;
+    }
+    emitir({ event: 'step_update', step_update: { conversation_id: cid, step_index: base + 1, state: 'DONE', step_type: 'agent_response', text_delta: 'STUBBED RESPONSE' } });
+    emitir({ event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: 'STUBBED RESPONSE', duration_seconds: 1, usage: USAGE_STUB } });
+  };
+
+  child.stdin = {
+    write(linea) {
+      if (process.env.CAPTURE_STDIN_FILE) {
+        fs.appendFileSync(process.env.CAPTURE_STDIN_FILE, JSON.stringify({ args, linea: String(linea).trim() }) + '\n');
+      }
+      let contenido = '';
+      try { contenido = JSON.parse(linea).message.content || ''; } catch {}
+      pendientes++;
+      const tarea = () => { responder(contenido); pendientes--; quizasCerrar(); };
+      if (holdMs > 0) setTimeout(tarea, holdMs);
+      else setImmediate(tarea);
+      return true;
+    },
+    end() { finPedido = true; setImmediate(quizasCerrar); }
+  };
+
+  let killed = false;
+  child.kill = () => {
+    if (killed) return;
+    killed = true;
+    fs.appendFileSync(CAPTURE_FILE, JSON.stringify({ event: 'kill', cwd: opts && opts.cwd }) + '\n');
+    cerrar(1);
+  };
+
+  setImmediate(() => emitir({ event: 'init', conversation_id: cid, init: {} }));
+  return child;
+}
+
 cp.spawn = function (cmd, args, opts) {
   if (!/agy/i.test(String(cmd))) {
     return realSpawn.apply(this, arguments);
@@ -41,6 +124,7 @@ cp.spawn = function (cmd, args, opts) {
   // (executeAgy, que solo hace `.on('data', ...)`, y executeAgyStreaming).
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
+  if (args.includes('--input-format')) return procesoInteractivo(child, args, opts);
   child.stdin = { write() {}, end() {} };
 
   // Sin STUB_HOLD_MS, el comportamiento es idéntico al de antes de FEAT-012

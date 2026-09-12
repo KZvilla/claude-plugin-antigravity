@@ -30,7 +30,8 @@ from common import (  # noqa: E402
     resolve_voice_profile, synthesize_sentence, voicebox_cancel,
     get_model_status, resolve_engine_and_model, unload_all_loaded_models,
     LatidoUso, tts_model_name, activar_motor_chat,
-    Senales, TiemposTurno, decidir_senal, clave_de_paso
+    Senales, TiemposTurno, decidir_senal, clave_de_paso,
+    accion_para_turno, pregunta_de_negaciones, aviso_escrituras, AVISO_CONFIRMACION
 )
 
 
@@ -108,16 +109,20 @@ def main():
     # Sin VAD no hay token de barge-in: cada Enter abre un turno nuevo y las
     # oraciones de los anteriores se descartan al terminar de sintetizarse.
     turno = {"n": 0}
+    # Charla con freno (plan-charla-modo-agente): cuando se pregunto por algo
+    # que agy tuvo negado. Vale solo para la frase siguiente.
+    por_confirmar = {"t": None}
 
     con_prewarm = proveedor == "voicebox" and engine in ("qwen", "qwen_custom_voice")
     print("[voice-loop] Iniciando sesion agy_voice_stream" +
           (" (con pre-warm de Voicebox en paralelo)" if con_prewarm else "") + "...")
     start_text = mcp.call_tool("agy_voice_stream", {
-        "action": "start", "effort": args.effort, "mode": "plan",
+        "action": "start", "effort": args.effort, "confirmacion": True,
         "prewarm_voicebox": con_prewarm, "voicebox_model_size": model_size or "1.7B"
     })
     stream_id = start_text.split("stream_id: `")[1].split("`")[0]
-    print(f"[voice-loop] Sesion lista: {stream_id}\n")
+    print(f"[voice-loop] Sesion lista: {stream_id}")
+    print(f"[voice-loop] ⚠️ {AVISO_CONFIRMACION.get(args.language) or AVISO_CONFIRMACION['en']}\n")
 
     print("Modo Charla (texto) listo. Escribi algo y presiona Enter.")
     print("Tipea mientras habla para interrumpir (barge-in simulado). 'salir' para terminar.\n")
@@ -150,9 +155,21 @@ def main():
                 t.marcar("primer_audio")
                 t.imprimir_una_vez()
 
+            # Un "sí" corto a la pregunta anterior autoriza; cualquier otra
+            # frase descarta la pregunta y va como turno normal.
+            accion, texto_envio = accion_para_turno(user_text, args.language, por_confirmar["t"], time.monotonic())
+            por_confirmar["t"] = None
+            es_ejecucion = accion == "confirm"
+            escrituras = []
+            negadas = []
+            corrio = []
+
             # Un error de MCP en el turno se informa y la charla sigue.
             try:
-                mcp.call_tool("agy_voice_stream", {"action": "send", "stream_id": stream_id, "text": user_text})
+                if es_ejecucion:
+                    print("  ✅ " + mcp.call_tool("agy_voice_stream", {"action": "confirm", "stream_id": stream_id}))
+                else:
+                    mcp.call_tool("agy_voice_stream", {"action": "send", "stream_id": stream_id, "text": texto_envio})
                 t_envio = time.monotonic()
                 tiempos.marcar("envio")
                 pendiente = None  # ver voice_loop.py
@@ -167,10 +184,17 @@ def main():
                     turn_complete = drain["turn_complete"]
                     if drain.get("deltas"):
                         tiempos.marcar("primer_texto")
+                    escrituras += drain.get("escrituras") or []
+                    if turn_complete:
+                        negadas = drain.get("negadas") or []
                     for paso in drain.get("detalles") or drain.get("herramientas") or []:
                         tiempos.marcar("herramienta")
-                        clave_paso = clave_de_paso(paso)
-                        if clave_paso != ultima_clave:
+                        if es_ejecucion:
+                            corrio.append(paso if isinstance(paso, str) else
+                                          "/".join(x for x in (paso.get("servidor"), paso.get("accion")) if x)
+                                          or paso.get("nombre") or "?")
+                        clave_paso = clave_de_paso(paso, es_ejecucion)
+                        if clave_paso and clave_paso != ultima_clave:
                             pendiente = clave_paso
                     if senales:
                         ahora = time.monotonic()
@@ -197,6 +221,25 @@ def main():
                         del futuros[:-8]
                         sequencer.submit(future, sentence, al_empezar=al_primer_audio,
                                          vigente=lambda n=mi_turno: turno["n"] == n)
+
+                # Cierre del turno: lo que corrio con permisos plenos, lo que
+                # agy escribio sin preguntar y la pregunta por lo negado.
+                if corrio:
+                    print("  🔧 Corrió con permisos plenos: " + ", ".join(corrio))
+                for frase in (aviso_escrituras(escrituras, args.language), pregunta_de_negaciones(negadas, args.language)):
+                    if not frase:
+                        continue
+                    print(f"Charla> {frase}")
+                    hubo_oracion = True
+                    future = executor.submit(synthesize_sentence, frase, profile, args.language, engine,
+                                             model_size, proveedor, muestra)
+                    futuros.append(future)
+                    del futuros[:-8]
+                    sequencer.submit(future, frase, al_empezar=al_primer_audio,
+                                     vigente=lambda n=mi_turno: turno["n"] == n)
+                if negadas:
+                    por_confirmar["t"] = time.monotonic()
+                    print('  (respondé "sí" para autorizarlo, o cualquier otra cosa para seguir)')
             except Exception as err:
                 print(f"  ⚠️ Error en el turno: {err}")
             finally:
