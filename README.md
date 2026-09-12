@@ -437,7 +437,10 @@ Design rationale, verification evidence and the remaining backlog live in `docs/
 
 ## 🫀 Souls (`agy_alma`)
 
-Phase 0 of a larger feature: the voices get an identity and a memory of their own. **Nothing uses them yet.** Narrations, the voice chat, a Telegram chat lane and emoji reactions come in later phases. The files already exist, though, and can be inspected, seeded and pruned.
+A feature built in phases: the voices get an identity and a memory of their own.
+
+- **Narrations already use the identity.** With `personality: true`, `agy_say`, `agy_narrate` and the spoken digest of `agy_session_summary` speak from the voice's `alma.md` instead of the two Voicebox profile fields. A voice without a soul gets one seeded from its profile the first time it narrates. To tune how a voice talks, edit its `alma.md`: the next narration follows it. `agy_say` and `agy_narrate` write the script as the tool-less `lagrange-alma` agent. The summary keeps its own call, because the persona there only changes the digest's tone.
+- **Memory does not reach narrations, and never will.** A narration may only rewrite what it was given (REWRITE ONLY), and memory would add facts. Memory arrives with the conversational surfaces (voice chat, a Telegram chat lane, emoji reactions) in later phases. Each narration only leaves a line in the soul's diary.
 
 ```
 ~/.claude/lagrange-almas/        (override: LAGRANGE_ALMAS_DIR)

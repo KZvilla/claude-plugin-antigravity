@@ -13,5 +13,6 @@ module.exports = {
   recuerdos: require('./recuerdos.js'),
   diario: require('./diario.js'),
   semilla: require('./semilla.js'),
-  agente: require('./agente.js')
+  agente: require('./agente.js'),
+  contexto: require('./contexto.js')
 };

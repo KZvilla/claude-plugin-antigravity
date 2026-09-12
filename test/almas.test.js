@@ -17,6 +17,7 @@ const recuerdos = require('../mcp-server/almas/recuerdos.js');
 const { escanear } = require('../mcp-server/almas/escaneo.js');
 const diario = require('../mcp-server/almas/diario.js');
 const semilla = require('../mcp-server/almas/semilla.js');
+const contexto = require('../mcp-server/almas/contexto.js');
 
 // --- Worker de concurrencia -------------------------------------------------
 if (process.argv.includes('--worker')) {
@@ -255,6 +256,24 @@ async function main() {
     const d = fs.readFileSync(r4.ruta, 'utf8');
     check('campos ausentes usan respaldo', d.includes('Natural and expressive') && d.includes('Voice Assistant') && !d.includes('undefined'));
     check('perfil sin nombre lanza', (() => { try { semilla.sembrar('x', {}, { env }); } catch { return true; } return false; })());
+  });
+
+  await group('contexto (fase 1): identidad', () => {
+    check('sin alma.md da null', contexto.identidad('nadie', env) === null);
+    const r = rutas.rutasDe('larga', env);
+    const lineas = [];
+    for (let i = 0; i < 80; i++) lineas.push(`Línea ${i} de un alma bastante larga.`);
+    fs.mkdirSync(r.dir, { recursive: true });
+    fs.writeFileSync(r.alma, lineas.join('\n'));
+    const id = contexto.identidad('larga', env);
+    check('recorta y avisa', id.recortado && id.texto.length <= semilla.MAX_ALMA && id.largo > semilla.MAX_ALMA, String(id.texto.length));
+    check('corta en un salto de línea', id.texto.endsWith('larga.'), id.texto.slice(-30));
+    const corta = semilla.sembrar('corta', { name: 'Corta', personality: 'Breve' }, { env });
+    check('un alma corta no se recorta', !contexto.identidad('corta', env).recortado && corta.creado);
+    check('componerContexto sin memoria da la identidad', contexto.componerContexto('corta', {}, env).includes('Breve'));
+    let lanzo = false;
+    try { contexto.componerContexto('corta', { conMemoria: true }, env); } catch { lanzo = true; }
+    check('conMemoria lanza hasta la fase 2', lanzo);
   });
 
   fs.rmSync(base, { recursive: true, force: true });

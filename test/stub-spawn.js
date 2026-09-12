@@ -108,6 +108,21 @@ function procesoInteractivo(child, args, opts) {
   return child;
 }
 
+// `agy agents` (la verificación de lagrange-alma, que usa execFile y no spawn):
+// una lista fija en vez del binario real. No se anota en CAPTURE_FILE porque
+// hay suites que cuentan sus líneas como lanzamientos. STUB_AGENTS='' simula un
+// agente que no resuelve.
+const realExecFile = cp.execFile;
+cp.execFile = function (file, args, ...resto) {
+  if (/agy/i.test(String(file)) && Array.isArray(args) && args[0] === 'agents') {
+    const cb = resto.find(a => typeof a === 'function');
+    const salida = process.env.STUB_AGENTS !== undefined ? process.env.STUB_AGENTS : 'lagrange-alma\n';
+    setImmediate(() => { if (cb) cb(null, salida, ''); });
+    return new EventEmitter();
+  }
+  return realExecFile.apply(this, arguments);
+};
+
 cp.spawn = function (cmd, args, opts) {
   if (!/agy/i.test(String(cmd))) {
     return realSpawn.apply(this, arguments);

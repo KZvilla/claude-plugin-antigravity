@@ -6,6 +6,8 @@
  * funciones son puras y hay que poder afirmarlas en un test sin levantar nada.
  */
 
+const path = require('node:path');
+
 // Tope de caracteres que se envian a Voicebox. Por encima, la sintesis tarda
 // muchisimo, el .wav se dispara y una nota de voz de varios minutos no la
 // escucha nadie. Es un limite de producto, no tecnico.
@@ -98,13 +100,31 @@ function normalizeSpokenText(raw) {
  * inventando convierte una nota de voz en una fuente de datos falsos que suena
  * exactamente igual de fiable que una correcta.
  */
-function getPolishPrompt(rawText, targetLang, profile, enablePersonality = false) {
+/**
+ * Persona desde `alma.md` (almas, fase 1): reemplaza los dos campos del perfil
+ * de Voicebox. El alma dice QUIÉN habla, no QUÉ pasó, y el encuadre lo repite
+ * para que ninguna narración saque hechos de ahí. Las reglas de cada prompt
+ * (REWRITE ONLY, exactitud del checkpoint) van después y no cambian.
+ */
+function bloqueAlma(nombre, alma) {
+  return `## Speaker Persona (from the soul file alma.md of ${nombre || 'the speaker'}):
+"""
+${String(alma).trim()}
+"""
+It defines who is speaking: tone, cadence, attitude. It is not information about the message: never take facts, names or events from it.`;
+}
+
+function getPolishPrompt(rawText, targetLang, profile, enablePersonality = false, alma = null) {
   const langName = targetLang === 'en' ? 'English' : 'Spanish';
   const langCode = targetLang === 'en' ? 'en' : 'es';
   const profileName = (profile && profile.name) || 'Voice Assistant';
 
   let personaSection = '';
-  if (enablePersonality && profile) {
+  if (enablePersonality && profile && alma) {
+    personaSection = `\n${bloqueAlma(profile.name, alma)}
+
+Adopt that tone and cadence, but never at the cost of changing what the message says.`;
+  } else if (enablePersonality && profile) {
     personaSection = `\n## Speaker Persona (Derived from Voicebox Profile):
 - Name: "${profile.name}"
 - Description: "${profile.description || 'Voice Assistant'}"
@@ -139,18 +159,21 @@ ${String(rawText).slice(0, 12000)}
  * No reusa getPolishPrompt porque ese condensa a 3 frases: aquí el texto se
  * dice completo, solo cambia el tono.
  */
-function getPersonaPrompt(rawText, targetLang, profile) {
+function getPersonaPrompt(rawText, targetLang, profile, alma = null) {
   const langName = targetLang === 'en' ? 'English' : 'Spanish';
   const langCode = targetLang === 'en' ? 'en' : 'es';
   const p = profile || {};
+  const persona = alma
+    ? bloqueAlma(p.name, alma)
+    : `## Speaker Persona (Derived from Voicebox Profile):
+- Name: "${p.name || 'Voice Assistant'}"
+- Description: "${p.description || 'Voice Assistant'}"
+- Personality Prompt: "${p.personality || 'Natural and expressive'}"`;
 
   return `You are preparing a message to be spoken aloud by a text-to-speech voice (profile: ${p.name || 'Voice Assistant'}).
 Rewrite the message below in the voice of this speaker persona, as natural spoken ${langName} (${langCode}).
 
-## Speaker Persona (Derived from Voicebox Profile):
-- Name: "${p.name || 'Voice Assistant'}"
-- Description: "${p.description || 'Voice Assistant'}"
-- Personality Prompt: "${p.personality || 'Natural and expressive'}"
+${persona}
 
 ## Message to rewrite:
 """
@@ -166,11 +189,76 @@ ${String(rawText).slice(0, 12000)}
 - Output ONLY the final spoken text. No preamble, no quotes, no explanation.`;
 }
 
+/**
+ * Prompt del guion de `agy_narrate`: Gemini REDACTA una actualización a partir
+ * de hechos del checkpoint. Vivía en index.js, que no exporta nada; se movió
+ * acá (almas, fase 1) para poder probarlo, sin cambios de contenido.
+ */
+function getNarrationPrompt(checkpoint, targetLang, profile, enablePersonality = false, alma = null) {
+  const langName = targetLang === 'en' ? 'English' : 'Spanish';
+  const langCode = targetLang === 'en' ? 'en' : 'es';
+  const profileName = (profile && profile.name) || 'Voice Assistant';
+
+  // Se le da el RECUENTO, no solo el estado. Un "pasaron los tests" es cierto
+  // pero vago; "las cinco suites en verde" es lo que una persona diria.
+  const nTests = (checkpoint.testExecutions || []).length;
+  let testSummary = 'No tests executed in this checkpoint.';
+  if (checkpoint.overallTestStatus === 'PASSED') {
+    testSummary = `${nTests} test run(s) were executed and ALL PASSED.`;
+  } else if (checkpoint.overallTestStatus === 'FAILED') {
+    testSummary = `${nTests} test run(s) were executed and at least one FAILED.`;
+  } else if (checkpoint.overallTestStatus === 'PENDING') {
+    testSummary = `${nTests} test run(s) were started but their result is unknown.`;
+  }
+
+  const filesList = checkpoint.filesModified.length > 0
+    ? checkpoint.filesModified.map(f => path.basename(f)).slice(0, 5).join(', ')
+    : 'no files explicitly modified';
+
+  const instruccionesPersona = `Persona Instructions:
+Adopt the authentic tone, humor, vocabulary, cadence, and characteristic mannerisms of the specified speaker persona naturally, but remain strictly accurate regarding the technical checkpoint facts (files modified and test results).`;
+
+  let personaSection = '';
+  if (enablePersonality && profile && alma) {
+    personaSection = `\n${bloqueAlma(profile.name, alma)}
+
+${instruccionesPersona}`;
+  } else if (enablePersonality && profile) {
+    personaSection = `\n## Speaker Persona (Derived from Voicebox Profile):
+- Name: "${profile.name}"
+- Description: "${profile.description || 'Voice Assistant'}"
+- Personality Prompt: "${profile.personality || 'Natural and expressive'}"
+
+${instruccionesPersona}`;
+  }
+
+  return `You are a voice assistant narrator creating a spoken status update for a software engineer.
+Generate a concise, natural, and conversational spoken narration (exactly 2 to 3 sentences) in ${langName} (${langCode}) to be spoken by Voicebox TTS (profile: ${profileName}).
+${personaSection}
+
+## Checkpoint Context:
+- User's Goal: "${checkpoint.userGoal.slice(0, 300)}"
+- Key Files Changed: ${filesList}
+- Tests Status: ${testSummary}
+- Assistant Context: "${checkpoint.assistantNotes.slice(0, 300) || 'Task completed'}"
+
+## Critical Audio Narration Rules:
+- Language MUST be ${langName}.
+- Keep it natural, conversational, and direct (between 25 and 45 words).
+- State clearly what was done, mention key component/file if relevant, and state the test outcome.
+- ABSOLUTELY NO MARKDOWN: no asterisks, no bullet points, no code blocks, no backticks, no brackets.
+- Do NOT spell symbols like "/", "\\", "_", or file extensions repeatedly unless natural (e.g. say "en el archivo de rutas" or "en index punto jota ese").
+- Do NOT include introductory filler like "Here is the summary" or quotation marks.
+- Output ONLY the plain text that will be spoken aloud.`;
+}
+
 module.exports = {
   SPOKEN_TEXT_LIMIT,
   POLISH_SUGGESTED_OVER,
   redactSecrets,
   normalizeSpokenText,
   getPolishPrompt,
-  getPersonaPrompt
+  getPersonaPrompt,
+  getNarrationPrompt,
+  bloqueAlma
 };

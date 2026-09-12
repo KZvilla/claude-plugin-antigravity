@@ -16,7 +16,8 @@ const {
   POLISH_SUGGESTED_OVER,
   normalizeSpokenText,
   getPolishPrompt,
-  getPersonaPrompt
+  getPersonaPrompt,
+  getNarrationPrompt
 } = require('./spoken-text.js');
 const { extractLastCheckpoint } = require('./checkpoint.js');
 const { preprocessSessionLog, renderFacts, renderFinalState } = require('./session-log.js');
@@ -2041,7 +2042,7 @@ async function emitirNarracionInterna({
 /**
  * Bloque de salida comun a las dos herramientas de narracion.
  */
-function formatNarrationOutput({ spokenText, profile, language, personality, localPlayback, emision, voiceboxUrl, voiceResolution, destino = {}, personaAplicada = null }) {
+function formatNarrationOutput({ spokenText, profile, language, personality, localPlayback, emision, voiceboxUrl, voiceResolution, destino = {}, personaAplicada = null, alma = null }) {
   const langLabel = language === 'es' ? 'Español' : 'Inglés';
   const fallbackNotice = voiceResolution.isFallback
     ? ` *(Fallback: ${voiceResolution.reason})*`
@@ -2073,8 +2074,15 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
   // narra el texto original, y decir «en personaje» sería falso.
   const enPersona = personaAplicada === null ? personality : personaAplicada;
   let modoPersona = '👔 Neutral / Profesional';
-  if (enPersona) modoPersona = `🎭 En personaje, escrito por agy (\`${profile.personality || profile.description || 'expresivo'}\`)`;
-  else if (personality) modoPersona = '⚠️ Se pidió personalidad pero la reescritura falló: se narró el texto original';
+  if (enPersona && alma && alma.clave) {
+    modoPersona = `🎭 En personaje, escrito por agy desde el alma \`${alma.clave}\``;
+    if (alma.sembrada) modoPersona += ' (sembrada ahora desde el perfil de voz)';
+    if (alma.recortado) modoPersona += ` (alma.md recortada a ${almas.semilla.MAX_ALMA} car.)`;
+    if (!alma.conAgente) modoPersona += ` — sin el agente lagrange-alma: ${alma.motivo || 'no disponible'}`;
+  } else if (enPersona) {
+    modoPersona = `🎭 En personaje, escrito por agy (\`${profile.personality || profile.description || 'expresivo'}\`)`;
+    if (alma && alma.aviso) modoPersona += ` — sin alma: ${alma.aviso}`;
+  } else if (personality) modoPersona = '⚠️ Se pidió personalidad pero la reescritura falló: se narró el texto original';
   out += `- **Modo de Personalidad**: ${modoPersona}\n`;
   out += `- **Reproducción Local en PC**: ${localPlayback ? (emision.localPlayed ? '🔊 Reproducido limpiamente en altavoces (sin eco)' : '⚠️ Solicitado pero falló el reproductor local') : '🤫 Silencioso en PC'}\n`;
   out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
@@ -2101,13 +2109,107 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
  * llamada falla (agy ausente, sin respuesta), se devuelve el texto original:
  * perder el mensaje por no poder darle tono sería el peor canje.
  */
-async function reescribirEnPersona({ texto, destino, args, config }) {
-  const modelo = args.model || config.defaultModel;
-  const esfuerzo = esfuerzoParaCli({ modelo, pedido: args.effort, porDefecto: 'low' });
+// ==============================================================================
+// Almas, fase 1 (FEAT-042): las narraciones con personality hablan desde alma.md
+// ==============================================================================
+
+/**
+ * El alma de la voz que va a narrar: `{clave, texto, recortado, sembrada}`, o
+ * `{aviso}` si no se pudo usar. Si la voz todavía no tiene alma, se siembra con
+ * el perfil que la narración ya resolvió: no hay búsqueda por nombre, así que no
+ * hay forma de sembrar otra voz. Una narración nunca falla por el alma: con un
+ * aviso, sigue con la persona del perfil como antes.
+ */
+function almaParaNarrar(profile) {
+  const { rutas, semilla, contexto, diario } = almas;
+  const clave = profile && rutas.claveDeVoz(profile.name);
+  if (!clave) return { aviso: 'la voz no tiene un nombre que sirva de alma' };
+  try {
+    let sembrada = false;
+    if (!fs.existsSync(rutas.rutasDe(clave).alma)) {
+      sembrada = semilla.sembrar(clave, profile).creado;
+      if (sembrada) diario.anotar(clave, { superficie: 'narracion', tipo: 'semilla', resumen: 'sembrada al narrar' });
+    }
+    const id = contexto.identidad(clave);
+    if (!id) return { aviso: 'alma.md está vacía' };
+    return { clave, texto: id.texto, recortado: id.recortado, sembrada };
+  } catch (err) {
+    return { aviso: `no se pudo leer el alma (${err.message})` };
+  }
+}
+
+const VERIFICACION_ALMA_MS = 10 * 60 * 1000;
+let almaVerificadaHasta = 0;
+
+/**
+ * Argumentos para correr como `lagrange-alma`, o el motivo para no hacerlo.
+ * `asegurarAgente` corre SIEMPRE: si alguien borró el agent.md, se reescribe
+ * antes de lanzar, y `--agent` nunca apunta a un nombre que no resuelve (falla
+ * abierto, con las tools completas). La caché solo ahorra repetir `agy agents`,
+ * y guarda únicamente el éxito.
+ */
+async function argsDeAlma({ modelo, esfuerzo }) {
+  const { agente } = almas;
+  try {
+    agente.asegurarAgente(os.homedir());
+  } catch (err) {
+    return { motivo: `no se pudo instalar su agent.md (${err.message})` };
+  }
+  if (Date.now() >= almaVerificadaHasta) {
+    const v = await agente.verificar(AGY_BIN);
+    if (!v.ok) return { motivo: v.motivo };
+    almaVerificadaHasta = Date.now() + VERIFICACION_ALMA_MS;
+  }
+  return { args: agente.argsBase({ modelo, esfuerzo }) };
+}
+
+/**
+ * Argumentos de las llamadas que escriben el guion en persona (agy_say con y
+ * sin polish, agy_narrate). Con alma y agente: `lagrange-alma`, sin skip y sin
+ * `--mode plan` (no tiene tools). Sin alma, o si el agente no resuelve: el
+ * régimen de siempre, que es el mismo riesgo que había antes de las almas.
+ */
+async function argsNarracion({ modelo, esfuerzoPedido, prompt, alma }) {
+  let motivo = null;
+  if (alma && alma.texto) {
+    const r = await argsDeAlma({ modelo, esfuerzo: esfuerzoPedido });
+    if (r.args) return { cliArgs: [...r.args, '-p', prompt], conAgente: true, motivo: null };
+    motivo = r.motivo;
+  }
+  const esfuerzo = esfuerzoParaCli({ modelo, pedido: esfuerzoPedido, porDefecto: 'low' });
   const cliArgs = ['--output-format', 'json', '--dangerously-skip-permissions', '--mode', 'plan'];
   if (esfuerzo) cliArgs.push('--effort', esfuerzo);
   if (modelo) cliArgs.push('--model', modelo);
-  cliArgs.push('-p', getPersonaPrompt(texto, destino.language, destino.profile));
+  cliArgs.push('-p', prompt);
+  return { cliArgs, conAgente: false, motivo };
+}
+
+/** Lo que `formatNarrationOutput` necesita saber del alma. */
+function infoAlma(alma, conAgente, motivo) {
+  if (!alma) return null;
+  if (!alma.texto) return { aviso: alma.aviso };
+  return { clave: alma.clave, sembrada: alma.sembrada, recortado: alma.recortado, conAgente, motivo };
+}
+
+/** Una línea en el diario por narración con alma. Fallar acá no falla la narración. */
+function anotarNarracion(alma, herramienta, spokenText) {
+  if (!alma || !alma.clave) return;
+  try {
+    almas.diario.anotar(alma.clave, { superficie: 'narracion', herramienta, resumen: spokenText });
+  } catch (err) {
+    process.stderr.write(`[antigravity-mcp] No se pudo anotar la narración en el diario de ${alma.clave}: ${err.message}\n`);
+  }
+}
+
+async function reescribirEnPersona({ texto, destino, args, config, alma = null }) {
+  const modelo = args.model || config.defaultModel;
+  const esfuerzo = esfuerzoParaCli({ modelo, pedido: args.effort, porDefecto: 'low' });
+  const { cliArgs, conAgente, motivo } = await argsNarracion({
+    modelo,
+    esfuerzoPedido: args.effort,
+    prompt: getPersonaPrompt(texto, destino.language, destino.profile, alma && alma.texto),
+    alma
+  });
 
   const res = await executeAgy(cliArgs, { cwd: args.cwd || process.cwd(), timeoutMinutes: 3 });
   const data = res.data || {};
@@ -2118,9 +2220,9 @@ async function reescribirEnPersona({ texto, destino, args, config }) {
   const salida = res.success ? (data.response || res.rawOutput || '').trim() : '';
   if (!salida) {
     process.stderr.write(`[antigravity-mcp] Reescritura en persona falló, se narra el original: ${res.error || 'sin respuesta'}\n`);
-    return { texto, aplicado: false, duracion, error: res.error || 'sin respuesta' };
+    return { texto, aplicado: false, duracion, error: res.error || 'sin respuesta', conAgente, motivo };
   }
-  return { texto: salida, aplicado: true, duracion, error: null };
+  return { texto: salida, aplicado: true, duracion, error: null, conAgente, motivo };
 }
 
 /** Los dos servidores de voz para el coordinador de VRAM. */
@@ -2424,58 +2526,6 @@ async function waitForGenerationFile(genDir, generationId, beforeFiles = [], tim
   return null;
 }
 
-
-function getNarrationPrompt(checkpoint, targetLang, profile, enablePersonality = false) {
-  const langName = targetLang === 'en' ? 'English' : 'Spanish';
-  const langCode = targetLang === 'en' ? 'en' : 'es';
-  const profileName = (profile && profile.name) || 'Voice Assistant';
-
-  // Se le da el RECUENTO, no solo el estado. Un "pasaron los tests" es cierto
-  // pero vago; "las cinco suites en verde" es lo que una persona diria.
-  const nTests = (checkpoint.testExecutions || []).length;
-  let testSummary = 'No tests executed in this checkpoint.';
-  if (checkpoint.overallTestStatus === 'PASSED') {
-    testSummary = `${nTests} test run(s) were executed and ALL PASSED.`;
-  } else if (checkpoint.overallTestStatus === 'FAILED') {
-    testSummary = `${nTests} test run(s) were executed and at least one FAILED.`;
-  } else if (checkpoint.overallTestStatus === 'PENDING') {
-    testSummary = `${nTests} test run(s) were started but their result is unknown.`;
-  }
-
-  const filesList = checkpoint.filesModified.length > 0
-    ? checkpoint.filesModified.map(f => path.basename(f)).slice(0, 5).join(', ')
-    : 'no files explicitly modified';
-
-  let personaSection = '';
-  if (enablePersonality && profile) {
-    personaSection = `\n## Speaker Persona (Derived from Voicebox Profile):
-- Name: "${profile.name}"
-- Description: "${profile.description || 'Voice Assistant'}"
-- Personality Prompt: "${profile.personality || 'Natural and expressive'}"
-
-Persona Instructions:
-Adopt the authentic tone, humor, vocabulary, cadence, and characteristic mannerisms of the specified speaker persona naturally, but remain strictly accurate regarding the technical checkpoint facts (files modified and test results).`;
-  }
-
-  return `You are a voice assistant narrator creating a spoken status update for a software engineer.
-Generate a concise, natural, and conversational spoken narration (exactly 2 to 3 sentences) in ${langName} (${langCode}) to be spoken by Voicebox TTS (profile: ${profileName}).
-${personaSection}
-
-## Checkpoint Context:
-- User's Goal: "${checkpoint.userGoal.slice(0, 300)}"
-- Key Files Changed: ${filesList}
-- Tests Status: ${testSummary}
-- Assistant Context: "${checkpoint.assistantNotes.slice(0, 300) || 'Task completed'}"
-
-## Critical Audio Narration Rules:
-- Language MUST be ${langName}.
-- Keep it natural, conversational, and direct (between 25 and 45 words).
-- State clearly what was done, mention key component/file if relevant, and state the test outcome.
-- ABSOLUTELY NO MARKDOWN: no asterisks, no bullet points, no code blocks, no backticks, no brackets.
-- Do NOT spell symbols like "/", "\\", "_", or file extensions repeatedly unless natural (e.g. say "en el archivo de rutas" or "en index punto jota ese").
-- Do NOT include introductory filler like "Here is the summary" or quotation marks.
-- Output ONLY the plain text that will be spoken aloud.`;
-}
 
 // Helper: Run agy process
 // Un prompt viaja como argumento de linea de comandos, y eso tiene techo del
@@ -4316,7 +4366,15 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         const d = await prepareNarrationTarget(args, config, { modoPorDefecto: 'diferido' });
         if (!d.error) destinoVoz = d;
       }
-      const summarySystemPrompt = getSummaryPrompt(focus, Boolean(args.narrate), destinoVoz ? destinoVoz.profile : null);
+      // Almas, fase 1: el digest en persona habla desde alma.md. La llamada del
+      // resumen conserva su régimen (modelo por tamaño, sus permisos): cambiarle
+      // el agente cambiaría el documento entero, no solo el digest. Solo cambia
+      // el texto de la persona, que escribe el usuario, sin memoria del modelo.
+      const almaResumen = destinoVoz ? almaParaNarrar(destinoVoz.profile) : null;
+      const personaResumen = destinoVoz
+        ? (almaResumen && almaResumen.texto ? { ...destinoVoz.profile, alma: almaResumen.texto } : destinoVoz.profile)
+        : null;
+      const summarySystemPrompt = getSummaryPrompt(focus, Boolean(args.narrate), personaResumen);
       const keyPoints = Array.isArray(args.key_points)
         ? args.key_points.map(p => String(p).trim()).filter(Boolean)
         : [];
@@ -4529,7 +4587,12 @@ Be thorough but concise. Prioritize primary sources and official documentation o
               sendTelegram: args.send_telegram !== false,
               ...camposEmision(destino)
             });
-            formatted += `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : (destinoVoz ? 'emitida, con el digest escrito en personaje' : 'emitida')}\n`;
+            const conAlma = Boolean(destinoVoz && almaResumen && almaResumen.texto);
+            if (conAlma && emision && emision.ok !== false) anotarNarracion(almaResumen, 'agy_session_summary', textoHablado);
+            const enPersona = conAlma
+              ? `emitida, con el digest escrito en personaje desde el alma \`${almaResumen.clave}\``
+              : (destinoVoz ? 'emitida, con el digest escrito en personaje' : 'emitida');
+            formatted += `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : enPersona}\n`;
           }
           formatted += `\n**Digest hablado:** ${digestHablado}\n`;
         }
@@ -4587,23 +4650,20 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
       // 5. Generate conversational spoken narration script via agy (Gemini)
       const enablePersonality = Boolean(args.personality);
-      const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile, enablePersonality);
+      // Almas, fase 1: con personality, la persona sale de alma.md.
+      const alma = enablePersonality ? almaParaNarrar(chosenProfile) : null;
+      const almaUsada = alma && alma.texto ? alma : null;
+      const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile, enablePersonality, almaUsada && almaUsada.texto);
       const effectiveModel = args.model || config.defaultModel;
       // `low` por latencia, pero solo si el modelo lo admite (BE-015).
       const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: 'low' });
 
-      const cliArgs = [
-        '--output-format', 'json',
-        '--dangerously-skip-permissions',
-        '--mode', 'plan'
-      ];
-      if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
-
-      if (effectiveModel) {
-        cliArgs.push('--model', effectiveModel);
-      }
-
-      cliArgs.push('-p', narratePrompt);
+      const { cliArgs, conAgente: almaConAgente, motivo: almaMotivo } = await argsNarracion({
+        modelo: effectiveModel,
+        esfuerzoPedido: args.effort,
+        prompt: narratePrompt,
+        alma: almaUsada
+      });
 
       const agyRes = await executeAgy(cliArgs, {
         cwd,
@@ -4662,6 +4722,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         };
       }
 
+      if (personaAplicada && almaUsada) anotarNarracion(almaUsada, 'agy_narrate', spokenText);
+
       // 7. Salida estructurada. La cabecera comun la genera formatNarrationOutput;
       // el contexto del checkpoint es lo unico propio de esta herramienta.
       let out = `### 🎙️ Narración de Voz Emitida (Voicebox)\n\n`;
@@ -4675,7 +4737,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         voiceboxUrl,
         voiceResolution,
         destino,
-        personaAplicada
+        personaAplicada,
+        alma: infoAlma(alma, almaConAgente, almaMotivo)
       });
       out += `\n**Contexto del Checkpoint detectado:**\n`;
       out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
@@ -4716,6 +4779,11 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       const { voiceboxUrl, voiceResolution, profile: chosenProfile, language: targetLang } = destino;
 
       const enablePersonality = Boolean(args.personality);
+      // Almas, fase 1: con personality, la persona sale de alma.md.
+      const alma = enablePersonality ? almaParaNarrar(chosenProfile) : null;
+      const almaUsada = alma && alma.texto ? alma : null;
+      let almaConAgente = false;
+      let almaMotivo = null;
       let polishDuration = 0;
       let polishApplied = false;
       let textoBase = rawText;
@@ -4728,14 +4796,15 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       if (args.polish) {
         const effectiveModel = args.model || config.defaultModel;
         const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: 'low' });
-        const cliArgs = [
-          '--output-format', 'json',
-          '--dangerously-skip-permissions',
-          '--mode', 'plan'
-        ];
-        if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
-        if (effectiveModel) cliArgs.push('--model', effectiveModel);
-        cliArgs.push('-p', getPolishPrompt(rawText, targetLang, chosenProfile, enablePersonality));
+        const armado = await argsNarracion({
+          modelo: effectiveModel,
+          esfuerzoPedido: args.effort,
+          prompt: getPolishPrompt(rawText, targetLang, chosenProfile, enablePersonality, almaUsada && almaUsada.texto),
+          alma: almaUsada
+        });
+        const cliArgs = armado.cliArgs;
+        almaConAgente = armado.conAgente;
+        almaMotivo = armado.motivo;
 
         const agyRes = await executeAgy(cliArgs, { cwd: args.cwd || process.cwd(), timeoutMinutes: 3 });
         const resData = agyRes.data || {};
@@ -4760,7 +4829,9 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       let personaAplicada = enablePersonality && polishApplied;
       let personaDuracion = 0;
       if (enablePersonality && !args.polish) {
-        const r = await reescribirEnPersona({ texto: rawText, destino, args, config });
+        const r = await reescribirEnPersona({ texto: rawText, destino, args, config, alma: almaUsada });
+        almaConAgente = r.conAgente;
+        almaMotivo = r.motivo;
         if (r.aplicado) {
           textoBase = r.texto;
           personaAplicada = true;
@@ -4800,6 +4871,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         };
       }
 
+      if (personaAplicada && almaUsada) anotarNarracion(almaUsada, 'agy_say', spokenText);
+
       let out = `### 🗣️ Texto Narrado (Voicebox)\n\n`;
       out += formatNarrationOutput({
         spokenText,
@@ -4811,7 +4884,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         voiceboxUrl,
         voiceResolution,
         destino,
-        personaAplicada
+        personaAplicada,
+        alma: infoAlma(alma, almaConAgente, almaMotivo)
       });
       let origen = '📝 Texto del llamante, saneado localmente';
       if (polishApplied) origen = `✨ Pulido por agy (${polishDuration.toFixed(1)}s)`;
