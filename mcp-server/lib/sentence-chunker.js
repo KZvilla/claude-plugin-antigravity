@@ -11,6 +11,7 @@
 
 const SENTENCE_ENDERS = new Set(['.', '!', '?', '\n']);
 const PAUSE_ENDERS = new Set([';', ':']);
+const CLOSERS = new Set(['"', "'", ')', ']', '»', '”', '’']);
 
 const DEFAULT_ABBREVIATIONS = [
   // Spanish
@@ -106,6 +107,18 @@ class SentenceChunker {
         } else if (ch === ':') {
           if (this._isMidNumberOrTime(this.buffer, i)) continue;
           if (this._isUrlColon(this.buffer, i)) continue;
+        }
+
+        if (ch === '.' || ch === '!' || ch === '?') {
+          // The sentence keeps its closing quotes/parens: 'Dijo "todo bien."'
+          let j = i + 1;
+          while (j < this.buffer.length && CLOSERS.has(this.buffer[j])) j++;
+          // Nothing after it yet: wait for the next delta (flush() emits it at turn end)
+          if (j === this.buffer.length) break;
+          // "prueba-freno.txt", "example.com" — a dot glued to text is not a sentence end
+          if (ch === '.' && !/\s/.test(this.buffer[j])) continue;
+          cutIdx = j - 1;
+          break;
         }
 
         cutIdx = i;
