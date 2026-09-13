@@ -24,13 +24,15 @@
  * los llamadores que no distinguen.
  */
 
-export const CARRILES = Object.freeze(['principal', 'cast']);
+export const CARRILES = Object.freeze(['principal', 'cast', 'alma']);
 
-const colas = { principal: [], cast: [] };
+const colas = { principal: [], cast: [], alma: [] };
 
-/** Carril al que va una tarea: solo un cast va al carril de casts. */
+/** Carril al que va una tarea, por su clase: cast, charla con un alma, o trabajo. */
 export function carrilDe(task) {
-  return task && task.kind === 'cast' ? 'cast' : 'principal';
+  if (task && task.kind === 'cast') return 'cast';
+  if (task && task.kind === 'alma') return 'alma';
+  return 'principal';
 }
 
 function colaDe(carril) {

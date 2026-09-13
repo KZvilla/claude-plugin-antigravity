@@ -37,6 +37,10 @@ const PATRONES_SECRETO = [
   /(bot)?\d{6,}:[A-Za-z0-9_-]{20,}/
 ];
 
+// Una entrada con las etiquetas del bloque, al reinyectarse y reflejarse en una
+// respuesta, podría fabricar operaciones de memoria falsas para `bloque.js`.
+const ETIQUETA_BLOQUE = /<\/?alma>/i;
+
 /** Control C0, DEL, ancho cero, marcas de dirección e invisibles de formato. */
 function esInvisible(codigo) {
   return codigo <= 0x1f
@@ -77,6 +81,7 @@ function escanear(texto) {
   const limpio = normalizar(texto);
   if (!limpio) return { ok: false, motivo: 'vacío' };
   if (tieneInvisibles(limpio)) return { ok: false, motivo: 'caracteres invisibles o de control' };
+  if (ETIQUETA_BLOQUE.test(limpio)) return { ok: false, motivo: 'parece un bloque de memoria' };
   if (PATRONES_URL.some(p => p.test(limpio))) return { ok: false, motivo: 'contiene una URL' };
   if (PATRONES_ORDEN.some(p => p.test(limpio))) return { ok: false, motivo: 'parece una orden' };
   if (PATRONES_SECRETO.some(p => p.test(limpio)) || pareceClaveSuelta(limpio)) {

@@ -14,5 +14,8 @@ module.exports = {
   diario: require('./diario.js'),
   semilla: require('./semilla.js'),
   agente: require('./agente.js'),
-  contexto: require('./contexto.js')
+  contexto: require('./contexto.js'),
+  bloque: require('./bloque.js'),
+  hilos: require('./hilos.js'),
+  charla: require('./charla.js')
 };

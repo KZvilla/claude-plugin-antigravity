@@ -440,7 +440,8 @@ Design rationale, verification evidence and the remaining backlog live in `docs/
 A feature built in phases: the voices get an identity and a memory of their own.
 
 - **Narrations already use the identity.** With `personality: true`, `agy_say`, `agy_narrate` and the spoken digest of `agy_session_summary` speak from the voice's `alma.md` instead of the two Voicebox profile fields. A voice without a soul gets one seeded from its profile the first time it narrates. To tune how a voice talks, edit its `alma.md`: the next narration follows it. `agy_say` and `agy_narrate` write the script as the tool-less `lagrange-alma` agent. The summary keeps its own call, because the persona there only changes the digest's tone.
-- **Memory does not reach narrations, and never will.** A narration may only rewrite what it was given (REWRITE ONLY), and memory would add facts. Memory arrives with the conversational surfaces (voice chat, a Telegram chat lane, emoji reactions) in later phases. Each narration only leaves a line in the soul's diary.
+- **You can talk to a soul on Telegram, and that is where it remembers.** `/charla [voice] <message>` starts a conversation, replying to one of its messages continues it, and `/charla nuevo` opens a clean thread. It answers in character from its own memory, and stores what is worth keeping — every reply tells you what it saved (`🧠 recordó 1`). `/alma` shows that memory with its ids, `/alma olvidar <id>` prunes it. Free text in the chat is still work: a reply to a plan still adjusts the plan.
+- **Memory reaches the chat, never the narrations.** A narration may only rewrite what it was given (REWRITE ONLY), and memory would add facts. Each narration only leaves a line in the soul's diary. The voice chat and emoji reactions come in later phases.
 
 ```
 ~/.claude/lagrange-almas/        (override: LAGRANGE_ALMAS_DIR)

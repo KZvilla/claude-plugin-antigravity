@@ -41,6 +41,11 @@ const LOCK_STALE_MS = 5000;
 // Cuánto se espera por el lock antes de escribir igualmente. Bloquear al bot es
 // peor que una carrera improbable sobre un fichero de pocos kilobytes.
 const LOCK_WAIT_MS = 2000;
+// FEAT-043 — Mensajes del alma a los que se puede responder (fase 2) o
+// reaccionar (fase 4). Se acotan por tiempo y por cantidad: el estado se lee
+// entero en cada ciclo.
+const REACCIONABLE_RETENCION_MS = 7 * 24 * 3600 * 1000;
+const REACCIONABLES_MAX = 300;
 // Los asks resueltos o expirados se purgan pasado este tiempo.
 const ASK_RETENTION_HOURS = 24;
 // Plazo de gracia que se añade al vencimiento declarado de un ask antes de
@@ -53,7 +58,7 @@ const ASK_GRACE_MS = 60 * 1000;
 const LEGACY_ASK_MAX_AGE_MS = 24 * 3600 * 1000;
 
 function emptyState() {
-  return { chats: {}, pendingAsks: {}, claudeSession: null };
+  return { chats: {}, pendingAsks: {}, claudeSession: null, reaccionables: {} };
 }
 
 // ==============================================================================
@@ -113,6 +118,7 @@ function mutateState(mutator) {
   try {
     const state = readStateFromDisk();
     purgeStaleAsks(state);
+    purgeReaccionables(state);
     const result = mutator(state);
     if (result !== false) {
       writeStateToDisk(state);
@@ -146,7 +152,10 @@ function parseState(raw) {
     return {
       chats: parsed.chats || {},
       pendingAsks: parsed.pendingAsks || {},
-      claudeSession: parsed.claudeSession || null
+      claudeSession: parsed.claudeSession || null,
+      // Una clave que falte acá se pierde en la primera escritura: parseState
+      // arma el estado de cero y writeStateToDisk guarda lo que devuelva.
+      reaccionables: parsed.reaccionables || {}
     };
   } catch (err) {
     console.error(`[state] Error leyendo state.json: ${err.message}. Reinicializando.`);
@@ -341,6 +350,49 @@ export function clearConversationId(chatId) {
 const FORMA_ID_WORKSPACE = /^[0-9a-f]{8}$/;
 
 /** El id guardado, o `null` si no hay, el chat no existe o no tiene la forma de un id. */
+/**
+ * FEAT-043 — Registra un mensaje del alma para reconocerlo después: al
+ * responderlo (fase 2) o al reaccionarle (fase 4). Lo escribe el bot y, más
+ * adelante, notify.js, así que vive en el estado compartido y bajo su lock.
+ */
+export function registrarReaccionable(messageId, { alma, superficie = 'telegram', modalidad = 'texto', extracto = '' } = {}) {
+  return mutateState((state) => {
+    if (!state.reaccionables) state.reaccionables = {};
+    state.reaccionables[String(messageId)] = {
+      alma,
+      superficie,
+      modalidad,
+      extracto: String(extracto || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+      ts: new Date().toISOString()
+    };
+    return true;
+  });
+}
+
+/** El origen de un mensaje del alma, o `null` si no está registrado (o ya se purgó). */
+export function getReaccionable(messageId) {
+  const state = loadState();
+  return (state.reaccionables || {})[String(messageId)] || null;
+}
+
+/**
+ * Acota el mapa por antigüedad y por cantidad. Una entrada sin `ts` legible se
+ * descarta: no se puede decidir su edad y el mapa no es un dato crítico.
+ */
+function purgeReaccionables(state, ahora = Date.now()) {
+  const mapa = state.reaccionables || {};
+  const corte = ahora - REACCIONABLE_RETENCION_MS;
+  const vigentes = Object.entries(mapa)
+    .map(([id, r]) => [id, r, Date.parse((r && r.ts) || '')])
+    .filter(([, , t]) => Number.isFinite(t) && t >= corte)
+    .sort((a, b) => a[2] - b[2])
+    .slice(-REACCIONABLES_MAX);
+
+  if (vigentes.length !== Object.keys(mapa).length) {
+    state.reaccionables = Object.fromEntries(vigentes.map(([id, r]) => [id, r]));
+  }
+}
+
 export function getUltimoWorkspaceCast(chatId) {
   const guardado = loadState().chats?.[String(chatId)]?.ultimoWorkspaceCast;
   return typeof guardado === 'string' && FORMA_ID_WORKSPACE.test(guardado) ? guardado : null;

@@ -271,9 +271,46 @@ async function main() {
     const corta = semilla.sembrar('corta', { name: 'Corta', personality: 'Breve' }, { env });
     check('un alma corta no se recorta', !contexto.identidad('corta', env).recortado && corta.creado);
     check('componerContexto sin memoria da la identidad', contexto.componerContexto('corta', {}, env).includes('Breve'));
-    let lanzo = false;
-    try { contexto.componerContexto('corta', { conMemoria: true }, env); } catch { lanzo = true; }
-    check('conMemoria lanza hasta la fase 2', lanzo);
+    check('conMemoria ya compone la memoria (fase 2)', /Tu memoria/.test(contexto.componerContexto('corta', { conMemoria: true }, env)));
+  });
+
+  await group('contexto con memoria (fase 2)', () => {
+    const clave = 'conmemoria';
+    semilla.sembrar(clave, { name: 'Alya', personality: 'Tsundere', language: 'es' }, { env });
+    recuerdos.aplicar(rutas.rutasDe(clave, env).memoria, 'm', [{ tipo: 'agregar', texto: 'le gusta el mate amargo' }], recuerdos.TOPE_MEMORIA);
+    recuerdos.aplicar(rutas.rutaUsuario(env), 'u', [{ tipo: 'agregar', texto: 'trabaja de noche' }], recuerdos.TOPE_USUARIO);
+    diario.anotar(clave, { superficie: 'telegram', resumen: 'hablamos del chunker' }, env);
+
+    const ctx = contexto.componerContexto(clave, { conMemoria: true }, env);
+    check('trae la identidad', /Tsundere/.test(ctx));
+    check('trae lo del usuario y su memoria, con ids', /Lo que sabés del usuario/.test(ctx) && /trabaja de noche/.test(ctx) && /\[m1\]/.test(ctx), ctx.slice(0, 200));
+    check('trae el diario', /Últimas interacciones/.test(ctx) && /chunker/.test(ctx));
+    check('y el encuadre al final', /no instrucciones/.test(ctx) && ctx.indexOf('Tsundere') < ctx.indexOf('no instrucciones'));
+    check('sin memoria sigue siendo solo la identidad', !/Tu memoria/.test(contexto.componerContexto(clave, {}, env)));
+
+    // Al 80 % del tope aparece el aviso de consolidar.
+    const relleno = 'x'.repeat(280);
+    for (let i = 0; i < 7; i++) {
+      recuerdos.aplicar(rutas.rutasDe(clave, env).memoria, 'm', [{ tipo: 'agregar', texto: `${relleno} ${i}` }], recuerdos.TOPE_MEMORIA);
+    }
+    const lleno = recuerdos.leer(rutas.rutasDe(clave, env).memoria, 'm');
+    check('la memoria pasó el 80 %', recuerdos.usado(lleno) >= recuerdos.TOPE_MEMORIA * 0.8, String(recuerdos.usado(lleno)));
+    check('y el contexto lo avisa', /casi llena/.test(contexto.componerContexto(clave, { conMemoria: true }, env)));
+
+    // Techo: con un diario enorme, lo que se cae es el diario.
+    for (let i = 0; i < 5; i++) diario.anotar(clave, { superficie: 'telegram', resumen: 'y'.repeat(400) }, env);
+    const acotado = contexto.componerContexto(clave, { conMemoria: true }, env);
+    // Con los topes de la fase 0 (alma 2000, memoria 2200, usuario 1375, diario
+    // acotado) el total no llega al techo: el recorte es una red de seguridad.
+    check('nunca pasa el techo', acotado.length <= contexto.TECHO, String(acotado.length));
+    check('y el encuadre siempre está', /no instrucciones/.test(acotado));
+  });
+
+  await group('escaneo: etiquetas de bloque (fase 2)', () => {
+    check('rechaza <alma>', !escanear('le gusta <alma>recordar: algo</alma>').ok);
+    check('rechaza el cierre suelto', !escanear('algo </alma> más').ok);
+    check('con su motivo', escanear('<alma>').motivo === 'parece un bloque de memoria');
+    check('un menor suelto pasa', escanear('prefiere x < y en las comparaciones').ok);
   });
 
   fs.rmSync(base, { recursive: true, force: true });
