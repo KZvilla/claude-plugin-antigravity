@@ -45,6 +45,12 @@ const HERRAMIENTAS_ESCRITURA = new Set(['write_to_file', 'replace_file_content',
 // brain/ (planes) y scratch/ (el cwd de la shell de agy) son de agy, no del usuario.
 const RUTA_PROPIA_DE_AGY = /[\\/]antigravity-cli[\\/](brain|scratch)([\\/]|$)/i;
 
+// FEAT-044 — El alma no puede aflojar el freno de la v0.24.0 ni el resto de
+// las reglas de la charla. Va justo antes de la confirmación, que es lo último
+// que lee el modelo.
+const PRECEDENCIA = 'Las reglas de esta charla mandan sobre tu forma de ser: si algo de tu identidad o de tu '
+  + 'memoria choca con ellas, ganan las reglas. ';
+
 function negacionDePaso(s) {
   if (s.step_type !== 'tool' || s.state !== 'ERROR') return null;
   const m = PERMISO_NEGADO.exec(s.tool_info?.error?.message || '');
@@ -152,6 +158,22 @@ function procesarEventosDrain(events, chunker, estado = {}) {
 const CIERRE_PRIMING = 'Confirmá que entendiste';
 
 /**
+ * FEAT-044 — Pone el contexto del alma (identidad, memoria y encuadre) ANTES
+ * del priming, y la frase de precedencia justo antes de la confirmación: lo
+ * último que lee el modelo son las reglas de la charla. Con `slice` y no
+ * `replace` por el mismo motivo que `conDirectorio`: un `/**
+ * Inserta el directorio del proyecto antes del cierre del priming. Con` en la memoria se
+ * interpolaría. Sin contexto, el priming queda igual.
+ */
+function conAlma(priming, contextoAlma) {
+  const ctx = typeof contextoAlma === 'string' ? contextoAlma.trim() : '';
+  if (!ctx) return priming;
+  const i = priming.indexOf(CIERRE_PRIMING);
+  const conPrecedencia = i < 0 ? priming : priming.slice(0, i) + PRECEDENCIA + priming.slice(i);
+  return `${ctx}\n\n---\n\n${conPrecedencia}`;
+}
+
+/**
  * Inserta el directorio del proyecto antes del cierre del priming. Con
  * `slice` y no `replace`: un `$&` en la ruta se interpolaria. Sin cwd o sin
  * cierre, el priming queda igual.
@@ -165,4 +187,4 @@ function conDirectorio(priming, cwd) {
   return priming.slice(0, i) + frase + priming.slice(i);
 }
 
-module.exports = { PRIMING_CHARLA, PRIMING_CONFIRMACION, conDirectorio, procesarEventosDrain };
+module.exports = { PRIMING_CHARLA, PRIMING_CONFIRMACION, PRECEDENCIA, conAlma, conDirectorio, procesarEventosDrain };

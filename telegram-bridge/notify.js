@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { registerPendingAsk, getPendingAsk, expirePendingAsk } from './state.js';
+import { registerPendingAsk, getPendingAsk, expirePendingAsk, registrarReaccionable } from './state.js';
 import { splitMessage, markdownToTelegramHtml, escapeHtml } from './formatter.js';
 import { assertPathAllowed, PolicyViolationError, redactSecrets } from './policy.js';
 import { loadBridgeEnv, describeEnvSearch, estadoDaemon } from './paths.js';
@@ -294,7 +294,8 @@ export async function sendTelegramVoice(options = {}) {
     waitForGeneration = false,
     generationId = null,
     beforeFiles = [],
-    timeoutMs = 90000
+    timeoutMs = 90000,
+    reaccionable = null
   } = typeof options === 'string' ? { audioPath: options } : options;
 
   const chatId = getDefaultChatId(targetChatId);
@@ -342,6 +343,25 @@ export async function sendTelegramVoice(options = {}) {
       title: path.basename(resolvedPath, path.extname(resolvedPath)),
       performer: 'Voicebox'
     });
+  }
+
+  // FEAT-045 — Solo una entrega con autoría explícita es reaccionable. Un
+  // fallo de metadatos no deshace una voz que Telegram ya aceptó.
+  try {
+    const alma = reaccionable && typeof reaccionable.alma === 'string' ? reaccionable.alma.trim() : '';
+    const extracto = reaccionable && typeof reaccionable.extracto === 'string' ? reaccionable.extracto.trim() : '';
+    const messageId = uploadResult?.message_id;
+    const resultChatId = uploadResult?.chat?.id;
+    if (alma && extracto && messageId !== undefined && resultChatId !== undefined) {
+      registrarReaccionable(messageId, {
+        alma,
+        superficie: 'telegram',
+        modalidad: 'voz',
+        extracto
+      }, resultChatId);
+    }
+  } catch (err) {
+    console.warn(`[notify] La voz se entregó, pero no se pudo registrar como reaccionable: ${redactSecrets(err.message)}`);
   }
 
   // Limpieza: generations/ crece sin límite si nadie borra lo ya entregado.

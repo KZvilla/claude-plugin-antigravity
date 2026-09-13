@@ -14,6 +14,7 @@ const { PassThrough } = require('stream');
 const fs = require('fs');
 
 const CAPTURE_FILE = process.env.CAPTURE_FILE;
+const CAPTURE_TELEGRAM_FILE = process.env.CAPTURE_TELEGRAM_FILE;
 const realSpawn = cp.spawn;
 
 // El servidor solo llama a recordUsage cuando la respuesta de agy trae `usage`,
@@ -24,6 +25,7 @@ const realSpawn = cp.spawn;
 const USAGE_STUB = process.env.STUB_USAGE === '1'
   ? { input_tokens: 10, output_tokens: 5, thinking_tokens: 2, cache_read_tokens: 1, total_tokens: 15 }
   : undefined;
+const STUB_RESPONSE = process.env.STUB_RESPONSE || 'STUBBED RESPONSE';
 
 /**
  * `--input-format stream-json` (la charla y executeAgyStdin): el proceso queda
@@ -77,7 +79,7 @@ function procesoInteractivo(child, args, opts) {
       return;
     }
     emitir({ event: 'step_update', step_update: { conversation_id: cid, step_index: base + 1, state: 'DONE', step_type: 'agent_response', text_delta: 'STUBBED RESPONSE' } });
-    emitir({ event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: 'STUBBED RESPONSE', duration_seconds: 1, usage: USAGE_STUB } });
+    emitir({ event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: STUB_RESPONSE, duration_seconds: 1, usage: USAGE_STUB } });
   };
 
   child.stdin = {
@@ -108,7 +110,77 @@ function procesoInteractivo(child, args, opts) {
   return child;
 }
 
+// `agy agents` (la verificación de lagrange-alma, que usa execFile y no spawn):
+// una lista fija en vez del binario real. No se anota en CAPTURE_FILE porque
+// hay suites que cuentan sus líneas como lanzamientos. STUB_AGENTS='' simula un
+// agente que no resuelve.
+const realExecFile = cp.execFile;
+cp.execFile = function (file, args, ...resto) {
+  if (/agy/i.test(String(file)) && Array.isArray(args) && args[0] === 'agents') {
+    const cb = resto.find(a => typeof a === 'function');
+    const salida = process.env.STUB_AGENTS !== undefined ? process.env.STUB_AGENTS : 'lagrange-alma\n';
+    setImmediate(() => { if (cb) cb(null, salida, ''); });
+    return new EventEmitter();
+  }
+  return realExecFile.apply(this, arguments);
+};
+
+/**
+ * FEAT-044 — El lanzamiento desacoplado del consolidador (`node consolidar.js`).
+ * Sin esto pasaba de largo hacia realSpawn: no quedaba registro (no se podia
+ * verificar que se lanzo, ni con que ruta, ni si se hizo unref) y ademas
+ * arrancaba un proceso real que borraba el pendiente que el test estaba
+ * mirando. Ahora se anota y no se lanza nada; el consolidador de verdad se
+ * prueba aparte, corriendolo sincronico.
+ */
+function esConsolidador(cmd, args) {
+  if (/agy/i.test(String(cmd))) return false; // un prompt de agy que lo nombre no cuenta
+  return Array.isArray(args) && args.some((a) => /consolidar\.js$/.test(String(a)));
+}
+
 cp.spawn = function (cmd, args, opts) {
+  if (CAPTURE_TELEGRAM_FILE && Array.isArray(args)
+    && args.some((a) => /telegram-bridge[\\/]notify\.js$/.test(String(a)))
+    && args.includes('--voice-json')) {
+    const falso = new EventEmitter();
+    falso.stdout = new PassThrough();
+    falso.stderr = new PassThrough();
+    let entrada = '';
+    falso.stdin = {
+      write(dato) { entrada += String(dato); },
+      end() {
+        let payload = null;
+        try { payload = JSON.parse(entrada.trim()); } catch {}
+        fs.appendFileSync(CAPTURE_TELEGRAM_FILE, JSON.stringify({
+          event: 'telegram-voice', cmd, args, cwd: opts && opts.cwd, payload
+        }) + '\n');
+        setImmediate(() => {
+          falso.stdout.end(JSON.stringify({ ok: true, result: { message_id: 1 } }) + '\n');
+          falso.stderr.end();
+          falso.emit('close', 0);
+        });
+      }
+    };
+    falso.kill = () => {};
+    return falso;
+  }
+
+  if (esConsolidador(cmd, args)) {
+    fs.appendFileSync(CAPTURE_FILE, JSON.stringify({
+      event: 'consolidador', cmd, args, cwd: opts && opts.cwd, detached: !!(opts && opts.detached)
+    }) + '\n');
+    const falso = new EventEmitter();
+    falso.stdout = new PassThrough();
+    falso.stderr = new PassThrough();
+    falso.stdin = { write() {}, end() {} };
+    falso.kill = () => {};
+    falso.unref = () => {
+      fs.appendFileSync(CAPTURE_FILE, JSON.stringify({ event: 'consolidador-unref' }) + '\n');
+    };
+    setImmediate(() => { falso.stdout.end(); falso.stderr.end(); falso.emit('close', 0); });
+    return falso;
+  }
+
   if (!/agy/i.test(String(cmd))) {
     return realSpawn.apply(this, arguments);
   }
@@ -153,12 +225,12 @@ cp.spawn = function (cmd, args, opts) {
       const eventos = [
         { event: 'init', conversation_id: cid, init: {} },
         { event: 'step_update', step_update: { conversation_id: cid, step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: 'STUBBED RESPONSE' } },
-        { event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: 'STUBBED RESPONSE', duration_seconds: 1, usage: USAGE_STUB } }
+        { event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: STUB_RESPONSE, duration_seconds: 1, usage: USAGE_STUB } }
       ];
       for (const ev of eventos) child.stdout.write(JSON.stringify(ev) + '\n');
     } else {
       child.stdout.write(JSON.stringify({
-        response: 'STUBBED RESPONSE',
+        response: STUB_RESPONSE,
         conversation_id: 'stub-conversation-id',
         duration_seconds: 1,
         usage: USAGE_STUB

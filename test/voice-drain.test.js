@@ -4,7 +4,7 @@
  */
 const { check, group, report } = require('./lib/assert');
 const { SentenceChunker } = require('../mcp-server/lib/sentence-chunker');
-const { PRIMING_CHARLA, PRIMING_CONFIRMACION, conDirectorio, procesarEventosDrain } = require('../mcp-server/lib/voice-drain');
+const { PRIMING_CHARLA, PRIMING_CONFIRMACION, conAlma, conDirectorio, procesarEventosDrain } = require('../mcp-server/lib/voice-drain');
 
 const texto = (t, i = 1) => ({ event: 'step_update', step_update: { step_index: i, state: 'ACTIVE', step_type: 'agent_response', text_delta: t } });
 const tool = (nombre, i, state = 'ACTIVE') => ({ event: 'step_update', step_update: { step_index: i, state, step_type: 'tool', tool_name: nombre } });
@@ -134,6 +134,35 @@ async function main() {
   await group('ignora el eco y lo que no es texto del agente', () => {
     const r = procesarEventosDrain([{ event: 'step_update', step_update: { step_type: 'user_input', text_delta: 'ECO' } }, result], new SentenceChunker());
     check('sin oraciones', r.sentences.length === 0, JSON.stringify(r.sentences));
+  });
+
+  await group('el alma antes del priming (FEAT-044)', () => {
+    const ctx = '# Alya\n\nSos tsundere.\n\n## Tu memoria\n\n- [m1] le dice bridge al puente';
+    const p = conAlma(PRIMING_CONFIRMACION, ctx);
+    check('el alma va primero', p.startsWith('# Alya'), p.slice(0, 40));
+    check('el priming va después', p.includes('A partir de ahora estamos en una conversación de voz'));
+    check('separados', p.includes('\n\n---\n\n'));
+    check('las reglas mandan sobre el alma', /mandan sobre tu forma de ser/.test(p));
+    check('y esa frase va antes de la confirmación',
+      p.indexOf('mandan sobre tu forma de ser') < p.indexOf('Confirmá que entendiste'));
+    check('sigue terminando en OK.', /OK\.$/.test(p));
+    check('el freno intacto', /la charla me pregunta/.test(p));
+
+    check('sin contexto no cambia nada',
+      [undefined, null, '', '   ', 123].every((c) => conAlma(PRIMING_CONFIRMACION, c) === PRIMING_CONFIRMACION));
+    check('sin cierre, el contexto igual se antepone', conAlma('hola', 'ALMA') === 'ALMA\n\n---\n\nhola');
+
+    // El mismo riesgo que resolvió conDirectorio con slice: un `$&` en la
+    // memoria del alma se interpolaría con replace.
+    const conDolar = conAlma(PRIMING_CONFIRMACION, 'Le gusta el símbolo $& y $\'');
+    check('un $& en la memoria no se interpola', conDolar.startsWith('Le gusta el símbolo $& y $\''), conDolar.slice(0, 40));
+
+    // Las dos inserciones conviven: la del proyecto y la del alma.
+    const dos = conAlma(conDirectorio(PRIMING_CONFIRMACION, 'C:\\proyecto'), ctx);
+    check('convive con conDirectorio', /El proyecto está en C:\\proyecto\./.test(dos) && /mandan sobre tu forma de ser/.test(dos));
+    check('y el orden es proyecto, precedencia, confirmación',
+      dos.indexOf('El proyecto está en') < dos.indexOf('mandan sobre tu forma de ser')
+      && dos.indexOf('mandan sobre tu forma de ser') < dos.indexOf('Confirmá que entendiste'));
   });
 
   await group('priming sin narración (v2)', () => {

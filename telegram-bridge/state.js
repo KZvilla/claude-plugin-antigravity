@@ -41,6 +41,11 @@ const LOCK_STALE_MS = 5000;
 // Cuánto se espera por el lock antes de escribir igualmente. Bloquear al bot es
 // peor que una carrera improbable sobre un fichero de pocos kilobytes.
 const LOCK_WAIT_MS = 2000;
+// FEAT-043 — Mensajes del alma a los que se puede responder (fase 2) o
+// reaccionar (fase 4). Se acotan por tiempo y por cantidad: el estado se lee
+// entero en cada ciclo.
+const REACCIONABLE_RETENCION_MS = 7 * 24 * 3600 * 1000;
+const REACCIONABLES_MAX = 300;
 // Los asks resueltos o expirados se purgan pasado este tiempo.
 const ASK_RETENTION_HOURS = 24;
 // Plazo de gracia que se añade al vencimiento declarado de un ask antes de
@@ -53,7 +58,7 @@ const ASK_GRACE_MS = 60 * 1000;
 const LEGACY_ASK_MAX_AGE_MS = 24 * 3600 * 1000;
 
 function emptyState() {
-  return { chats: {}, pendingAsks: {}, claudeSession: null };
+  return { chats: {}, pendingAsks: {}, claudeSession: null, reaccionables: {} };
 }
 
 // ==============================================================================
@@ -113,6 +118,7 @@ function mutateState(mutator) {
   try {
     const state = readStateFromDisk();
     purgeStaleAsks(state);
+    purgeReaccionables(state);
     const result = mutator(state);
     if (result !== false) {
       writeStateToDisk(state);
@@ -146,7 +152,10 @@ function parseState(raw) {
     return {
       chats: parsed.chats || {},
       pendingAsks: parsed.pendingAsks || {},
-      claudeSession: parsed.claudeSession || null
+      claudeSession: parsed.claudeSession || null,
+      // Una clave que falte acá se pierde en la primera escritura: parseState
+      // arma el estado de cero y writeStateToDisk guarda lo que devuelva.
+      reaccionables: parsed.reaccionables || {}
     };
   } catch (err) {
     console.error(`[state] Error leyendo state.json: ${err.message}. Reinicializando.`);
@@ -341,6 +350,119 @@ export function clearConversationId(chatId) {
 const FORMA_ID_WORKSPACE = /^[0-9a-f]{8}$/;
 
 /** El id guardado, o `null` si no hay, el chat no existe o no tiene la forma de un id. */
+/**
+ * FEAT-043 — Registra un mensaje del alma para reconocerlo después: al
+ * responderlo (fase 2) o al reaccionarle (fase 4). Lo escribe el bot y, más
+ * adelante, notify.js, así que vive en el estado compartido y bajo su lock.
+ */
+function clavesDeReaccionable(messageId, chatId = null) {
+  const historica = String(messageId);
+  return chatId === null || chatId === undefined
+    ? [historica]
+    : [`${String(chatId)}:${historica}`, historica];
+}
+
+export function registrarReaccionable(messageId, { alma, superficie = 'telegram', modalidad = 'texto', extracto = '' } = {}, chatId = null) {
+  return mutateState((state) => {
+    if (!state.reaccionables) state.reaccionables = {};
+    const [clave] = clavesDeReaccionable(messageId, chatId);
+    state.reaccionables[clave] = {
+      alma,
+      superficie,
+      modalidad,
+      extracto: String(extracto || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+      ts: new Date().toISOString(),
+      respondido: false
+    };
+    // `mutateState` purga antes de mutar; sin esta segunda pasada, insertar la
+    // entrada 301 dejaba el mapa temporalmente por encima de su contrato.
+    purgeReaccionables(state);
+    return true;
+  });
+}
+
+/** El origen de un mensaje del alma, o `null` si no está registrado (o ya se purgó). */
+export function getReaccionable(messageId, chatId = null) {
+  const state = loadState();
+  const mapa = state.reaccionables || {};
+  for (const clave of clavesDeReaccionable(messageId, chatId)) {
+    if (mapa[clave]) return mapa[clave];
+  }
+  return null;
+}
+
+/**
+ * FEAT-045 — Reclama una reacción una sola vez dentro del mismo ciclo
+ * leer-modificar-escribir. La lectura histórica mantiene reaccionables los
+ * mensajes emitidos antes de que el mapa incorporase el chat a la clave.
+ */
+export function tomarReaccionable(messageId, chatId) {
+  return mutateState((state) => {
+    const mapa = state.reaccionables || {};
+    const clave = clavesDeReaccionable(messageId, chatId).find((k) => mapa[k]);
+    const reaccionable = clave ? mapa[clave] : null;
+    if (!reaccionable || !reaccionable.alma || reaccionable.respondido === true) return false;
+    reaccionable.respondido = true;
+    return { ...reaccionable };
+  }) || null;
+}
+
+/**
+ * Acota el mapa por antigüedad y por cantidad. Una entrada sin `ts` legible se
+ * descarta: no se puede decidir su edad y el mapa no es un dato crítico.
+ */
+function purgeReaccionables(state, ahora = Date.now()) {
+  const mapa = state.reaccionables || {};
+  const corte = ahora - REACCIONABLE_RETENCION_MS;
+  const vigentes = Object.entries(mapa)
+    .map(([id, r]) => [id, r, Date.parse((r && r.ts) || '')])
+    .filter(([, , t]) => Number.isFinite(t) && t >= corte)
+    .sort((a, b) => a[2] - b[2])
+    .slice(-REACCIONABLES_MAX);
+
+  if (vigentes.length !== Object.keys(mapa).length) {
+    state.reaccionables = Object.fromEntries(vigentes.map(([id, r]) => [id, r]));
+  }
+}
+
+// FEAT-047 — Modo charla: mientras la charla esté fresca, el texto suelto del
+// chat sigue con el alma en vez de abrir un plan de trabajo. Es una marca por
+// chat con vencimiento pasivo; no hay timers.
+const MODO_CHARLA_MS = 30 * 60 * 1000;
+
+/** Enciende o refresca el modo charla de un chat. Conserva el resto del chat. */
+export function setModoCharla(chatId, alma) {
+  if (!alma) return false;
+  mutateState((state) => {
+    const idStr = String(chatId);
+    state.chats[idStr] = {
+      ...(state.chats[idStr] || {}),
+      modoCharla: { alma, ts: new Date().toISOString() },
+      updatedAt: new Date().toISOString()
+    };
+  });
+  return true;
+}
+
+/** La clave del alma con la que sigue el chat, o `null` si no hay o si venció. */
+export function getModoCharla(chatId, { ventanaMs = MODO_CHARLA_MS, ahora = Date.now() } = {}) {
+  const modo = loadState().chats?.[String(chatId)]?.modoCharla;
+  if (!modo || !modo.alma) return null;
+  const ts = Date.parse(modo.ts || '');
+  if (!Number.isFinite(ts) || ahora - ts > ventanaMs) return null;
+  return modo.alma;
+}
+
+/** Apaga el modo. Lo llaman todos los caminos por los que entra el trabajo. */
+export function limpiarModoCharla(chatId) {
+  mutateState((state) => {
+    const idStr = String(chatId);
+    if (!state.chats[idStr] || !state.chats[idStr].modoCharla) return false;
+    delete state.chats[idStr].modoCharla;
+    state.chats[idStr].updatedAt = new Date().toISOString();
+  });
+}
+
 export function getUltimoWorkspaceCast(chatId) {
   const guardado = loadState().chats?.[String(chatId)]?.ultimoWorkspaceCast;
   return typeof guardado === 'string' && FORMA_ID_WORKSPACE.test(guardado) ? guardado : null;

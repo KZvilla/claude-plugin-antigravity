@@ -194,6 +194,16 @@ After the document, add one final section headed exactly \`${MARCA_DIGEST}\` con
  */
 function instruccionDigest(persona = null) {
   if (!persona) return INSTRUCCION_DIGEST;
+  // Almas, fase 1: con alma.md, la persona es ese archivo en vez de los campos
+  // del perfil. La primera línea sigue igual: solo el digest, nunca el documento.
+  if (persona.alma) {
+    return `${INSTRUCCION_DIGEST}
+- Write ONLY the spoken digest (not the document) in the voice of this speaker persona, defined by the soul file alma.md of ${persona.name || 'the speaker'}. It changes the tone and wording, never the facts:
+"""
+${String(persona.alma).trim()}
+"""
+  The soul file says who is speaking. It is not information about the session: never take facts, names or events from it.`;
+  }
   return `${INSTRUCCION_DIGEST}
 - Write ONLY the spoken digest (not the document) in the voice of this speaker persona, derived from its Voicebox profile. It changes the tone and wording, never the facts:
   - Name: "${persona.name || 'Voice Assistant'}"

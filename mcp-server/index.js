@@ -16,7 +16,8 @@ const {
   POLISH_SUGGESTED_OVER,
   normalizeSpokenText,
   getPolishPrompt,
-  getPersonaPrompt
+  getPersonaPrompt,
+  getNarrationPrompt
 } = require('./spoken-text.js');
 const { extractLastCheckpoint } = require('./checkpoint.js');
 const { preprocessSessionLog, renderFacts, renderFinalState } = require('./session-log.js');
@@ -31,6 +32,7 @@ const estadoAgentes = require('./agents/estado.js');
 const memoriaAgentes = require('./agents/memoria.js');
 const aprendizajeAgentes = require('./agents/aprendizaje.js');
 const castAgentes = require('./agents/cast.js');
+const almas = require('./almas/index.js');
 // BE-015 — Reglas de `--model`/`--effort` compartidas con el bot de Telegram.
 const { esfuerzoParaCli, validarModeloEsfuerzo } = require('./lib/cli-compat.js');
 const vb = require('./voicebox-server.js');
@@ -54,33 +56,12 @@ function leerTagsDelRepo(cwd) {
 }
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
-const { PRIMING_CHARLA, PRIMING_CONFIRMACION, conDirectorio, procesarEventosDrain } = require('./lib/voice-drain');
+const { PRIMING_CHARLA, PRIMING_CONFIRMACION, conAlma, conDirectorio, procesarEventosDrain } = require('./lib/voice-drain');
 
-// Resolve agy binary location
-function resolveAgyBin() {
-  const isWin = process.platform === 'win32';
-  const binName = isWin ? 'agy.exe' : 'agy';
-
-  // 1. Try PATH (using execFileSync without shell interpolation)
-  try {
-    const file = isWin ? 'where.exe' : 'which';
-    const found = execFileSync(file, [binName], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim().split(/\r?\n/)[0];
-    if (found && fs.existsSync(found)) {
-      return found;
-    }
-  } catch {}
-
-  // 2. Try default Windows LocalAppData path
-  if (isWin && process.env.LOCALAPPDATA) {
-    const localPath = path.join(process.env.LOCALAPPDATA, 'agy', 'bin', 'agy.exe');
-    if (fs.existsSync(localPath)) {
-      return localPath;
-    }
-  }
-
-  // 3. Fallback to binName in PATH
-  return binName;
-}
+// Resolve agy binary location. La resolución vive en lib/agy-bin.js: el
+// consolidador de la charla de voz (almas/consolidar.js) corre como proceso
+// suelto y no puede requerir este servidor.
+const { resolveAgyBin } = require('./lib/agy-bin.js');
 
 const AGY_BIN = resolveAgyBin();
 
@@ -1109,6 +1090,10 @@ const TOOLS = [
           type: 'boolean',
           description: 'Voice chat with a confirmation brake, for "start". agy runs without --dangerously-skip-permissions (and in accept-edits unless `mode` is given), so it denies commands, MCP calls and read_url by itself; the denials come back in `drain.negadas` and "confirm" relaunches agy with full permissions on the same conversation for that turn only. Note: agy does not gate write_to_file; `drain.escrituras` reports those writes. Defaults to false (unchanged behavior).'
         },
+        alma: {
+          type: 'string',
+          description: 'Voice name or soul key ("Alya", "Diego Alvarez") whose soul primes the session on "start": its identity, what it knows about the user and its memory go in before the priming, and when the session is stopped a detached process decides what to remember from the conversation. Without it the session behaves exactly as before. A soul problem never fails the session: it starts without one and says so.'
+        },
         conversation_id: {
           type: 'string',
           description: 'Resume a previous agy conversation on "start" instead of beginning a new one.'
@@ -1425,6 +1410,16 @@ const TOOLS = [
         caption: {
           type: 'string',
           description: 'Optional caption text to display with the voice note.'
+        },
+        reaccionable: {
+          type: 'object',
+          description: 'Optional soul authorship metadata. When present, reactions to the delivered voice note can be answered by that soul.',
+          properties: {
+            alma: { type: 'string', minLength: 1 },
+            extracto: { type: 'string', minLength: 1 }
+          },
+          required: ['alma', 'extracto'],
+          additionalProperties: false
         }
       }
     }
@@ -1492,6 +1487,36 @@ const TOOLS = [
         timeout_minutes: {
           type: 'number',
           description: 'Timeout in minutes. Defaults to 15.'
+        }
+      }
+    }
+  },
+  {
+    name: 'agy_alma',
+    description: 'Souls for the voices (phase 0: data layer only, no surface uses them yet). Each voice can have an identity file (alma.md, seeded once from its Voicebox profile and then edited by hand), a bounded memory of the relationship (memoria.md, entries with stable ids like m3), a file shared by every voice with what is known about the user (usuario.md, ids like u2), and a diary written by code. Actions: "listar" lists the souls on disk and the voices without one; "ver" shows one soul in full; "olvidar" deletes one memory entry by id; "semilla" seeds alma.md from a Voicebox profile (exact name match, never a fallback voice); "agente" installs and verifies the tool-less lagrange-alma agent that soul calls will run as. Never launches agy.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['listar', 'ver', 'olvidar', 'semilla', 'agente'],
+          description: 'What to do. Defaults to "listar".'
+        },
+        voz: {
+          type: 'string',
+          description: 'Voice name (e.g. "Alya", "Diego Alvarez"). Required for ver, olvidar and semilla.'
+        },
+        id: {
+          type: 'string',
+          description: 'Entry id for olvidar: m<n> for the soul memory, u<n> for what is known about the user.'
+        },
+        forzar: {
+          type: 'boolean',
+          description: 'For semilla: re-seed a soul that already has alma.md. The current file is kept as alma.md.anterior. Defaults to false.'
+        },
+        voicebox_url: {
+          type: 'string',
+          description: 'Custom Voicebox endpoint to read voice profiles from. When Voicebox does not answer, the voice cache is used.'
         }
       }
     }
@@ -1846,8 +1871,8 @@ function formatearActivacion(r, action, deVoz) {
   return out;
 }
 
-async function getVoiceboxProfiles(baseUrl) {
-  const res = await httpRequest(`${baseUrl}/profiles`, { timeout: 4000 });
+async function getVoiceboxProfiles(baseUrl, { timeoutMs = 4000 } = {}) {
+  const res = await httpRequest(`${baseUrl}/profiles`, { timeout: timeoutMs });
   if (res.statusCode >= 200 && res.statusCode < 300) {
     return JSON.parse(res.body);
   }
@@ -1911,7 +1936,8 @@ async function emitirNarracionInterna({
   proveedor = 'voicebox',
   muestra = null,
   omniUrl = null,
-  classTemperature = null
+  classTemperature = null,
+  alma = null
 }) {
   const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Roaming');
   const genDir = path.join(appData, 'sh.voicebox.app', 'generations');
@@ -1981,6 +2007,10 @@ async function emitirNarracionInterna({
       if (generatedWavPath) {
         tPayload.audioPath = generatedWavPath;
       }
+      const claveAlma = typeof alma === 'string' ? alma.trim() : String(alma?.clave || '').trim();
+      if (claveAlma) {
+        tPayload.reaccionable = { alma: claveAlma, extracto: spokenText };
+      }
       const tRes = await invokeTelegramBridge('--voice-json', tPayload);
       if (tRes && tRes.ok) {
         telegramDelivered = true;
@@ -2010,7 +2040,7 @@ async function emitirNarracionInterna({
 /**
  * Bloque de salida comun a las dos herramientas de narracion.
  */
-function formatNarrationOutput({ spokenText, profile, language, personality, localPlayback, emision, voiceboxUrl, voiceResolution, destino = {}, personaAplicada = null }) {
+function formatNarrationOutput({ spokenText, profile, language, personality, localPlayback, emision, voiceboxUrl, voiceResolution, destino = {}, personaAplicada = null, alma = null }) {
   const langLabel = language === 'es' ? 'Español' : 'Inglés';
   const fallbackNotice = voiceResolution.isFallback
     ? ` *(Fallback: ${voiceResolution.reason})*`
@@ -2042,8 +2072,15 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
   // narra el texto original, y decir «en personaje» sería falso.
   const enPersona = personaAplicada === null ? personality : personaAplicada;
   let modoPersona = '👔 Neutral / Profesional';
-  if (enPersona) modoPersona = `🎭 En personaje, escrito por agy (\`${profile.personality || profile.description || 'expresivo'}\`)`;
-  else if (personality) modoPersona = '⚠️ Se pidió personalidad pero la reescritura falló: se narró el texto original';
+  if (enPersona && alma && alma.clave) {
+    modoPersona = `🎭 En personaje, escrito por agy desde el alma \`${alma.clave}\``;
+    if (alma.sembrada) modoPersona += ' (sembrada ahora desde el perfil de voz)';
+    if (alma.recortado) modoPersona += ` (alma.md recortada a ${almas.semilla.MAX_ALMA} car.)`;
+    if (!alma.conAgente) modoPersona += ` — sin el agente lagrange-alma: ${alma.motivo || 'no disponible'}`;
+  } else if (enPersona) {
+    modoPersona = `🎭 En personaje, escrito por agy (\`${profile.personality || profile.description || 'expresivo'}\`)`;
+    if (alma && alma.aviso) modoPersona += ` — sin alma: ${alma.aviso}`;
+  } else if (personality) modoPersona = '⚠️ Se pidió personalidad pero la reescritura falló: se narró el texto original';
   out += `- **Modo de Personalidad**: ${modoPersona}\n`;
   out += `- **Reproducción Local en PC**: ${localPlayback ? (emision.localPlayed ? '🔊 Reproducido limpiamente en altavoces (sin eco)' : '⚠️ Solicitado pero falló el reproductor local') : '🤫 Silencioso en PC'}\n`;
   out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
@@ -2070,13 +2107,141 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
  * llamada falla (agy ausente, sin respuesta), se devuelve el texto original:
  * perder el mensaje por no poder darle tono sería el peor canje.
  */
-async function reescribirEnPersona({ texto, destino, args, config }) {
-  const modelo = args.model || config.defaultModel;
-  const esfuerzo = esfuerzoParaCli({ modelo, pedido: args.effort, porDefecto: 'low' });
+// ==============================================================================
+// Almas, fase 1 (FEAT-042): las narraciones con personality hablan desde alma.md
+// ==============================================================================
+
+/**
+ * El alma de la voz que va a narrar: `{clave, texto, recortado, sembrada}`, o
+ * `{aviso}` si no se pudo usar. Si la voz todavía no tiene alma, se siembra con
+ * el perfil que la narración ya resolvió: no hay búsqueda por nombre, así que no
+ * hay forma de sembrar otra voz. Una narración nunca falla por el alma: con un
+ * aviso, sigue con la persona del perfil como antes.
+ */
+function almaParaNarrar(profile) {
+  const { rutas, semilla, contexto, diario } = almas;
+  const clave = profile && rutas.claveDeVoz(profile.name);
+  if (!clave) return { aviso: 'la voz no tiene un nombre que sirva de alma' };
+  try {
+    let sembrada = false;
+    if (!fs.existsSync(rutas.rutasDe(clave).alma)) {
+      sembrada = semilla.sembrar(clave, profile).creado;
+      if (sembrada) diario.anotar(clave, { superficie: 'narracion', tipo: 'semilla', resumen: 'sembrada al narrar' });
+    }
+    const id = contexto.identidad(clave);
+    if (!id) return { aviso: 'alma.md está vacía' };
+    return { clave, texto: id.texto, recortado: id.recortado, sembrada };
+  } catch (err) {
+    return { aviso: `no se pudo leer el alma (${err.message})` };
+  }
+}
+
+/**
+ * FEAT-044 — El alma que prima una charla de voz: `{clave, texto}`, o
+ * `{aviso}`. A diferencia de `almaParaNarrar`, acá solo llega un nombre, así
+ * que para sembrar hay que ir a buscar el perfil a Voicebox — con la misma
+ * búsqueda estricta de la fase 0, que nunca cae en otra voz. El timeout es
+ * corto a propósito: los dos loops le piden `/profiles` a Voicebox segundos
+ * antes (`voice-chat/common.py:233`), así que si no contesta en 1,5 s no está,
+ * y la charla no puede esperar 4 s por una siembra.
+ */
+async function almaParaCharla(nombre, voiceboxUrl) {
+  const { rutas, semilla, contexto, diario } = almas;
+  const clave = rutas.claveDeVoz(nombre);
+  if (!clave) return { aviso: 'el nombre no sirve de alma' };
+  try {
+    if (!fs.existsSync(rutas.rutasDe(clave).alma)) {
+      let perfil = null;
+      try {
+        perfil = semilla.perfilPorNombre(await getVoiceboxProfiles(voiceboxUrl, { timeoutMs: 1500 }), nombre);
+      } catch (err) {
+        return { aviso: `no se pudo leer el perfil para sembrarla (${err.message})` };
+      }
+      if (!perfil) return { aviso: 'ninguna voz de Voicebox resuelve ese nombre' };
+      if (semilla.sembrar(clave, perfil).creado) {
+        diario.anotar(clave, { superficie: 'voz', tipo: 'semilla', resumen: 'sembrada al abrir la charla' });
+      }
+    }
+    const texto = contexto.componerContexto(clave, { conMemoria: true });
+    if (!texto) return { aviso: 'alma.md está vacía' };
+    return { clave, texto };
+  } catch (err) {
+    return { aviso: `no se pudo leer el alma (${err.message})` };
+  }
+}
+
+const VERIFICACION_ALMA_MS = 10 * 60 * 1000;
+let almaVerificadaHasta = 0;
+
+/**
+ * Argumentos para correr como `lagrange-alma`, o el motivo para no hacerlo.
+ * `asegurarAgente` corre SIEMPRE: si alguien borró el agent.md, se reescribe
+ * antes de lanzar, y `--agent` nunca apunta a un nombre que no resuelve (falla
+ * abierto, con las tools completas). La caché solo ahorra repetir `agy agents`,
+ * y guarda únicamente el éxito.
+ */
+async function argsDeAlma({ modelo, esfuerzo }) {
+  const { agente } = almas;
+  try {
+    agente.asegurarAgente(os.homedir());
+  } catch (err) {
+    return { motivo: `no se pudo instalar su agent.md (${err.message})` };
+  }
+  if (Date.now() >= almaVerificadaHasta) {
+    const v = await agente.verificar(AGY_BIN);
+    if (!v.ok) return { motivo: v.motivo };
+    almaVerificadaHasta = Date.now() + VERIFICACION_ALMA_MS;
+  }
+  return { args: agente.argsBase({ modelo, esfuerzo }) };
+}
+
+/**
+ * Argumentos de las llamadas que escriben el guion en persona (agy_say con y
+ * sin polish, agy_narrate). Con alma y agente: `lagrange-alma`, sin skip y sin
+ * `--mode plan` (no tiene tools). Sin alma, o si el agente no resuelve: el
+ * régimen de siempre, que es el mismo riesgo que había antes de las almas.
+ */
+async function argsNarracion({ modelo, esfuerzoPedido, prompt, alma }) {
+  let motivo = null;
+  if (alma && alma.texto) {
+    const r = await argsDeAlma({ modelo, esfuerzo: esfuerzoPedido });
+    if (r.args) return { cliArgs: [...r.args, '-p', prompt], conAgente: true, motivo: null };
+    motivo = r.motivo;
+  }
+  const esfuerzo = esfuerzoParaCli({ modelo, pedido: esfuerzoPedido, porDefecto: 'low' });
   const cliArgs = ['--output-format', 'json', '--dangerously-skip-permissions', '--mode', 'plan'];
   if (esfuerzo) cliArgs.push('--effort', esfuerzo);
   if (modelo) cliArgs.push('--model', modelo);
-  cliArgs.push('-p', getPersonaPrompt(texto, destino.language, destino.profile));
+  cliArgs.push('-p', prompt);
+  return { cliArgs, conAgente: false, motivo };
+}
+
+/** Lo que `formatNarrationOutput` necesita saber del alma. */
+function infoAlma(alma, conAgente, motivo) {
+  if (!alma) return null;
+  if (!alma.texto) return { aviso: alma.aviso };
+  return { clave: alma.clave, sembrada: alma.sembrada, recortado: alma.recortado, conAgente, motivo };
+}
+
+/** Una línea en el diario por narración con alma. Fallar acá no falla la narración. */
+function anotarNarracion(alma, herramienta, spokenText) {
+  if (!alma || !alma.clave) return;
+  try {
+    almas.diario.anotar(alma.clave, { superficie: 'narracion', herramienta, resumen: spokenText });
+  } catch (err) {
+    process.stderr.write(`[antigravity-mcp] No se pudo anotar la narración en el diario de ${alma.clave}: ${err.message}\n`);
+  }
+}
+
+async function reescribirEnPersona({ texto, destino, args, config, alma = null }) {
+  const modelo = args.model || config.defaultModel;
+  const esfuerzo = esfuerzoParaCli({ modelo, pedido: args.effort, porDefecto: 'low' });
+  const { cliArgs, conAgente, motivo } = await argsNarracion({
+    modelo,
+    esfuerzoPedido: args.effort,
+    prompt: getPersonaPrompt(texto, destino.language, destino.profile, alma && alma.texto),
+    alma
+  });
 
   const res = await executeAgy(cliArgs, { cwd: args.cwd || process.cwd(), timeoutMinutes: 3 });
   const data = res.data || {};
@@ -2087,9 +2252,9 @@ async function reescribirEnPersona({ texto, destino, args, config }) {
   const salida = res.success ? (data.response || res.rawOutput || '').trim() : '';
   if (!salida) {
     process.stderr.write(`[antigravity-mcp] Reescritura en persona falló, se narra el original: ${res.error || 'sin respuesta'}\n`);
-    return { texto, aplicado: false, duracion, error: res.error || 'sin respuesta' };
+    return { texto, aplicado: false, duracion, error: res.error || 'sin respuesta', conAgente, motivo };
   }
-  return { texto: salida, aplicado: true, duracion, error: null };
+  return { texto: salida, aplicado: true, duracion, error: null, conAgente, motivo };
 }
 
 /** Los dos servidores de voz para el coordinador de VRAM. */
@@ -2394,58 +2559,6 @@ async function waitForGenerationFile(genDir, generationId, beforeFiles = [], tim
 }
 
 
-function getNarrationPrompt(checkpoint, targetLang, profile, enablePersonality = false) {
-  const langName = targetLang === 'en' ? 'English' : 'Spanish';
-  const langCode = targetLang === 'en' ? 'en' : 'es';
-  const profileName = (profile && profile.name) || 'Voice Assistant';
-
-  // Se le da el RECUENTO, no solo el estado. Un "pasaron los tests" es cierto
-  // pero vago; "las cinco suites en verde" es lo que una persona diria.
-  const nTests = (checkpoint.testExecutions || []).length;
-  let testSummary = 'No tests executed in this checkpoint.';
-  if (checkpoint.overallTestStatus === 'PASSED') {
-    testSummary = `${nTests} test run(s) were executed and ALL PASSED.`;
-  } else if (checkpoint.overallTestStatus === 'FAILED') {
-    testSummary = `${nTests} test run(s) were executed and at least one FAILED.`;
-  } else if (checkpoint.overallTestStatus === 'PENDING') {
-    testSummary = `${nTests} test run(s) were started but their result is unknown.`;
-  }
-
-  const filesList = checkpoint.filesModified.length > 0
-    ? checkpoint.filesModified.map(f => path.basename(f)).slice(0, 5).join(', ')
-    : 'no files explicitly modified';
-
-  let personaSection = '';
-  if (enablePersonality && profile) {
-    personaSection = `\n## Speaker Persona (Derived from Voicebox Profile):
-- Name: "${profile.name}"
-- Description: "${profile.description || 'Voice Assistant'}"
-- Personality Prompt: "${profile.personality || 'Natural and expressive'}"
-
-Persona Instructions:
-Adopt the authentic tone, humor, vocabulary, cadence, and characteristic mannerisms of the specified speaker persona naturally, but remain strictly accurate regarding the technical checkpoint facts (files modified and test results).`;
-  }
-
-  return `You are a voice assistant narrator creating a spoken status update for a software engineer.
-Generate a concise, natural, and conversational spoken narration (exactly 2 to 3 sentences) in ${langName} (${langCode}) to be spoken by Voicebox TTS (profile: ${profileName}).
-${personaSection}
-
-## Checkpoint Context:
-- User's Goal: "${checkpoint.userGoal.slice(0, 300)}"
-- Key Files Changed: ${filesList}
-- Tests Status: ${testSummary}
-- Assistant Context: "${checkpoint.assistantNotes.slice(0, 300) || 'Task completed'}"
-
-## Critical Audio Narration Rules:
-- Language MUST be ${langName}.
-- Keep it natural, conversational, and direct (between 25 and 45 words).
-- State clearly what was done, mention key component/file if relevant, and state the test outcome.
-- ABSOLUTELY NO MARKDOWN: no asterisks, no bullet points, no code blocks, no backticks, no brackets.
-- Do NOT spell symbols like "/", "\\", "_", or file extensions repeatedly unless natural (e.g. say "en el archivo de rutas" or "en index punto jota ese").
-- Do NOT include introductory filler like "Here is the summary" or quotation marks.
-- Output ONLY the plain text that will be spoken aloud.`;
-}
-
 // Helper: Run agy process
 // Un prompt viaja como argumento de linea de comandos, y eso tiene techo del
 // sistema operativo: Windows limita TODA la linea a 32767 caracteres, y Linux
@@ -2741,6 +2854,12 @@ function createVoiceStreamSession(options = {}) {
     // Charla con freno (plan-charla-modo-agente). Sin `confirmacion` nada de
     // esto se usa y la sesion se comporta como siempre.
     confirmacion: !!options.confirmacion,
+    // FEAT-044: el alma que prima la charla y la transcripción acotada que se
+    // consolida al cerrar. Sin alma, ninguna de las dos se usa.
+    alma: null,
+    // El contexto del alma solo se usa para armar el priming, una vez.
+    almaTexto: null,
+    transcripcion: [],
     modoBase: options.mode,
     skipBase: options.dangerously_skip_permissions !== false,
     negadasTurno: [],
@@ -2911,6 +3030,62 @@ function drainVoiceStreamEvents(session) {
   const drained = session.events.slice(session.cursor);
   session.cursor = session.events.length;
   return drained;
+}
+
+/**
+ * FEAT-044 — Las respuestas del alma que traen esos eventos. Se recorren TODOS
+ * los results y no solo el primero: un drain lento puede traer dos turnos
+ * cerrados juntos, y `procesarEventosDrain` se queda con el primero (es lo que
+ * necesita el loop de voz, que habla de a un turno). Un result sin texto —una
+ * negación del freno, el CANCELLED de `stop_exec`— no es un turno: lo descarta
+ * `agregarTurno`, que es el único lugar donde vive esa regla.
+ */
+function anotarRespuestasDeAlma(session, eventos) {
+  if (!session.alma) return;
+  for (const ev of eventos) {
+    if (ev.event !== 'result') continue;
+    almas.consolidar.agregarTurno(session.transcripcion, { rol: 'alma', texto: ev.result && ev.result.response });
+  }
+}
+
+/**
+ * FEAT-044 — Los turnos que cerraron pero que el loop no llegó a drenar. Pasa
+ * cuando `stop` llega enseguida del último "chau", o con un Ctrl+C: sin esto,
+ * la última respuesta del alma no entraría en la transcripción.
+ */
+function absorberPendientes(session) {
+  anotarRespuestasDeAlma(session, session.events.slice(session.cursor));
+}
+
+/**
+ * FEAT-044 — Al cerrar: vuelca la transcripción y lanza el consolidador
+ * DESACOPLADO. No se espera nada (`stop` tiene que volver al instante) y el
+ * proceso sobrevive a la muerte de este servidor, que el loop de Python mata al
+ * salir. Ruta absoluta con `__dirname`: la sesión corre con el cwd del proyecto
+ * del usuario. Nada de esto puede impedir que la sesión se detenga.
+ */
+function cerrarConAlma(session) {
+  if (!session.alma) return false;
+  const { consolidar } = almas;
+  try {
+    absorberPendientes(session);
+    if (consolidar.cuentaTurnosUsuario(session.transcripcion) < consolidar.MIN_TURNOS_USUARIO) return false;
+    const archivo = consolidar.volcar({
+      clave: session.alma.clave,
+      streamId: session.id,
+      turnos: session.transcripcion
+    });
+    const hijo = spawn(process.execPath, [path.join(__dirname, 'almas', 'consolidar.js'), archivo], {
+      detached: true,
+      stdio: 'ignore',
+      env: process.env
+    });
+    hijo.unref();
+    return true;
+  } catch (err) {
+    process.stderr.write(`[antigravity-mcp] No se pudo lanzar la consolidación de ${session.alma.clave}: ${err.message}\n`);
+    return false;
+  }
 }
 
 function stopVoiceStreamSession(session) {
@@ -3183,6 +3358,159 @@ async function handleToolCall(name, args) {
       }
 
       return { content: [{ type: 'text', text: texto }] };
+    }
+
+    case 'agy_alma': {
+      const accion = args.action || 'listar';
+      const texto = t => ({ content: [{ type: 'text', text: t }] });
+      const error = t => ({ isError: true, content: [{ type: 'text', text: t }] });
+      const { rutas, archivos, recuerdos, diario, semilla, agente } = almas;
+
+      // Perfiles de Voicebox, o de la caché de voces si no responde. Solo lee:
+      // listar almas no es motivo para levantar Voicebox.
+      const perfilesDeVoz = async () => {
+        try {
+          const p = await getVoiceboxProfiles(resolveVoiceboxUrl(args, config));
+          if (Array.isArray(p) && p.length) return { perfiles: p, origen: 'Voicebox' };
+        } catch {}
+        const cache = om.leerCacheVoces();
+        return { perfiles: cache && Array.isArray(cache.perfiles) ? cache.perfiles : [], origen: 'la caché de voces' };
+      };
+
+      // La voz pedida contra las almas que ya existen, con la misma regla que la
+      // semilla: "Diego" encuentra `diego-alvarez`, "Ana" no encuentra `anabel`.
+      const claveExistente = voz => {
+        const directa = rutas.claveDeVoz(voz);
+        if (!directa) return null;
+        const hallada = semilla.perfilPorNombre(rutas.listarClaves().map(name => ({ name })), voz);
+        return hallada ? hallada.name : directa;
+      };
+
+      const nombreEnAlma = ruta => {
+        const m = /^#\s+(.+)$/m.exec(archivos.leerTexto(ruta));
+        return m ? m[1].trim() : null;
+      };
+
+      const listaEntradas = modelo => {
+        const e = recuerdos.entradas(modelo);
+        if (!e.length) return '_(vacía)_';
+        return e.map(x => `- \`${x.id || 'sin id: se asigna al próximo guardado'}\` [${x.fecha || '—'}] ${x.texto}`).join('\n');
+      };
+
+      try {
+        if (accion === 'listar') {
+          const claves = rutas.listarClaves();
+          const lineas = claves.map(c => {
+            const r = rutas.rutasDe(c);
+            const m = recuerdos.leer(r.memoria, 'm');
+            const nombre = nombreEnAlma(r.alma);
+            const ultima = diario.ultimas(c, 1)[0];
+            return `- \`${c}\`${nombre ? ` (${nombre})` : ''}: memoria ${recuerdos.entradas(m).length} entradas, `
+              + `${recuerdos.usado(m)}/${recuerdos.TOPE_MEMORIA} car.`
+              + `${ultima ? `, última interacción ${ultima.ts}` : ''}`
+              + `${fs.existsSync(r.alma) ? '' : ' — sin alma.md'}`;
+          });
+          const usuario = recuerdos.leer(rutas.rutaUsuario(), 'u');
+          const { perfiles, origen } = await perfilesDeVoz();
+          const sinAlma = perfiles
+            .map(p => p && p.name)
+            .filter(n => n && !claves.includes(rutas.claveDeVoz(n)));
+
+          let out = '### 🫀 Almas\n\n';
+          out += lineas.length
+            ? lineas.join('\n')
+            : 'Todavía no hay ninguna. Sembrá una con `agy_alma action:"semilla" voz:"<nombre>"`.';
+          out += `\n\nLo que saben de vos (compartido): ${recuerdos.entradas(usuario).length} entradas, `
+            + `${recuerdos.usado(usuario)}/${recuerdos.TOPE_USUARIO} car.`;
+          if (sinAlma.length) out += `\n\nVoces sin alma (según ${origen}): ${sinAlma.join(', ')}.`;
+          out += `\n\nDirectorio: \`${rutas.dirAlmas()}\``;
+          return texto(out);
+        }
+
+        if (accion === 'ver') {
+          const clave = claveExistente(args.voz);
+          if (!clave) return error('Falta `voz`: el nombre de la voz cuya alma querés ver.');
+          const r = rutas.rutasDe(clave);
+          if (!fs.existsSync(r.alma) && !fs.existsSync(r.memoria)) {
+            return error(`No hay alma para \`${clave}\`. Sembrala con \`agy_alma action:"semilla" voz:"${args.voz}"\`.`);
+          }
+          const alma = archivos.leerTexto(r.alma);
+          const memoria = recuerdos.leer(r.memoria, 'm');
+          const usuario = recuerdos.leer(rutas.rutaUsuario(), 'u');
+          const ultimas = diario.ultimas(clave, 10);
+
+          let out = `### 🫀 Alma \`${clave}\`\n\n`;
+          out += `**alma.md** (${alma.length} car.`
+            + `${alma.length > semilla.MAX_ALMA ? `; al inyectarse se recorta a ${semilla.MAX_ALMA}` : ''})\n\n`;
+          out += alma ? `\`\`\`markdown\n${alma.trimEnd()}\n\`\`\`\n\n` : '_(no existe todavía)_\n\n';
+          out += `**Memoria** (${recuerdos.usado(memoria)}/${recuerdos.TOPE_MEMORIA} car.)\n\n${listaEntradas(memoria)}\n\n`;
+          out += `**Lo que sabe de vos** (compartido, ${recuerdos.usado(usuario)}/${recuerdos.TOPE_USUARIO} car.)\n\n${listaEntradas(usuario)}\n\n`;
+          out += `**Diario** (últimas ${ultimas.length})\n\n`;
+          out += ultimas.length
+            ? ultimas.map(e => `- ${e.ts} · ${e.superficie || '—'} · ${e.resumen || e.tipo || ''}${e.motivo ? ` (${e.motivo})` : ''}`).join('\n')
+            : '_(vacío)_';
+          out += `\n\n**Archivos:** \`${r.alma}\`, \`${r.memoria}\`, \`${rutas.rutaUsuario()}\`, \`${r.diario}\``;
+          return texto(out);
+        }
+
+        if (accion === 'olvidar') {
+          const clave = claveExistente(args.voz);
+          if (!clave) return error('Falta `voz`.');
+          const id = String(args.id || '').trim().toLowerCase();
+          if (!/^[mu]\d+$/.test(id)) {
+            return error('`id` tiene que ser `m<n>` (memoria del alma) o `u<n>` (lo que sabe de vos). Mirá los ids con `action:"ver"`.');
+          }
+          const prefijo = id[0];
+          const ruta = prefijo === 'm' ? rutas.rutasDe(clave).memoria : rutas.rutaUsuario();
+          const tope = prefijo === 'm' ? recuerdos.TOPE_MEMORIA : recuerdos.TOPE_USUARIO;
+          const r = recuerdos.aplicar(ruta, prefijo, [{ tipo: 'olvidar', id }], tope);
+          if (!r.aplicadas.length) {
+            return error(`No hay una entrada \`${id}\` ${prefijo === 'm' ? `en la memoria de \`${clave}\`` : 'en lo que saben de vos'}.`);
+          }
+          diario.anotar(clave, { superficie: 'agy_alma', tipo: 'olvidar', id });
+          return texto(`🧹 Olvidado \`${id}\`: "${r.aplicadas[0].texto}".`);
+        }
+
+        if (accion === 'semilla') {
+          if (!args.voz) return error('Falta `voz`: el nombre del perfil de Voicebox.');
+          const { perfiles, origen } = await perfilesDeVoz();
+          const perfil = semilla.perfilPorNombre(perfiles, args.voz);
+          if (!perfil) {
+            const nombres = perfiles.map(p => p && p.name).filter(Boolean);
+            return error(`No hay un único perfil que se llame "${args.voz}" (según ${origen}). `
+              + (nombres.length
+                ? `Disponibles: ${nombres.join(', ')}.`
+                : 'No hay perfiles: levantá Voicebox (`agy_voice_model`) o narrá una vez para llenar la caché.'));
+          }
+          const clave = rutas.claveDeVoz(perfil.name);
+          const r = semilla.sembrar(clave, perfil, { forzar: Boolean(args.forzar) });
+          if (!r.creado) {
+            return texto(`\`${clave}\` ya tiene alma (\`${r.ruta}\`) y no se tocó. `
+              + 'Con `forzar: true` se re-siembra, y el archivo actual queda en `alma.md.anterior`.');
+          }
+          diario.anotar(clave, { superficie: 'agy_alma', tipo: 'semilla', resumen: r.existia ? 're-sembrada' : 'sembrada' });
+          return texto(`🌱 Alma de **${perfil.name}** sembrada desde el perfil (según ${origen}): \`${r.ruta}\``
+            + `${r.respaldo ? `\nLa anterior quedó en \`${r.respaldo}\`.` : ''}`
+            + '\n\nEditala a gusto: desde ahora manda ese archivo.');
+        }
+
+        if (accion === 'agente') {
+          const instalado = agente.asegurarAgente(os.homedir());
+          const verificacion = await agente.verificar(AGY_BIN);
+          const out = `### Agente \`${agente.AGENTE}\`\n\n`
+            + `- **agent.md:** \`${instalado.ruta}\` (${instalado.cambiado ? 'instalado o actualizado' : 'ya estaba al día'})\n`
+            + `- **Resuelve en \`agy agents\`:** ${verificacion.ok ? '✅ sí' : `❌ no — ${verificacion.motivo}`}\n`
+            + '- **Tools nativas:** ninguna (`tools: []`; ojo, `tools:` sin ítems no es lo mismo).\n'
+            + '- **Roster MCP:** llega igual (`call_mcp_tool`, SEC-010), pero las llamadas del alma corren sin '
+            + '`--dangerously-skip-permissions` y agy lo niega sola.';
+          return verificacion.ok ? texto(out) : error(out);
+        }
+
+        return error(`Acción desconocida: "${accion}". Usá listar, ver, olvidar, semilla o agente.`);
+      } catch (err) {
+        if (err && err.name === 'ErrorLock') return error(err.message);
+        return error(`agy_alma falló: ${err && err.message ? err.message : String(err)}`);
+      }
     }
 
     case 'cast_agent': {
@@ -3516,6 +3844,21 @@ async function handleToolCall(name, args) {
           await new Promise((r) => setTimeout(r, 50));
         }
 
+        // FEAT-044: el alma se resuelve DESPUÉS de lanzar agy, así la lectura de
+        // los archivos y la eventual siembra se solapan con su arranque. Un
+        // problema del alma nunca frena la charla: queda como aviso.
+        let almaNota = '';
+        if (args.alma) {
+          const alma = await almaParaCharla(args.alma, resolveVoiceboxUrl(args, config));
+          if (alma.clave) {
+            session.alma = { clave: alma.clave };
+            session.almaTexto = alma.texto;
+            almaNota = `\n- Alma: \`${alma.clave}\``;
+          } else {
+            almaNota = `\n- Alma: no (${alma.aviso})`;
+          }
+        }
+
         // Priming turn: without this, agy treats spoken questions as coding-agent tasks
         // and can do things like write a plan.md file instead of just answering out loud
         // (verified live 2026-08-30 — a plain "tell me two facts" prompt produced a written
@@ -3526,7 +3869,10 @@ async function handleToolCall(name, args) {
           // Incluye la regla del aviso previo antes de usar herramientas (lib/voice-drain.js).
           // Solo el cwd que paso el llamador: nombrarle a agy como proyecto el
           // process.cwd() de respaldo seria elegir por el usuario (auditoria).
-          const primingText = conDirectorio(session.confirmacion ? PRIMING_CONFIRMACION : PRIMING_CHARLA, args.cwd);
+          const primingText = conAlma(
+            conDirectorio(session.confirmacion ? PRIMING_CONFIRMACION : PRIMING_CHARLA, args.cwd),
+            session.almaTexto
+          );
           try {
             sendVoiceStreamTurn(session, primingText);
             const primingDeadline = Date.now() + 10000;
@@ -3543,7 +3889,7 @@ async function handleToolCall(name, args) {
         return {
           content: [{
             type: 'text',
-            text: `Voice stream session started.\n- stream_id: \`${session.id}\`\n- conversation_id: \`${session.conversationId || 'pending'}\`\n- Model: \`${effectiveModel || 'default'}\` | Effort: \`${effectiveEffort}\` | Mode: \`${effectiveMode}\` | Skip permissions: \`${skip}\` | Confirmación: \`${confirmacion ? 'activa' : 'no'}\`\n- Status: \`${session.status}\`${prewarmNote}${primingNote}\n\nUse \`action: "send"\` with this stream_id to send a turn, then poll \`action: "drain"\` to read incremental text_delta events as they arrive.`
+            text: `Voice stream session started.\n- stream_id: \`${session.id}\`\n- conversation_id: \`${session.conversationId || 'pending'}\`\n- Model: \`${effectiveModel || 'default'}\` | Effort: \`${effectiveEffort}\` | Mode: \`${effectiveMode}\` | Skip permissions: \`${skip}\` | Confirmación: \`${confirmacion ? 'activa' : 'no'}\`\n- Status: \`${session.status}\`${prewarmNote}${almaNota}${primingNote}\n\nUse \`action: "send"\` with this stream_id to send a turn, then poll \`action: "drain"\` to read incremental text_delta events as they arrive.`
           }]
         };
       }
@@ -3579,6 +3925,7 @@ async function handleToolCall(name, args) {
         } catch (err) {
           return { isError: true, content: [{ type: 'text', text: err.message }] };
         }
+        if (session.alma) almas.consolidar.agregarTurno(session.transcripcion, { rol: 'usuario', texto: args.text });
         return {
           content: [{ type: 'text', text: `Turn sent to session \`${session.id}\`. Poll \`action: "drain"\` to receive text_delta events as they stream in.` }]
         };
@@ -3591,6 +3938,8 @@ async function handleToolCall(name, args) {
         // (short replies like "OK") and when a tool step starts, so a spoken
         // heads-up before a web search is not held until the search ends.
         const { sentences, deltas, herramientas, detalles, negadas, escrituras, resultEvent } = procesarEventosDrain(events, session.chunker, session.drainEstado || (session.drainEstado = {}));
+
+        anotarRespuestasDeAlma(session, events);
 
         // Charla con freno: las negadas se juntan por turno y, al cerrarlo,
         // quedan pendientes de un `confirm`. El cierre de una ejecucion
@@ -3707,9 +4056,15 @@ async function handleToolCall(name, args) {
       }
 
       if (action === 'stop') {
+        const consolidando = cerrarConAlma(session);
         stopVoiceStreamSession(session);
         voiceStreamSessions.delete(session.id);
-        return { content: [{ type: 'text', text: `Voice stream session \`${session.id}\` stopped.` }] };
+        return {
+          content: [{
+            type: 'text',
+            text: `Voice stream session \`${session.id}\` stopped.${consolidando ? ' Consolidación de memoria lanzada en segundo plano.' : ''}`
+          }]
+        };
       }
 
       return { isError: true, content: [{ type: 'text', text: `Unknown action "${action}" for agy_voice_stream.` }] };
@@ -4132,7 +4487,15 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         const d = await prepareNarrationTarget(args, config, { modoPorDefecto: 'diferido' });
         if (!d.error) destinoVoz = d;
       }
-      const summarySystemPrompt = getSummaryPrompt(focus, Boolean(args.narrate), destinoVoz ? destinoVoz.profile : null);
+      // Almas, fase 1: el digest en persona habla desde alma.md. La llamada del
+      // resumen conserva su régimen (modelo por tamaño, sus permisos): cambiarle
+      // el agente cambiaría el documento entero, no solo el digest. Solo cambia
+      // el texto de la persona, que escribe el usuario, sin memoria del modelo.
+      const almaResumen = destinoVoz ? almaParaNarrar(destinoVoz.profile) : null;
+      const personaResumen = destinoVoz
+        ? (almaResumen && almaResumen.texto ? { ...destinoVoz.profile, alma: almaResumen.texto } : destinoVoz.profile)
+        : null;
+      const summarySystemPrompt = getSummaryPrompt(focus, Boolean(args.narrate), personaResumen);
       const keyPoints = Array.isArray(args.key_points)
         ? args.key_points.map(p => String(p).trim()).filter(Boolean)
         : [];
@@ -4343,9 +4706,15 @@ Be thorough but concise. Prioritize primary sources and official documentation o
               language: destino.language,
               localPlayback: args.local_playback !== false,
               sendTelegram: args.send_telegram !== false,
+              alma: destinoVoz && almaResumen && almaResumen.texto ? almaResumen : null,
               ...camposEmision(destino)
             });
-            formatted += `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : (destinoVoz ? 'emitida, con el digest escrito en personaje' : 'emitida')}\n`;
+            const conAlma = Boolean(destinoVoz && almaResumen && almaResumen.texto);
+            if (conAlma && emision && emision.ok !== false) anotarNarracion(almaResumen, 'agy_session_summary', textoHablado);
+            const enPersona = conAlma
+              ? `emitida, con el digest escrito en personaje desde el alma \`${almaResumen.clave}\``
+              : (destinoVoz ? 'emitida, con el digest escrito en personaje' : 'emitida');
+            formatted += `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : enPersona}\n`;
           }
           formatted += `\n**Digest hablado:** ${digestHablado}\n`;
         }
@@ -4403,23 +4772,20 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
       // 5. Generate conversational spoken narration script via agy (Gemini)
       const enablePersonality = Boolean(args.personality);
-      const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile, enablePersonality);
+      // Almas, fase 1: con personality, la persona sale de alma.md.
+      const alma = enablePersonality ? almaParaNarrar(chosenProfile) : null;
+      const almaUsada = alma && alma.texto ? alma : null;
+      const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile, enablePersonality, almaUsada && almaUsada.texto);
       const effectiveModel = args.model || config.defaultModel;
       // `low` por latencia, pero solo si el modelo lo admite (BE-015).
       const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: 'low' });
 
-      const cliArgs = [
-        '--output-format', 'json',
-        '--dangerously-skip-permissions',
-        '--mode', 'plan'
-      ];
-      if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
-
-      if (effectiveModel) {
-        cliArgs.push('--model', effectiveModel);
-      }
-
-      cliArgs.push('-p', narratePrompt);
+      const { cliArgs, conAgente: almaConAgente, motivo: almaMotivo } = await argsNarracion({
+        modelo: effectiveModel,
+        esfuerzoPedido: args.effort,
+        prompt: narratePrompt,
+        alma: almaUsada
+      });
 
       const agyRes = await executeAgy(cliArgs, {
         cwd,
@@ -4466,6 +4832,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         language: targetLang,
         localPlayback: playLocally,
         sendTelegram: args.send_telegram !== false,
+        alma: personaAplicada ? almaUsada : null,
         ...camposEmision(destino)
       });
 
@@ -4477,6 +4844,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
           }]
         };
       }
+
+      if (personaAplicada && almaUsada) anotarNarracion(almaUsada, 'agy_narrate', spokenText);
 
       // 7. Salida estructurada. La cabecera comun la genera formatNarrationOutput;
       // el contexto del checkpoint es lo unico propio de esta herramienta.
@@ -4491,7 +4860,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         voiceboxUrl,
         voiceResolution,
         destino,
-        personaAplicada
+        personaAplicada,
+        alma: infoAlma(alma, almaConAgente, almaMotivo)
       });
       out += `\n**Contexto del Checkpoint detectado:**\n`;
       out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
@@ -4532,6 +4902,11 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       const { voiceboxUrl, voiceResolution, profile: chosenProfile, language: targetLang } = destino;
 
       const enablePersonality = Boolean(args.personality);
+      // Almas, fase 1: con personality, la persona sale de alma.md.
+      const alma = enablePersonality ? almaParaNarrar(chosenProfile) : null;
+      const almaUsada = alma && alma.texto ? alma : null;
+      let almaConAgente = false;
+      let almaMotivo = null;
       let polishDuration = 0;
       let polishApplied = false;
       let textoBase = rawText;
@@ -4544,14 +4919,15 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       if (args.polish) {
         const effectiveModel = args.model || config.defaultModel;
         const effectiveEffort = esfuerzoParaCli({ modelo: effectiveModel, pedido: args.effort, porDefecto: 'low' });
-        const cliArgs = [
-          '--output-format', 'json',
-          '--dangerously-skip-permissions',
-          '--mode', 'plan'
-        ];
-        if (effectiveEffort) cliArgs.push('--effort', effectiveEffort);
-        if (effectiveModel) cliArgs.push('--model', effectiveModel);
-        cliArgs.push('-p', getPolishPrompt(rawText, targetLang, chosenProfile, enablePersonality));
+        const armado = await argsNarracion({
+          modelo: effectiveModel,
+          esfuerzoPedido: args.effort,
+          prompt: getPolishPrompt(rawText, targetLang, chosenProfile, enablePersonality, almaUsada && almaUsada.texto),
+          alma: almaUsada
+        });
+        const cliArgs = armado.cliArgs;
+        almaConAgente = armado.conAgente;
+        almaMotivo = armado.motivo;
 
         const agyRes = await executeAgy(cliArgs, { cwd: args.cwd || process.cwd(), timeoutMinutes: 3 });
         const resData = agyRes.data || {};
@@ -4576,7 +4952,9 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       let personaAplicada = enablePersonality && polishApplied;
       let personaDuracion = 0;
       if (enablePersonality && !args.polish) {
-        const r = await reescribirEnPersona({ texto: rawText, destino, args, config });
+        const r = await reescribirEnPersona({ texto: rawText, destino, args, config, alma: almaUsada });
+        almaConAgente = r.conAgente;
+        almaMotivo = r.motivo;
         if (r.aplicado) {
           textoBase = r.texto;
           personaAplicada = true;
@@ -4604,6 +4982,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         language: targetLang,
         localPlayback: playLocally,
         sendTelegram: args.send_telegram !== false,
+        alma: personaAplicada ? almaUsada : null,
         ...camposEmision(destino)
       });
 
@@ -4616,6 +4995,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         };
       }
 
+      if (personaAplicada && almaUsada) anotarNarracion(almaUsada, 'agy_say', spokenText);
+
       let out = `### 🗣️ Texto Narrado (Voicebox)\n\n`;
       out += formatNarrationOutput({
         spokenText,
@@ -4627,7 +5008,8 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         voiceboxUrl,
         voiceResolution,
         destino,
-        personaAplicada
+        personaAplicada,
+        alma: infoAlma(alma, almaConAgente, almaMotivo)
       });
       let origen = '📝 Texto del llamante, saneado localmente';
       if (polishApplied) origen = `✨ Pulido por agy (${polishDuration.toFixed(1)}s)`;
@@ -5046,10 +5428,39 @@ Be thorough but concise. Prioritize primary sources and official documentation o
     }
 
     case 'telegram_send_voice': {
-      const res = await invokeTelegramBridge('--voice-json', {
+      let reaccionable = null;
+      if (args.reaccionable !== undefined) {
+        const clave = typeof args.reaccionable?.alma === 'string' ? args.reaccionable.alma.trim() : '';
+        const extracto = typeof args.reaccionable?.extracto === 'string' ? args.reaccionable.extracto.trim() : '';
+        try {
+          almas.rutas.validarClave(clave);
+        } catch (err) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `No se envió la voz: ${err.message}` }]
+          };
+        }
+        if (!extracto) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: 'No se envió la voz: `reaccionable.extracto` está vacío.' }]
+          };
+        }
+        if (!fs.existsSync(almas.rutas.rutasDe(clave).alma)) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `No se envió la voz: no existe el alma \`${clave}\`.` }]
+          };
+        }
+        reaccionable = { alma: clave, extracto };
+      }
+
+      const payload = {
         audioPath: args.audio_path,
         caption: args.caption || '🎙️ Nota de voz de Voicebox'
-      });
+      };
+      if (reaccionable) payload.reaccionable = reaccionable;
+      const res = await invokeTelegramBridge('--voice-json', payload);
 
       if (!res.ok) {
         return {
@@ -5181,6 +5592,29 @@ rl.on('line', async (line) => {
       }
     });
   }
+});
+
+/**
+ * FEAT-044 — El cliente cerró stdin: no va a llegar ningún `stop`.
+ *
+ * Pasó en la primera prueba en vivo: un Ctrl+C en la consola le llega a TODO el
+ * grupo de procesos, así que este servidor moría antes de que el `finally` del
+ * loop de Python pudiera pedir el `stop`, y la transcripción de la charla —que
+ * vive en memoria— se perdía entera. Los loops ahora lo lanzan en su propio
+ * grupo (`voice-chat/common.py`), pero esto es la red de abajo: cualquier
+ * cliente que cierre la tubería sin despedirse deja igual su charla consolidada.
+ */
+rl.on('close', () => {
+  for (const session of voiceStreamSessions.values()) {
+    try {
+      cerrarConAlma(session);
+      stopVoiceStreamSession(session);
+    } catch (err) {
+      process.stderr.write(`[antigravity-mcp] Error cerrando la sesión ${session.id}: ${err.message}\n`);
+    }
+  }
+  voiceStreamSessions.clear();
+  process.exit(0);
 });
 
 process.stderr.write(`[antigravity-mcp] Server started, binary: ${AGY_BIN}\n`);

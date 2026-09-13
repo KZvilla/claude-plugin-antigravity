@@ -23,6 +23,7 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Concurrent Subagent Fan-Out (`/lagrange:fanout`)](#-concurrent-subagent-fan-out-lagrangefanout)
 - [Watching a Fan-Out Live (`/lagrange:watch`)](#-watching-a-fan-out-live-lagrangewatch)
 - [Persistent SKILL-Bound Agents (`cast_agent`)](#-persistent-skill-bound-agents-cast_agent)
+- [Souls (`agy_alma`)](#-souls-agy_alma)
 - [Model & Effort Configuration](#-model--reasoning-effort-configuration)
 - [Telemetry (`/lagrange:usage`)](#-telemetry--usage-tracking-lagrangeusage)
 - [Session Summary & Anti-Compaction](#-session-summary--anti-compaction-lagrangesummary)
@@ -134,7 +135,7 @@ at startup - a restart is what makes `agy_run` and friends appear.
 
 ## 🔧 MCP Tools Reference
 
-Nineteen tools exposed via the MCP server — fourteen `agy_*` tools, four `telegram_*` bridge tools, and `cast_agent`:
+Twenty-one tools exposed via the MCP server — sixteen `agy_*` tools, four `telegram_*` bridge tools, and `cast_agent`:
 
 | Tool | Mode | Default Timeout | Description |
 |------|------|-----------------|-------------|
@@ -158,6 +159,7 @@ Nineteen tools exposed via the MCP server — fourteen `agy_*` tools, four `tele
 | `telegram_send_voice` | outbound audio | — | Send an audio file (or the latest Voicebox generation) as a native voice note |
 | `cast_agent` | read-only by default | 15m | Cast a persistent, SKILL-bound agent that keeps its identity, thread and accumulated criteria across sessions — see [Persistent SKILL-Bound Agents](#-persistent-skill-bound-agents-cast_agent) |
 | `telegram_bridge_status` | read-only | — | Diagnose the bridge: daemon state, which copy of the code each half runs, where credentials and shared state resolve — `/lagrange:bridge` |
+| `agy_alma` | local files | — | Souls for the voices: list, inspect, seed from a Voicebox profile and prune the identity and memory files; install the tool-less `lagrange-alma` agent — see [Souls](#-souls-agy_alma) |
 
 ### `agy_run` — Full Parameters
 
@@ -432,6 +434,41 @@ Two more layers back that up:
 Design rationale, verification evidence and the remaining backlog live in `docs/future-implementations/agentes-persistidos.md`.
 
 ---
+
+## 🫀 Souls (`agy_alma`)
+
+A feature built in phases: the voices get an identity and a memory of their own.
+
+- **Narrations already use the identity.** With `personality: true`, `agy_say`, `agy_narrate` and the spoken digest of `agy_session_summary` speak from the voice's `alma.md` instead of the two Voicebox profile fields. A voice without a soul gets one seeded from its profile the first time it narrates. To tune how a voice talks, edit its `alma.md`: the next narration follows it. `agy_say` and `agy_narrate` write the script as the tool-less `lagrange-alma` agent. The summary keeps its own call, because the persona there only changes the digest's tone.
+- **You can talk to a soul on Telegram, and that is where it remembers.** `/charla [voice] <message>` starts a conversation, replying to one of its messages continues it, and `/charla nuevo` opens a clean thread. It answers in character from its own memory, and stores what is worth keeping — every reply tells you what it saved (`🧠 recordó 1`). `/alma` shows that memory with its ids, `/alma olvidar <id>` prunes it. Free text in the chat is still work: a reply to a plan still adjusts the plan.
+- **Voice chat starts with the soul and learns when it ends.** The Python loops pass their voice as `alma`, so the session is primed with that soul's identity, memory and what it knows about you — before the priming, which still has the last word ("the rules of this chat override your personality"). Nothing is written mid-conversation: on `stop`, if the chat had at least three turns, a **detached** process (`mcp-server/almas/consolidar.js`) reads the transcript in a fresh tool-less thread and decides what to keep. `stop` stays instant, and the consolidation survives the loop exiting — Ctrl+C included.
+- **Emoji reactions go back to the authoring soul.** Reacting to one of its Telegram replies or narrated voice notes produces one short text response with the soul's current thread and memory. Removed/custom emoji, progress messages and bursts inside ten seconds are ignored; changing the emoji on the same message never answers twice.
+- **Memory reaches the chat and the voice chat, never the narrations.** A narration may only rewrite what it was given (REWRITE ONLY), and memory would add facts. Each narration only leaves a line in the soul's diary.
+
+```
+~/.claude/lagrange-almas/        (override: LAGRANGE_ALMAS_DIR)
+  usuario.md        what the souls know about you, shared by every voice (cap: 1375 chars)
+  alya/
+    alma.md         identity: seeded once from the Voicebox profile, then yours to edit
+    memoria.md      the soul's memory of the relationship (cap: 2200 chars)
+    diario.jsonl    a diary written by code, not by the model; rotated
+  .pendientes/      voice-chat transcripts waiting to be consolidated; retried, and dropped after 24h
+```
+
+```
+agy_alma  action:"semilla"  voz:"Alya"            → alma.md from the Voicebox profile
+agy_alma  action:"ver"      voz:"Alya"            → identity, memory with ids, diary
+agy_alma  action:"olvidar"  voz:"Alya"  id:"m3"   → delete one entry
+agy_alma  action:"listar"                         → souls on disk, voices without one
+agy_alma  action:"agente"                         → install / verify the lagrange-alma agent
+```
+
+- **Seeding matches the name exactly.** "Diego" finds a "Diego Alvarez" profile, but "Ana" never finds "Anabel", and there is no fallback voice: seeding another voice's soul is worse than not seeding. Re-seeding an existing soul needs `forzar: true`, and it keeps the previous file as `alma.md.anterior`.
+- **Memory entries have stable ids** (`- [m3] [2026-09-12] …`, `u2` in `usuario.md`). Ids are never reused, the caps are hard, and a write that would exceed them is rejected rather than silently dropping something. The files are plain text: edit them by hand whenever you want.
+- **Memory is scanned before it is written.** Invisible characters, command-shaped text ("run this command", not "run a marathon"), URLs and secret-shaped strings are rejected. This is the hygiene layer. The hard barrier is the agent:
+- **Soul calls will run as `lagrange-alma`, an agent with `tools: []`.** Verified live, that leaves it with *no* native tools at all. Note that `tools:` with no items is **not** empty: agy then grants a default read set. The MCP roster still arrives (see SEC-010 above), but soul calls never pass `--dangerously-skip-permissions`, so agy denies it on its own. And because agy fixes a thread's identity on its first turn, soul threads are always born as this agent, never converted.
+- Writes from several processes (MCP, Telegram bot, background consolidation) go through a per-file lock and an atomic rename. A lock that cannot be taken fails the write instead of writing without it.
+- The files are local, never versioned and never logged.
 
 ## ⚙️ Model & Reasoning Effort Configuration
 

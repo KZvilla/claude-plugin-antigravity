@@ -16,7 +16,7 @@ const path = require('path');
 const http = require('http');
 const { startServer, removeFixture, REPO_ROOT } = require('./lib/mcp-client');
 const { check, group, report } = require('./lib/assert');
-const { getPersonaPrompt, getPolishPrompt } = require(path.join(REPO_ROOT, 'mcp-server', 'spoken-text.js'));
+const { getPersonaPrompt, getPolishPrompt, getNarrationPrompt } = require(path.join(REPO_ROOT, 'mcp-server', 'spoken-text.js'));
 const { getSummaryPrompt } = require(path.join(REPO_ROOT, 'mcp-server', 'summary-doc.js'));
 
 const ALYA = { id: 'p-alya', name: 'Alya', language: 'es', default_engine: 'qwen', description: 'Estudiante reservada', personality: 'Orgullosa y tsundere' };
@@ -61,6 +61,39 @@ async function main() {
     check('sin digest, la persona no aparece', !/Orgullosa/.test(getSummaryPrompt('full', false, ALYA)));
   });
 
+  await group('prompts con alma (almas, fase 1)', () => {
+    const ALMA = 'Sos Alya, del ALMA DE PRUEBA.';
+    const p = getPersonaPrompt('Terminé la tarea.', 'es', ALYA, ALMA);
+    check('persona: trae el alma', p.includes(ALMA) && /soul file alma\.md of Alya/.test(p));
+    check('persona: no usa los campos del perfil', !/Orgullosa y tsundere/.test(p) && !/Derived from Voicebox Profile/.test(p));
+    check('persona: REWRITE ONLY intacto', /REWRITE ONLY/.test(p) && /Keep ALL of the content/.test(p) && /Never invent a status/.test(p));
+    check('persona: el alma va antes de las reglas', p.indexOf(ALMA) < p.indexOf('REWRITE ONLY'));
+    check('persona: el alma no es fuente de hechos', /never take facts, names or events from it/.test(p));
+    check('persona sin alma: la del perfil', /Derived from Voicebox Profile/.test(getPersonaPrompt('x', 'es', ALYA)));
+
+    const pol = getPolishPrompt('x', 'es', ALYA, true, ALMA);
+    check('polish: trae el alma y sigue condensando', pol.includes(ALMA) && /at most 3 sentences/.test(pol) && !/Orgullosa/.test(pol));
+    check('polish sin personality: ni alma ni persona', !getPolishPrompt('x', 'es', ALYA, false, ALMA).includes(ALMA));
+
+    const cp = {
+      userGoal: 'arreglar el chunker',
+      filesModified: ['C:/repo/mcp-server/lib/sentence-chunker.js'],
+      testExecutions: [{}],
+      overallTestStatus: 'PASSED',
+      assistantNotes: ''
+    };
+    const n = getNarrationPrompt(cp, 'es', ALYA, true, ALMA);
+    check('narración: trae el alma, no el perfil', n.includes(ALMA) && !/Orgullosa/.test(n));
+    check('narración: exactitud del checkpoint', /remain strictly accurate/.test(n));
+    check('narración: path.basename en su nuevo módulo', n.includes('sentence-chunker.js') && !n.includes('C:/repo'));
+    check('narración sin personality: sin persona', !/Speaker Persona/.test(getNarrationPrompt(cp, 'es', ALYA, false, ALMA)));
+
+    const d = getSummaryPrompt('full', true, { ...ALYA, alma: ALMA });
+    check('digest: trae el alma', d.includes(ALMA) && !/Orgullosa/.test(d));
+    check('digest: solo el digest, nunca el documento', /Write ONLY the spoken digest \(not the document\)/.test(d));
+    check('digest sin digest pedido: sin alma', !getSummaryPrompt('full', false, { ...ALYA, alma: ALMA }).includes(ALMA));
+  });
+
   const vbox = await fakeVoicebox();
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'persona-cwd-'));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'persona-home-'));
@@ -96,6 +129,64 @@ async function main() {
       const g2 = vbox.generados[1] || {};
       check('sin personality: texto original y personality: false', g2.text === 'Hola sin persona.' && g2.personality === false, JSON.stringify(g2));
       check('sin personality: modo neutral', /Neutral/.test(texto || ''));
+    });
+
+    // Almas, fase 1: las narraciones con personality hablan desde alma.md.
+    const spawns = () => fs.readFileSync(captura, 'utf8').split('\n').filter(l => l.includes('"cmd"')).map(l => JSON.parse(l));
+    const ultimo = () => spawns()[spawns().length - 1];
+    const promptDe = s => (s && s.args[s.args.indexOf('-p') + 1]) || '';
+    const agenteDe = s => (s && s.args.includes('--agent') ? s.args[s.args.indexOf('--agent') + 1] : null);
+    const almaMd = path.join(home, '.claude', 'lagrange-almas', 'alya', 'alma.md');
+    const diario = () => {
+      const ruta = path.join(home, '.claude', 'lagrange-almas', 'alya', 'diario.jsonl');
+      return fs.existsSync(ruta) ? fs.readFileSync(ruta, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
+    };
+    const base = { voice: 'Alya', send_telegram: false, local_playback: false, voicebox_url: vbox.url };
+
+    await group('agy_say con alma: lagrange-alma sin skip, semilla y diario', async () => {
+      const primero = spawns()[0];
+      check('corrió como lagrange-alma', agenteDe(primero) === 'lagrange-alma', JSON.stringify(primero && primero.args));
+      check('sin skip ni --mode plan', !primero.args.includes('--dangerously-skip-permissions') && !primero.args.includes('--mode'));
+      check('sembró alma.md desde el perfil', fs.existsSync(almaMd) && fs.readFileSync(almaMd, 'utf8').includes('Orgullosa y tsundere'));
+      check('el prompt trae el alma', /soul file alma\.md/.test(promptDe(primero)) && promptDe(primero).includes('Orgullosa y tsundere'));
+      check('instaló el agent.md en el HOME', fs.existsSync(path.join(home, '.gemini', 'config', 'agents', 'lagrange-alma', 'agent.md')));
+      const d = diario();
+      check('diario: la semilla y la narración', d.some(e => e.tipo === 'semilla') && d.some(e => e.superficie === 'narracion' && e.herramienta === 'agy_say'));
+
+      fs.writeFileSync(almaMd, '# Alya\n\nSos una voz EDITADA A MANO.\n');
+      const res = await server.callTool('agy_say', { ...base, text: 'Otra vez.', personality: true }, 60000);
+      const texto = (res.result && res.result.content[0].text) || '';
+      check('la edición llega al prompt', promptDe(ultimo()).includes('EDITADA A MANO') && !promptDe(ultimo()).includes('Orgullosa y tsundere'));
+      check('la salida nombra el alma', /desde el alma `alya`/.test(texto), texto);
+      check('ya no dice que la sembró', !/sembrada ahora/.test(texto));
+
+      await server.callTool('agy_say', { ...base, text: 'Pulido.', personality: true, polish: true }, 60000);
+      check('polish con alma: lagrange-alma y el alma editada', agenteDe(ultimo()) === 'lagrange-alma' && promptDe(ultimo()).includes('EDITADA A MANO'));
+
+      await server.callTool('agy_narrate', { ...base, personality: true, cwd }, 60000);
+      check('agy_narrate con alma: lagrange-alma y el alma editada', agenteDe(ultimo()) === 'lagrange-alma' && promptDe(ultimo()).includes('EDITADA A MANO'), JSON.stringify(ultimo() && ultimo().args).slice(0, 300));
+
+      const narraciones = diario().filter(e => e.superficie === 'narracion' && e.herramienta);
+      check('diario: cuatro narraciones, ninguna sin personality', narraciones.length === 4, String(narraciones.length));
+    });
+
+    await group('sin el agente: el régimen de siempre, y lo dice', async () => {
+      const previoAgentes = process.env.STUB_AGENTS;
+      process.env.STUB_AGENTS = '';
+      const sinAgente = startServer({ cwd, captureFile: captura });
+      if (previoAgentes === undefined) delete process.env.STUB_AGENTS;
+      else process.env.STUB_AGENTS = previoAgentes;
+      try {
+        await sinAgente.initialize();
+        const res = await sinAgente.callTool('agy_say', { ...base, text: 'Sin agente.', personality: true }, 60000);
+        const texto = (res.result && res.result.content[0].text) || '';
+        check('no es error', !(res.result && res.result.isError), texto);
+        check('vuelve a skip + plan', ultimo().args.includes('--dangerously-skip-permissions') && agenteDe(ultimo()) === null);
+        check('pero con el alma', promptDe(ultimo()).includes('EDITADA A MANO'));
+        check('y lo explica', /sin el agente lagrange-alma/.test(texto), texto);
+      } finally {
+        await sinAgente.stop();
+      }
     });
   } finally {
     await server.stop();

@@ -27,14 +27,38 @@ globalThis.fetch = async (url, opts) => {
   const metodo = String(url).split('/').pop();
   envios.push({ metodo, parse_mode: b.get('parse_mode'), caption: b.get('caption') });
   // sendVoice falla a propósito para ejercitar el fallback a sendAudio.
-  return { json: async () => (metodo === 'sendVoice' ? { ok: false, description: 'forzado' } : { ok: true, result: {} }) };
+  if (metodo === 'sendVoice' && b.get('caption') === 'directa') {
+    return { json: async () => ({ ok: true, result: { message_id: 322, chat: { id: 888 } } }) };
+  }
+  return { json: async () => (metodo === 'sendVoice'
+    ? { ok: false, description: 'forzado' }
+    : { ok: true, result: { message_id: b.get('caption') === 'inválida' ? 323 : 321, chat: { id: 777 } } }) };
 };
-await sendTelegramVoice({ audioPath: process.env.AUDIO, caption: 'class_temperature 0.7 *prueba* <x> & y', targetChatId: '1' });
+await sendTelegramVoice({
+  audioPath: process.env.AUDIO,
+  caption: 'class_temperature 0.7 *prueba* <x> & y',
+  targetChatId: '1',
+  reaccionable: { alma: 'alya', extracto: 'texto de la voz por fallback' }
+});
+await sendTelegramVoice({
+  audioPath: process.env.AUDIO,
+  caption: 'directa',
+  targetChatId: '2',
+  reaccionable: { alma: 'diego', extracto: 'texto de la voz directa' }
+});
+await sendTelegramVoice({
+  audioPath: process.env.AUDIO,
+  caption: 'inválida',
+  targetChatId: '3',
+  reaccionable: { alma: '', extracto: '' }
+});
+const estado = JSON.parse((await import('node:fs')).readFileSync(process.env.TELEGRAM_BRIDGE_STATE_FILE, 'utf8'));
 const densos = captionHtml('Hola & '.repeat(300));
 const solo = captionHtml('&'.repeat(1000));
 const emoji = captionHtml('a'.repeat(1022) + '\\u{1F399}\\u{FE0F}' + 'b'.repeat(50));
 console.log('RESULTADO ' + JSON.stringify({
   envios,
+  reaccionables: estado.reaccionables,
   densos: { largo: densos.length, vacio: densos === '…' },
   solo: { largo: solo.length, cortada: /&[a-z]*…$/.test(solo) && !/&amp;…$/.test(solo) },
   emoji: { largo: emoji.length, huerfano: /[\\uD800-\\uDBFF](?![\\uDC00-\\uDFFF])/.test(emoji) },
@@ -67,6 +91,13 @@ async function main() {
       check('sendVoice en HTML', voz && voz.metodo === 'sendVoice' && voz.parse_mode === 'HTML', JSON.stringify(voz));
       check('caption escapado (< y &), _ y * literales', voz && voz.caption === 'class_temperature 0.7 *prueba* &lt;x&gt; &amp; y', voz && voz.caption);
       check('el fallback sendAudio también va en HTML y escapado', audioEnvio && audioEnvio.metodo === 'sendAudio' && audioEnvio.parse_mode === 'HTML' && audioEnvio.caption === voz.caption, JSON.stringify(audioEnvio));
+      check('el fallback registra una sola voz con los ids devueltos por Telegram',
+        d.reaccionables['777:321']?.alma === 'alya' && d.reaccionables['777:321']?.modalidad === 'voz' && d.reaccionables['777:321']?.respondido === false,
+        JSON.stringify(d.reaccionables));
+      check('sendVoice directo también registra',
+        d.reaccionables['888:322']?.alma === 'diego' && d.reaccionables['888:322']?.extracto === 'texto de la voz directa',
+        JSON.stringify(d.reaccionables));
+      check('metadatos vacíos no registran aunque la entrega sea exitosa', !d.reaccionables['777:323'], JSON.stringify(d.reaccionables));
     });
 
     await group('captionHtml respeta 1024 sin vaciar ni cortar', () => {

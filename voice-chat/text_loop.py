@@ -120,6 +120,9 @@ def main():
     start_text = mcp.call_tool("agy_voice_stream", {
         # cwd: sin el, agy corre los comandos en su scratch/ y no en el proyecto.
         "action": "start", "effort": args.effort, "confirmacion": True, "cwd": os.getcwd(),
+        # alma: identidad y memoria de esta voz en el priming, y consolidacion
+        # al cerrar (FEAT-044).
+        "alma": profile["name"],
         "prewarm_voicebox": con_prewarm, "voicebox_model_size": model_size or "1.7B"
     })
     stream_id = start_text.split("stream_id: `")[1].split("`")[0]
