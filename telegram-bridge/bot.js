@@ -25,6 +25,9 @@ import {
   clearConversationId,
   registrarReaccionable,
   getReaccionable,
+  setModoCharla,
+  getModoCharla,
+  limpiarModoCharla,
   resolvePendingAsk,
   getPendingAsk,
   getStateFilePath,
@@ -486,6 +489,9 @@ async function processTaskQueue(carril) {
       await notifyChat(chatId, errMsg, { parse_mode: 'Markdown' });
     }
   } catch (err) {
+    // Si la rama del carril se cayó, `responderCharla` no llegó a correr y el
+    // modo quedaría prendido sobre una charla que nunca contestó.
+    if (task.kind === 'alma') limpiarModoCharla(chatId);
     console.error('[TASK ERROR]', redactSecrets(err?.stack || err?.message || String(err)));
     await notifyChat(chatId, `❌ Ocurrió un error inesperado al procesar la tarea: ${redactSecrets(err.message)}`);
   } finally {
@@ -557,6 +563,7 @@ export function recortarActividad(texto) {
  */
 async function dispatchTask(ctx, prompt, mode = 'accept-edits', forceConvId = null, { freshSession = false } = {}) {
   const chatId = ctx.chat.id;
+  limpiarModoCharla(chatId);
   let activeConvId = forceConvId !== null ? forceConvId : getConversationId(chatId);
 
   if (freshSession && forceConvId === null) {
@@ -738,6 +745,10 @@ function almaDeMensajeRespondido(respondido, idDelBot) {
  */
 export async function dispatchCharla(ctx, { clave, voz, texto, fresco = false }) {
   const chatId = ctx.chat.id;
+  // FEAT-047 — El modo se enciende ACÁ, no al responder: un turno tarda
+  // segundos, y el segundo mensaje que el usuario manda mientras el alma
+  // piensa tiene que seguir la charla y no abrir un plan.
+  setModoCharla(chatId, clave);
   const task = {
     ctx, chatId, kind: 'alma', clave, voz, fresco,
     prompt: texto, mode: 'alma', conversationId: null, statusMessageId: null
@@ -774,6 +785,11 @@ function pieDeMemoria(turno) {
  * charla, y solo el primero lleva el prefijo.
  */
 async function responderCharla(ctx, task, turno) {
+  // El modo se encendió al despachar: un turno que no llegó a buen puerto lo
+  // apaga, y uno bueno le renueva la ventana.
+  if (turno.ok) setModoCharla(ctx.chat.id, task.clave);
+  else limpiarModoCharla(ctx.chat.id);
+
   if (turno.cancelled) return void await ctx.reply(`🛑 Charla con ${task.voz} cancelada.`);
   if (turno.sinAlma) {
     return void await sendSafeChunk(ctx, `No hay alma para \`${task.clave}\`. Sembrala desde Claude Code: \`agy_alma action:"semilla" voz:"${task.voz}"\`.`);
@@ -803,6 +819,7 @@ async function responderCharla(ctx, task, turno) {
  */
 export async function dispatchCast(ctx, { agent, prompt, cwd, workspaceName }) {
   const chatId = ctx.chat.id;
+  limpiarModoCharla(chatId);
   const task = {
     ctx, chatId, kind: 'cast', agent, prompt, cwd, workspaceName,
     mode: 'cast', conversationId: null, statusMessageId: null
@@ -977,7 +994,7 @@ Puente móvil autónomo conectado a tu entorno local.
 • \`/logs [N]\` — Últimas líneas del log del daemon, para ver por qué falló algo. Si el bot está caído, esto tampoco responde.
 • \`/cancel\` — Aborta lo que esté en curso y vacía las colas. \`/cancel cast\` corta solo el cast, sin tocar un /run.
 • \`/reset\` — Reinicia la conversación y olvida el contexto actual.
-• \`/charla [voz] <mensaje>\` — Habla con un alma: responde en personaje y recuerda lo tuyo. Responder a un mensaje suyo sigue la charla. \`/charla nuevo\` arranca un hilo limpio.
+• \`/charla [voz] <mensaje>\` — Habla con un alma: responde en personaje y recuerda lo tuyo. Mientras la charla esté fresca (30 min) el texto suelto sigue con ella, y cualquier comando de trabajo vuelve al workspace. Responder a un mensaje suyo también sigue la charla. \`/charla nuevo\` arranca un hilo limpio.
 • \`/alma [voz]\` — Su memoria con ids y lo que sabe de vos. \`/alma olvidar <id>\` borra una entrada.
 
 *Sesión activa:* ${convId ? `\`${convId}\`` : '_Ninguna (el próximo mensaje abrirá una nueva)_'}
@@ -1200,7 +1217,10 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
   });
 
   bot.command('reset', async (ctx) => {
+    // `clearConversationId` solo borra la conversación de trabajo: el modo
+    // charla hay que apagarlo a mano o /reset no reiniciaría nada de la charla.
     clearConversationId(ctx.chat.id);
+    limpiarModoCharla(ctx.chat.id);
     await ctx.reply('🔄 Contexto de conversación reiniciado. Tu próximo mensaje iniciará una nueva sesión en blanco.');
   });
 
@@ -1216,6 +1236,8 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
       const alma = resolverAlma(palabras.slice(1).join(' ') || null);
       if (alma.error) return sendSafeChunk(ctx, alma.error);
       almasHilos.olvidarHilo(alma.clave);
+      // El mensaje siguiente tiene que ir a la charla: es lo que dice el aviso.
+      setModoCharla(ctx.chat.id, alma.clave);
       return sendSafeChunk(ctx, `🧵 Hilo nuevo con *${alma.voz}*. El próximo mensaje arranca limpio y vuelve a leer su memoria.`);
     }
 
@@ -1294,6 +1316,9 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
   });
 
   bot.command('resume', async (ctx) => {
+    // Sin sesión activa el comando retorna antes de `dispatchTask`, pero pedir
+    // reanudar trabajo ya es salir de la charla.
+    limpiarModoCharla(ctx.chat.id);
     const prompt = ctx.match?.trim();
     if (!prompt) {
       return sendSafeChunk(ctx, '⚠️ Por favor indica qué deseas continuar en la sesión. Ejemplo:\n`/resume Ahora ejecuta las pruebas unitarias`');
@@ -1308,6 +1333,9 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
   // pide el proyecto con el mismo listado de `/claude` (getKnownWorkspaces):
   // nunca una ruta escrita a mano.
   bot.command('cast', async (ctx) => {
+    // El cast es en dos pasos (comando y botón de workspace): apagar solo en
+    // `dispatchCast` dejaría el chat en modo charla mientras se elige.
+    limpiarModoCharla(ctx.chat.id);
     const partes = (ctx.match || '').trim().match(/^(\S+)\s+([\s\S]+)$/);
     if (!partes) {
       return sendSafeChunk(ctx, '⚠️ Uso: `/cast <agente> <pedido>`\nEjemplo: `/cast lagrange-reviewer Revisá el último commit`');
@@ -1339,6 +1367,9 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
     }
 
     const objetivo = arg ? [arg] : CARRILES;
+    // `/cancel cast` corta una revisión en segundo plano: no tiene por qué
+    // tumbar una charla en curso.
+    if (objetivo.includes('alma')) limpiarModoCharla(ctx.chat.id);
     let descartadas = 0;
     const abortados = [];
     for (const c of objetivo) {
@@ -1743,10 +1774,30 @@ ${status.extraDirs.length > 0 ? `• *Directorios extra:* \`${status.extraDirs.j
         await dispatchCharla(ctx, { clave: destino.clave, voz: destino.voz, texto: text });
         return;
       }
+      // Un reply a otra cosa del bot —el plan de FEAT-027, la salida de una
+      // tarea— es intención de trabajo: corta la charla aunque esté fresca.
+      if (!destino) limpiarModoCharla(ctx.chat.id);
       if (destino && destino.desconocida) {
         await ctx.reply(`Ya no tengo un alma llamada «${destino.desconocida}». Mirá cuáles hay con /alma.`);
         return;
       }
+    }
+
+    // FEAT-047 — Con la charla fresca (30 min), el texto suelto sigue con ella.
+    // Va después del reply y antes del trabajo. Un comando nunca llega acá: la
+    // guarda de arriba corta todo lo que empieza con «/».
+    const almaEnCurso = getModoCharla(ctx.chat.id);
+    if (almaEnCurso) {
+      const alma = resolverAlma(almaEnCurso);
+      if (!alma.error) {
+        await dispatchCharla(ctx, { clave: alma.clave, voz: alma.voz, texto: text });
+        return;
+      }
+      // El alma ya no existe: se avisa y NO se manda a trabajo, que abriría un
+      // plan sobre el repo con un mensaje de charla.
+      limpiarModoCharla(ctx.chat.id);
+      await ctx.reply(`Se terminó la charla: ya no tengo un alma \`${almaEnCurso}\`. Empezá otra con /charla.`);
+      return;
     }
 
     // Modo `plan` por defecto: un mensaje mal escrito, un autocorrector o un toque

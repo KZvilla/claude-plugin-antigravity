@@ -393,6 +393,44 @@ function purgeReaccionables(state, ahora = Date.now()) {
   }
 }
 
+// FEAT-047 — Modo charla: mientras la charla esté fresca, el texto suelto del
+// chat sigue con el alma en vez de abrir un plan de trabajo. Es una marca por
+// chat con vencimiento pasivo; no hay timers.
+const MODO_CHARLA_MS = 30 * 60 * 1000;
+
+/** Enciende o refresca el modo charla de un chat. Conserva el resto del chat. */
+export function setModoCharla(chatId, alma) {
+  if (!alma) return false;
+  mutateState((state) => {
+    const idStr = String(chatId);
+    state.chats[idStr] = {
+      ...(state.chats[idStr] || {}),
+      modoCharla: { alma, ts: new Date().toISOString() },
+      updatedAt: new Date().toISOString()
+    };
+  });
+  return true;
+}
+
+/** La clave del alma con la que sigue el chat, o `null` si no hay o si venció. */
+export function getModoCharla(chatId, { ventanaMs = MODO_CHARLA_MS, ahora = Date.now() } = {}) {
+  const modo = loadState().chats?.[String(chatId)]?.modoCharla;
+  if (!modo || !modo.alma) return null;
+  const ts = Date.parse(modo.ts || '');
+  if (!Number.isFinite(ts) || ahora - ts > ventanaMs) return null;
+  return modo.alma;
+}
+
+/** Apaga el modo. Lo llaman todos los caminos por los que entra el trabajo. */
+export function limpiarModoCharla(chatId) {
+  mutateState((state) => {
+    const idStr = String(chatId);
+    if (!state.chats[idStr] || !state.chats[idStr].modoCharla) return false;
+    delete state.chats[idStr].modoCharla;
+    state.chats[idStr].updatedAt = new Date().toISOString();
+  });
+}
+
 export function getUltimoWorkspaceCast(chatId) {
   const guardado = loadState().chats?.[String(chatId)]?.ultimoWorkspaceCast;
   return typeof guardado === 'string' && FORMA_ID_WORKSPACE.test(guardado) ? guardado : null;
