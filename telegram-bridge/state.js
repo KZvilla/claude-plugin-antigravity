@@ -355,24 +355,56 @@ const FORMA_ID_WORKSPACE = /^[0-9a-f]{8}$/;
  * responderlo (fase 2) o al reaccionarle (fase 4). Lo escribe el bot y, más
  * adelante, notify.js, así que vive en el estado compartido y bajo su lock.
  */
-export function registrarReaccionable(messageId, { alma, superficie = 'telegram', modalidad = 'texto', extracto = '' } = {}) {
+function clavesDeReaccionable(messageId, chatId = null) {
+  const historica = String(messageId);
+  return chatId === null || chatId === undefined
+    ? [historica]
+    : [`${String(chatId)}:${historica}`, historica];
+}
+
+export function registrarReaccionable(messageId, { alma, superficie = 'telegram', modalidad = 'texto', extracto = '' } = {}, chatId = null) {
   return mutateState((state) => {
     if (!state.reaccionables) state.reaccionables = {};
-    state.reaccionables[String(messageId)] = {
+    const [clave] = clavesDeReaccionable(messageId, chatId);
+    state.reaccionables[clave] = {
       alma,
       superficie,
       modalidad,
       extracto: String(extracto || '').replace(/\s+/g, ' ').trim().slice(0, 300),
-      ts: new Date().toISOString()
+      ts: new Date().toISOString(),
+      respondido: false
     };
+    // `mutateState` purga antes de mutar; sin esta segunda pasada, insertar la
+    // entrada 301 dejaba el mapa temporalmente por encima de su contrato.
+    purgeReaccionables(state);
     return true;
   });
 }
 
 /** El origen de un mensaje del alma, o `null` si no está registrado (o ya se purgó). */
-export function getReaccionable(messageId) {
+export function getReaccionable(messageId, chatId = null) {
   const state = loadState();
-  return (state.reaccionables || {})[String(messageId)] || null;
+  const mapa = state.reaccionables || {};
+  for (const clave of clavesDeReaccionable(messageId, chatId)) {
+    if (mapa[clave]) return mapa[clave];
+  }
+  return null;
+}
+
+/**
+ * FEAT-045 — Reclama una reacción una sola vez dentro del mismo ciclo
+ * leer-modificar-escribir. La lectura histórica mantiene reaccionables los
+ * mensajes emitidos antes de que el mapa incorporase el chat a la clave.
+ */
+export function tomarReaccionable(messageId, chatId) {
+  return mutateState((state) => {
+    const mapa = state.reaccionables || {};
+    const clave = clavesDeReaccionable(messageId, chatId).find((k) => mapa[k]);
+    const reaccionable = clave ? mapa[clave] : null;
+    if (!reaccionable || !reaccionable.alma || reaccionable.respondido === true) return false;
+    reaccionable.respondido = true;
+    return { ...reaccionable };
+  }) || null;
 }
 
 /**

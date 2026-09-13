@@ -64,9 +64,22 @@ function aplicarOperaciones(clave, operaciones, env) {
   return { aplicadas, rechazadas };
 }
 
-function anotarEnDiario(clave, { respuesta, rechazadas }, env) {
+function anotarEnDiario(clave, { respuesta, aplicadas, rechazadas, metadatos }, env) {
   try {
-    diario.anotar(clave, { superficie: 'telegram', resumen: respuesta }, env);
+    const origen = metadatos && metadatos.tipo === 'reaccion'
+      ? {
+          tipo: 'reaccion',
+          reaccion: String(metadatos.reaccion || ''),
+          mensajeId: String(metadatos.messageId || '')
+        }
+      : {};
+    diario.anotar(clave, { superficie: 'telegram', ...origen, resumen: respuesta }, env);
+    // Igual que la consolidación de voz: registrar cada cambio deja trazabilidad.
+    // En `olvidar`, a.texto es el valor quitado y preserva la única copia que
+    // deja de existir en el archivo; en `reemplazar` es el nuevo valor aplicado.
+    for (const a of aplicadas) {
+      diario.anotar(clave, { superficie: 'telegram', tipo: `memoria:${a.tipo}`, id: a.id, resumen: a.texto }, env);
+    }
     for (const r of rechazadas) {
       diario.anotar(clave, { superficie: 'telegram', tipo: 'rechazo', motivo: r.motivo }, env);
     }
@@ -125,7 +138,7 @@ async function charlar({ clave, texto, agyBin, ejecutar, homeDir = os.homedir(),
   const crudo = datos.response || resultado.rawOutput || '';
   const { respuesta, operaciones } = bloque.extraerBloque(crudo);
   const { aplicadas, rechazadas } = aplicarOperaciones(clave, operaciones, env);
-  anotarEnDiario(clave, { respuesta, rechazadas }, env);
+  anotarEnDiario(clave, { respuesta, aplicadas, rechazadas, metadatos: opciones.diario }, env);
 
   return { ...base, ok: true, respuesta: respuesta || '(se quedó sin palabras)', aplicadas, rechazadas };
 }

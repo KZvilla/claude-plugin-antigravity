@@ -1410,6 +1410,16 @@ const TOOLS = [
         caption: {
           type: 'string',
           description: 'Optional caption text to display with the voice note.'
+        },
+        reaccionable: {
+          type: 'object',
+          description: 'Optional soul authorship metadata. When present, reactions to the delivered voice note can be answered by that soul.',
+          properties: {
+            alma: { type: 'string', minLength: 1 },
+            extracto: { type: 'string', minLength: 1 }
+          },
+          required: ['alma', 'extracto'],
+          additionalProperties: false
         }
       }
     }
@@ -1926,7 +1936,8 @@ async function emitirNarracionInterna({
   proveedor = 'voicebox',
   muestra = null,
   omniUrl = null,
-  classTemperature = null
+  classTemperature = null,
+  alma = null
 }) {
   const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Roaming');
   const genDir = path.join(appData, 'sh.voicebox.app', 'generations');
@@ -1995,6 +2006,10 @@ async function emitirNarracionInterna({
       };
       if (generatedWavPath) {
         tPayload.audioPath = generatedWavPath;
+      }
+      const claveAlma = typeof alma === 'string' ? alma.trim() : String(alma?.clave || '').trim();
+      if (claveAlma) {
+        tPayload.reaccionable = { alma: claveAlma, extracto: spokenText };
       }
       const tRes = await invokeTelegramBridge('--voice-json', tPayload);
       if (tRes && tRes.ok) {
@@ -4691,6 +4706,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
               language: destino.language,
               localPlayback: args.local_playback !== false,
               sendTelegram: args.send_telegram !== false,
+              alma: destinoVoz && almaResumen && almaResumen.texto ? almaResumen : null,
               ...camposEmision(destino)
             });
             const conAlma = Boolean(destinoVoz && almaResumen && almaResumen.texto);
@@ -4816,6 +4832,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         language: targetLang,
         localPlayback: playLocally,
         sendTelegram: args.send_telegram !== false,
+        alma: personaAplicada ? almaUsada : null,
         ...camposEmision(destino)
       });
 
@@ -4965,6 +4982,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         language: targetLang,
         localPlayback: playLocally,
         sendTelegram: args.send_telegram !== false,
+        alma: personaAplicada ? almaUsada : null,
         ...camposEmision(destino)
       });
 
@@ -5410,10 +5428,39 @@ Be thorough but concise. Prioritize primary sources and official documentation o
     }
 
     case 'telegram_send_voice': {
-      const res = await invokeTelegramBridge('--voice-json', {
+      let reaccionable = null;
+      if (args.reaccionable !== undefined) {
+        const clave = typeof args.reaccionable?.alma === 'string' ? args.reaccionable.alma.trim() : '';
+        const extracto = typeof args.reaccionable?.extracto === 'string' ? args.reaccionable.extracto.trim() : '';
+        try {
+          almas.rutas.validarClave(clave);
+        } catch (err) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `No se envió la voz: ${err.message}` }]
+          };
+        }
+        if (!extracto) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: 'No se envió la voz: `reaccionable.extracto` está vacío.' }]
+          };
+        }
+        if (!fs.existsSync(almas.rutas.rutasDe(clave).alma)) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `No se envió la voz: no existe el alma \`${clave}\`.` }]
+          };
+        }
+        reaccionable = { alma: clave, extracto };
+      }
+
+      const payload = {
         audioPath: args.audio_path,
         caption: args.caption || '🎙️ Nota de voz de Voicebox'
-      });
+      };
+      if (reaccionable) payload.reaccionable = reaccionable;
+      const res = await invokeTelegramBridge('--voice-json', payload);
 
       if (!res.ok) {
         return {
