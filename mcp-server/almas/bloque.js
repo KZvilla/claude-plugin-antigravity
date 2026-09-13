@@ -19,12 +19,19 @@ const CIERRE = '</alma>';
 const MAX_OPERACIONES = 4;
 const MAX_TEXTO = 300;
 
-/** La consigna que se agrega al prompt. Corta y al final, para no correrle el foco al mensaje. */
-function instruccionDeCierre() {
+const ENCABEZADO_CHARLA = 'Si algo de esta conversación te sirve para la próxima vez, agregá al final un bloque así:';
+
+/**
+ * La consigna que se agrega al prompt. Corta y al final, para no correrle el
+ * foco al mensaje. El `encabezado` lo cambia la consolidación de la charla de
+ * voz (FEAT-044), que pide el bloque solo y no una respuesta con bloque; la
+ * plantilla y los topes son los mismos para las dos superficies.
+ */
+function instruccionDeCierre({ encabezado = ENCABEZADO_CHARLA } = {}) {
   return [
     '',
     '---',
-    'Si algo de esta conversación te sirve para la próxima vez, agregá al final un bloque así:',
+    encabezado,
     '',
     APERTURA,
     'recordar: <algo que quieras recordar vos>',
@@ -98,4 +105,4 @@ function extraerBloque(textoCrudo) {
   return { respuesta, operaciones };
 }
 
-module.exports = { APERTURA, CIERRE, MAX_OPERACIONES, MAX_TEXTO, instruccionDeCierre, extraerBloque };
+module.exports = { APERTURA, CIERRE, MAX_OPERACIONES, MAX_TEXTO, ENCABEZADO_CHARLA, instruccionDeCierre, extraerBloque };

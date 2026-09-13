@@ -123,7 +123,36 @@ cp.execFile = function (file, args, ...resto) {
   return realExecFile.apply(this, arguments);
 };
 
+/**
+ * FEAT-044 — El lanzamiento desacoplado del consolidador (`node consolidar.js`).
+ * Sin esto pasaba de largo hacia realSpawn: no quedaba registro (no se podia
+ * verificar que se lanzo, ni con que ruta, ni si se hizo unref) y ademas
+ * arrancaba un proceso real que borraba el pendiente que el test estaba
+ * mirando. Ahora se anota y no se lanza nada; el consolidador de verdad se
+ * prueba aparte, corriendolo sincronico.
+ */
+function esConsolidador(cmd, args) {
+  if (/agy/i.test(String(cmd))) return false; // un prompt de agy que lo nombre no cuenta
+  return Array.isArray(args) && args.some((a) => /consolidar\.js$/.test(String(a)));
+}
+
 cp.spawn = function (cmd, args, opts) {
+  if (esConsolidador(cmd, args)) {
+    fs.appendFileSync(CAPTURE_FILE, JSON.stringify({
+      event: 'consolidador', cmd, args, cwd: opts && opts.cwd, detached: !!(opts && opts.detached)
+    }) + '\n');
+    const falso = new EventEmitter();
+    falso.stdout = new PassThrough();
+    falso.stderr = new PassThrough();
+    falso.stdin = { write() {}, end() {} };
+    falso.kill = () => {};
+    falso.unref = () => {
+      fs.appendFileSync(CAPTURE_FILE, JSON.stringify({ event: 'consolidador-unref' }) + '\n');
+    };
+    setImmediate(() => { falso.stdout.end(); falso.stderr.end(); falso.emit('close', 0); });
+    return falso;
+  }
+
   if (!/agy/i.test(String(cmd))) {
     return realSpawn.apply(this, arguments);
   }

@@ -56,33 +56,12 @@ function leerTagsDelRepo(cwd) {
 }
 const http = require('node:http');
 const { SentenceChunker } = require('./lib/sentence-chunker');
-const { PRIMING_CHARLA, PRIMING_CONFIRMACION, conDirectorio, procesarEventosDrain } = require('./lib/voice-drain');
+const { PRIMING_CHARLA, PRIMING_CONFIRMACION, conAlma, conDirectorio, procesarEventosDrain } = require('./lib/voice-drain');
 
-// Resolve agy binary location
-function resolveAgyBin() {
-  const isWin = process.platform === 'win32';
-  const binName = isWin ? 'agy.exe' : 'agy';
-
-  // 1. Try PATH (using execFileSync without shell interpolation)
-  try {
-    const file = isWin ? 'where.exe' : 'which';
-    const found = execFileSync(file, [binName], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim().split(/\r?\n/)[0];
-    if (found && fs.existsSync(found)) {
-      return found;
-    }
-  } catch {}
-
-  // 2. Try default Windows LocalAppData path
-  if (isWin && process.env.LOCALAPPDATA) {
-    const localPath = path.join(process.env.LOCALAPPDATA, 'agy', 'bin', 'agy.exe');
-    if (fs.existsSync(localPath)) {
-      return localPath;
-    }
-  }
-
-  // 3. Fallback to binName in PATH
-  return binName;
-}
+// Resolve agy binary location. La resolución vive en lib/agy-bin.js: el
+// consolidador de la charla de voz (almas/consolidar.js) corre como proceso
+// suelto y no puede requerir este servidor.
+const { resolveAgyBin } = require('./lib/agy-bin.js');
 
 const AGY_BIN = resolveAgyBin();
 
@@ -1111,6 +1090,10 @@ const TOOLS = [
           type: 'boolean',
           description: 'Voice chat with a confirmation brake, for "start". agy runs without --dangerously-skip-permissions (and in accept-edits unless `mode` is given), so it denies commands, MCP calls and read_url by itself; the denials come back in `drain.negadas` and "confirm" relaunches agy with full permissions on the same conversation for that turn only. Note: agy does not gate write_to_file; `drain.escrituras` reports those writes. Defaults to false (unchanged behavior).'
         },
+        alma: {
+          type: 'string',
+          description: 'Voice name or soul key ("Alya", "Diego Alvarez") whose soul primes the session on "start": its identity, what it knows about the user and its memory go in before the priming, and when the session is stopped a detached process decides what to remember from the conversation. Without it the session behaves exactly as before. A soul problem never fails the session: it starts without one and says so.'
+        },
         conversation_id: {
           type: 'string',
           description: 'Resume a previous agy conversation on "start" instead of beginning a new one.'
@@ -1878,8 +1861,8 @@ function formatearActivacion(r, action, deVoz) {
   return out;
 }
 
-async function getVoiceboxProfiles(baseUrl) {
-  const res = await httpRequest(`${baseUrl}/profiles`, { timeout: 4000 });
+async function getVoiceboxProfiles(baseUrl, { timeoutMs = 4000 } = {}) {
+  const res = await httpRequest(`${baseUrl}/profiles`, { timeout: timeoutMs });
   if (res.statusCode >= 200 && res.statusCode < 300) {
     return JSON.parse(res.body);
   }
@@ -2133,6 +2116,40 @@ function almaParaNarrar(profile) {
     const id = contexto.identidad(clave);
     if (!id) return { aviso: 'alma.md está vacía' };
     return { clave, texto: id.texto, recortado: id.recortado, sembrada };
+  } catch (err) {
+    return { aviso: `no se pudo leer el alma (${err.message})` };
+  }
+}
+
+/**
+ * FEAT-044 — El alma que prima una charla de voz: `{clave, texto}`, o
+ * `{aviso}`. A diferencia de `almaParaNarrar`, acá solo llega un nombre, así
+ * que para sembrar hay que ir a buscar el perfil a Voicebox — con la misma
+ * búsqueda estricta de la fase 0, que nunca cae en otra voz. El timeout es
+ * corto a propósito: los dos loops le piden `/profiles` a Voicebox segundos
+ * antes (`voice-chat/common.py:233`), así que si no contesta en 1,5 s no está,
+ * y la charla no puede esperar 4 s por una siembra.
+ */
+async function almaParaCharla(nombre, voiceboxUrl) {
+  const { rutas, semilla, contexto, diario } = almas;
+  const clave = rutas.claveDeVoz(nombre);
+  if (!clave) return { aviso: 'el nombre no sirve de alma' };
+  try {
+    if (!fs.existsSync(rutas.rutasDe(clave).alma)) {
+      let perfil = null;
+      try {
+        perfil = semilla.perfilPorNombre(await getVoiceboxProfiles(voiceboxUrl, { timeoutMs: 1500 }), nombre);
+      } catch (err) {
+        return { aviso: `no se pudo leer el perfil para sembrarla (${err.message})` };
+      }
+      if (!perfil) return { aviso: 'ninguna voz de Voicebox resuelve ese nombre' };
+      if (semilla.sembrar(clave, perfil).creado) {
+        diario.anotar(clave, { superficie: 'voz', tipo: 'semilla', resumen: 'sembrada al abrir la charla' });
+      }
+    }
+    const texto = contexto.componerContexto(clave, { conMemoria: true });
+    if (!texto) return { aviso: 'alma.md está vacía' };
+    return { clave, texto };
   } catch (err) {
     return { aviso: `no se pudo leer el alma (${err.message})` };
   }
@@ -2822,6 +2839,12 @@ function createVoiceStreamSession(options = {}) {
     // Charla con freno (plan-charla-modo-agente). Sin `confirmacion` nada de
     // esto se usa y la sesion se comporta como siempre.
     confirmacion: !!options.confirmacion,
+    // FEAT-044: el alma que prima la charla y la transcripción acotada que se
+    // consolida al cerrar. Sin alma, ninguna de las dos se usa.
+    alma: null,
+    // El contexto del alma solo se usa para armar el priming, una vez.
+    almaTexto: null,
+    transcripcion: [],
     modoBase: options.mode,
     skipBase: options.dangerously_skip_permissions !== false,
     negadasTurno: [],
@@ -2992,6 +3015,62 @@ function drainVoiceStreamEvents(session) {
   const drained = session.events.slice(session.cursor);
   session.cursor = session.events.length;
   return drained;
+}
+
+/**
+ * FEAT-044 — Las respuestas del alma que traen esos eventos. Se recorren TODOS
+ * los results y no solo el primero: un drain lento puede traer dos turnos
+ * cerrados juntos, y `procesarEventosDrain` se queda con el primero (es lo que
+ * necesita el loop de voz, que habla de a un turno). Un result sin texto —una
+ * negación del freno, el CANCELLED de `stop_exec`— no es un turno: lo descarta
+ * `agregarTurno`, que es el único lugar donde vive esa regla.
+ */
+function anotarRespuestasDeAlma(session, eventos) {
+  if (!session.alma) return;
+  for (const ev of eventos) {
+    if (ev.event !== 'result') continue;
+    almas.consolidar.agregarTurno(session.transcripcion, { rol: 'alma', texto: ev.result && ev.result.response });
+  }
+}
+
+/**
+ * FEAT-044 — Los turnos que cerraron pero que el loop no llegó a drenar. Pasa
+ * cuando `stop` llega enseguida del último "chau", o con un Ctrl+C: sin esto,
+ * la última respuesta del alma no entraría en la transcripción.
+ */
+function absorberPendientes(session) {
+  anotarRespuestasDeAlma(session, session.events.slice(session.cursor));
+}
+
+/**
+ * FEAT-044 — Al cerrar: vuelca la transcripción y lanza el consolidador
+ * DESACOPLADO. No se espera nada (`stop` tiene que volver al instante) y el
+ * proceso sobrevive a la muerte de este servidor, que el loop de Python mata al
+ * salir. Ruta absoluta con `__dirname`: la sesión corre con el cwd del proyecto
+ * del usuario. Nada de esto puede impedir que la sesión se detenga.
+ */
+function cerrarConAlma(session) {
+  if (!session.alma) return false;
+  const { consolidar } = almas;
+  try {
+    absorberPendientes(session);
+    if (consolidar.cuentaTurnosUsuario(session.transcripcion) < consolidar.MIN_TURNOS_USUARIO) return false;
+    const archivo = consolidar.volcar({
+      clave: session.alma.clave,
+      streamId: session.id,
+      turnos: session.transcripcion
+    });
+    const hijo = spawn(process.execPath, [path.join(__dirname, 'almas', 'consolidar.js'), archivo], {
+      detached: true,
+      stdio: 'ignore',
+      env: process.env
+    });
+    hijo.unref();
+    return true;
+  } catch (err) {
+    process.stderr.write(`[antigravity-mcp] No se pudo lanzar la consolidación de ${session.alma.clave}: ${err.message}\n`);
+    return false;
+  }
 }
 
 function stopVoiceStreamSession(session) {
@@ -3750,6 +3829,21 @@ async function handleToolCall(name, args) {
           await new Promise((r) => setTimeout(r, 50));
         }
 
+        // FEAT-044: el alma se resuelve DESPUÉS de lanzar agy, así la lectura de
+        // los archivos y la eventual siembra se solapan con su arranque. Un
+        // problema del alma nunca frena la charla: queda como aviso.
+        let almaNota = '';
+        if (args.alma) {
+          const alma = await almaParaCharla(args.alma, resolveVoiceboxUrl(args, config));
+          if (alma.clave) {
+            session.alma = { clave: alma.clave };
+            session.almaTexto = alma.texto;
+            almaNota = `\n- Alma: \`${alma.clave}\``;
+          } else {
+            almaNota = `\n- Alma: no (${alma.aviso})`;
+          }
+        }
+
         // Priming turn: without this, agy treats spoken questions as coding-agent tasks
         // and can do things like write a plan.md file instead of just answering out loud
         // (verified live 2026-08-30 — a plain "tell me two facts" prompt produced a written
@@ -3760,7 +3854,10 @@ async function handleToolCall(name, args) {
           // Incluye la regla del aviso previo antes de usar herramientas (lib/voice-drain.js).
           // Solo el cwd que paso el llamador: nombrarle a agy como proyecto el
           // process.cwd() de respaldo seria elegir por el usuario (auditoria).
-          const primingText = conDirectorio(session.confirmacion ? PRIMING_CONFIRMACION : PRIMING_CHARLA, args.cwd);
+          const primingText = conAlma(
+            conDirectorio(session.confirmacion ? PRIMING_CONFIRMACION : PRIMING_CHARLA, args.cwd),
+            session.almaTexto
+          );
           try {
             sendVoiceStreamTurn(session, primingText);
             const primingDeadline = Date.now() + 10000;
@@ -3777,7 +3874,7 @@ async function handleToolCall(name, args) {
         return {
           content: [{
             type: 'text',
-            text: `Voice stream session started.\n- stream_id: \`${session.id}\`\n- conversation_id: \`${session.conversationId || 'pending'}\`\n- Model: \`${effectiveModel || 'default'}\` | Effort: \`${effectiveEffort}\` | Mode: \`${effectiveMode}\` | Skip permissions: \`${skip}\` | Confirmación: \`${confirmacion ? 'activa' : 'no'}\`\n- Status: \`${session.status}\`${prewarmNote}${primingNote}\n\nUse \`action: "send"\` with this stream_id to send a turn, then poll \`action: "drain"\` to read incremental text_delta events as they arrive.`
+            text: `Voice stream session started.\n- stream_id: \`${session.id}\`\n- conversation_id: \`${session.conversationId || 'pending'}\`\n- Model: \`${effectiveModel || 'default'}\` | Effort: \`${effectiveEffort}\` | Mode: \`${effectiveMode}\` | Skip permissions: \`${skip}\` | Confirmación: \`${confirmacion ? 'activa' : 'no'}\`\n- Status: \`${session.status}\`${prewarmNote}${almaNota}${primingNote}\n\nUse \`action: "send"\` with this stream_id to send a turn, then poll \`action: "drain"\` to read incremental text_delta events as they arrive.`
           }]
         };
       }
@@ -3813,6 +3910,7 @@ async function handleToolCall(name, args) {
         } catch (err) {
           return { isError: true, content: [{ type: 'text', text: err.message }] };
         }
+        if (session.alma) almas.consolidar.agregarTurno(session.transcripcion, { rol: 'usuario', texto: args.text });
         return {
           content: [{ type: 'text', text: `Turn sent to session \`${session.id}\`. Poll \`action: "drain"\` to receive text_delta events as they stream in.` }]
         };
@@ -3825,6 +3923,8 @@ async function handleToolCall(name, args) {
         // (short replies like "OK") and when a tool step starts, so a spoken
         // heads-up before a web search is not held until the search ends.
         const { sentences, deltas, herramientas, detalles, negadas, escrituras, resultEvent } = procesarEventosDrain(events, session.chunker, session.drainEstado || (session.drainEstado = {}));
+
+        anotarRespuestasDeAlma(session, events);
 
         // Charla con freno: las negadas se juntan por turno y, al cerrarlo,
         // quedan pendientes de un `confirm`. El cierre de una ejecucion
@@ -3941,9 +4041,15 @@ async function handleToolCall(name, args) {
       }
 
       if (action === 'stop') {
+        const consolidando = cerrarConAlma(session);
         stopVoiceStreamSession(session);
         voiceStreamSessions.delete(session.id);
-        return { content: [{ type: 'text', text: `Voice stream session \`${session.id}\` stopped.` }] };
+        return {
+          content: [{
+            type: 'text',
+            text: `Voice stream session \`${session.id}\` stopped.${consolidando ? ' Consolidación de memoria lanzada en segundo plano.' : ''}`
+          }]
+        };
       }
 
       return { isError: true, content: [{ type: 'text', text: `Unknown action "${action}" for agy_voice_stream.` }] };
@@ -5439,6 +5545,29 @@ rl.on('line', async (line) => {
       }
     });
   }
+});
+
+/**
+ * FEAT-044 — El cliente cerró stdin: no va a llegar ningún `stop`.
+ *
+ * Pasó en la primera prueba en vivo: un Ctrl+C en la consola le llega a TODO el
+ * grupo de procesos, así que este servidor moría antes de que el `finally` del
+ * loop de Python pudiera pedir el `stop`, y la transcripción de la charla —que
+ * vive en memoria— se perdía entera. Los loops ahora lo lanzan en su propio
+ * grupo (`voice-chat/common.py`), pero esto es la red de abajo: cualquier
+ * cliente que cierre la tubería sin despedirse deja igual su charla consolidada.
+ */
+rl.on('close', () => {
+  for (const session of voiceStreamSessions.values()) {
+    try {
+      cerrarConAlma(session);
+      stopVoiceStreamSession(session);
+    } catch (err) {
+      process.stderr.write(`[antigravity-mcp] Error cerrando la sesión ${session.id}: ${err.message}\n`);
+    }
+  }
+  voiceStreamSessions.clear();
+  process.exit(0);
 });
 
 process.stderr.write(`[antigravity-mcp] Server started, binary: ${AGY_BIN}\n`);

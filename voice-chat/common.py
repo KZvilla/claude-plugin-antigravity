@@ -148,10 +148,16 @@ class McpClient:
     el mismo protocolo y el mismo binario que usa Claude Code."""
 
     def __init__(self):
+        # En su propio grupo de procesos: un Ctrl+C en la consola le llega a
+        # TODO el grupo, y el servidor moria antes de que el `finally` del loop
+        # pudiera pedirle el `stop` -- con el se perdia la transcripcion de la
+        # charla, que vive en memoria (FEAT-044, visto en la primera prueba en
+        # vivo). Igual lo cerramos nosotros en close().
+        extra = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
         self.proc = subprocess.Popen(
             ["node", MCP_SERVER],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            cwd=REPO_ROOT, text=True, encoding="utf-8", bufsize=1
+            cwd=REPO_ROOT, text=True, encoding="utf-8", bufsize=1, **extra
         )
         self._next_id = 1
         self._lock = threading.Lock()
@@ -202,6 +208,14 @@ class McpClient:
     def close(self):
         try:
             self.proc.stdin.close()
+        except Exception:
+            pass
+        # Al cerrarse stdin, el servidor consolida las charlas que hayan quedado
+        # abiertas y sale solo. Se le dan unos segundos antes de matarlo: un
+        # terminate() inmediato podia cortarlo justo ahi (FEAT-044).
+        try:
+            self.proc.wait(timeout=5)
+            return
         except Exception:
             pass
         try:

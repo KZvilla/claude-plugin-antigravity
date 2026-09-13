@@ -283,7 +283,11 @@ def main():
     print("[voice-loop] Iniciando sesion agy_voice_stream" +
           (" (con pre-warm de Voicebox en paralelo)" if is_qwen_engine and proveedor == "voicebox" else "") + "...")
     # cwd: sin el, agy corre los comandos en su scratch/ y no en el proyecto.
+    # alma: la charla arranca con la identidad y la memoria de esta voz, y al
+    # cerrar consolida lo que aprendio (FEAT-044). El nombre del perfil es la
+    # misma clave que usan las narraciones, asi que comparten alma.
     start_args = {"action": "start", "effort": args.effort, "confirmacion": True, "cwd": os.getcwd(),
+                  "alma": profile["name"],
                   "prewarm_voicebox": is_qwen_engine and proveedor == "voicebox"}
     if is_qwen_engine:
         start_args["voicebox_model_size"] = model_size or "1.7B"

@@ -17,5 +17,6 @@ module.exports = {
   contexto: require('./contexto.js'),
   bloque: require('./bloque.js'),
   hilos: require('./hilos.js'),
-  charla: require('./charla.js')
+  charla: require('./charla.js'),
+  consolidar: require('./consolidar.js')
 };

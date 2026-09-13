@@ -36,7 +36,11 @@ function armarPrompt({ clave, mensaje, hilo, env }) {
   return `${ctx}\n\n---\n\n${mensaje}\n${cierre}`;
 }
 
-/** Las operaciones van por archivo: `recuerdos.aplicar` trabaja sobre uno por llamada. */
+/**
+ * Las operaciones van por archivo: `recuerdos.aplicar` trabaja sobre uno por
+ * llamada. Lo comparte la consolidación de la charla de voz (`consolidar.js`):
+ * es el mismo reparto entre `memoria.md` y `usuario.md`, con los mismos topes.
+ */
 function aplicarOperaciones(clave, operaciones, env) {
   const aplicadas = [];
   const rechazadas = [];
@@ -126,4 +130,4 @@ async function charlar({ clave, texto, agyBin, ejecutar, homeDir = os.homedir(),
   return { ...base, ok: true, respuesta: respuesta || '(se quedó sin palabras)', aplicadas, rechazadas };
 }
 
-module.exports = { charlar, armarPrompt };
+module.exports = { charlar, armarPrompt, aplicarOperaciones };
