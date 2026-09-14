@@ -605,6 +605,12 @@ const LOCAL_READ_ONLY_TOOL_ANNOTATIONS = Object.freeze({
   idempotentHint: true,
   openWorldHint: false
 });
+const OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS = Object.freeze({
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true
+});
 
 const TOOLS = [
   {
@@ -701,6 +707,7 @@ const TOOLS = [
   {
     name: 'agy_plan',
     description: 'Ask Antigravity to analyze the codebase and generate an architectural or implementation plan without executing modifications (enforces read-only policy).',
+    annotations: OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
       properties: {
@@ -737,6 +744,7 @@ const TOOLS = [
   {
     name: 'agy_review',
     description: 'Ask Antigravity to perform an adversarial or complementary code review of recent changes, diffs, or specific files against guidelines and best practices (enforces read-only policy).',
+    annotations: OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
       properties: {
@@ -777,6 +785,7 @@ const TOOLS = [
   {
     name: 'agy_audit',
     description: 'Run a skeptical, evidence-based adversarial audit via Antigravity. Two modes: (1) "implementation" — verify an implementation against a plan/spec/ticket, (2) "plan" — verify a proposed plan against the real codebase. Uses structured severity rubric (BLOCKER/MAJOR/MINOR/NOTE) and deterministic verdicts (FAIL/PASS WITH RESERVATIONS/PASS). Much more rigorous and heavyweight than agy_review. Default timeout: 25 minutes.',
+    annotations: OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
       properties: {
@@ -822,6 +831,7 @@ const TOOLS = [
   {
     name: 'agy_research',
     description: 'Delegate deep web research to Antigravity, which uses Gemini\'s native search tools. Returns a structured report with an executive summary, numbered key findings, cited source URLs, and relevance to the current project. Read-only: never edits files. Requires the "network" capability — fails with an explicit error if network access is denied by the permission policy, rather than answering from the model\'s memory.',
+    annotations: OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
       properties: {
