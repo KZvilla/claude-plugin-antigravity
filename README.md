@@ -922,8 +922,8 @@ Use a new thread after installation. Skills refer to semantic tool names such as
 | Planning, implementation, review, audit and research | Full | Full |
 | Persistent agents, fan-out and Almas | Full | Full; effective permissions are verified in the next phase |
 | Explicit speech with `agy_say` and outbound Telegram | Full | Full |
-| `agy_session_summary` | Full | Not supported for the current Codex thread |
-| Automatic checkpoint narration with `agy_narrate` | Full | Not supported; use `agy_say` |
+| `agy_session_summary` | Full | Full after trusting the packaged session hook |
+| Automatic checkpoint narration with `agy_narrate` | Full | Full after trusting the packaged session hook; otherwise use `agy_say` |
 | Fan-out statusline | Full | Not supported |
 | Telegram `/claude` reverse control | Full | Claude Code only |
 | Slash commands | `/lagrange:*` | Not applicable; use skills or semantic tool intent |
@@ -991,9 +991,10 @@ check them against your client's docs.
 - **Config and state stay in `~/.claude/`** (`antigravity.json`, usage, the agent
   registry), even if you never use Claude Code. This is deliberate: one
   directory per client would split the persistent agents' memory.
-- **`agy_session_summary` and `agy_narrate` read Claude Code session logs**
-  (`~/.claude/projects/`). Do not use either as if it understood the active
-  Codex or generic-client session; use host-native handoff and `agy_say`.
+- **`agy_session_summary` and `agy_narrate` need a host session source.** Claude
+  Code uses its project logs; Codex uses the packaged, trusted session hook and
+  fails closed on missing or ambiguous pointers. Generic MCP clients have no
+  adapter, so use their native handoff and `agy_say` there.
 - **The fan-out statusline** relies on Claude Code's `statusLine` contract.
 - **Telegram:** the outbound tools (`telegram_notify`, `telegram_ask`,
   `telegram_send_voice`) work from any client. The bot's `/claude` command

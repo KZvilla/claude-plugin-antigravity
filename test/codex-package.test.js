@@ -38,7 +38,7 @@ async function main() {
     check('Codex declara los hooks de sesión', codex.hooks === './hooks/hooks.json' && Boolean(hooksCodex.hooks?.SessionStart && hooksCodex.hooks?.SessionEnd));
     const hookInicio = hooksCodex.hooks.SessionStart[0].hooks[0];
     check('el hook resuelve PLUGIN_ROOT en ambos shells',
-      hookInicio.command.includes('$PLUGIN_ROOT') && hookInicio.commandWindows.includes('%PLUGIN_ROOT%'),
+      hookInicio.command.includes('$PLUGIN_ROOT') && hookInicio.commandWindows.includes('$env:PLUGIN_ROOT'),
       JSON.stringify(hookInicio));
     check('no hay una copia de skills dentro del overlay', !fs.existsSync(path.join(ROOT, '.codex-plugin', 'skills')));
   });

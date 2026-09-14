@@ -28,9 +28,9 @@ Delegate tasks to Antigravity when:
 3. **Adversarial Code Review / Sanity Check**: After modifying code, ask Antigravity to review the diff against project guidelines (`agy_review`).
 4. **Rigorous Audit with a Blocking Verdict**: When a plain review is not strict enough — verifying an implementation against the plan it was supposed to follow, or a proposed plan against the real codebase (`agy_audit`).
 5. **Second Opinion on Tricky Bugs**: When troubleshooting a puzzling bug or flaky test, delegate an investigation to Antigravity with a fresh perspective.
-6. **Session Documentation & Anti-Compaction (Claude Code only in the MVP)**: Generate a structured markdown summary with `agy_session_summary` only when the active host is Claude Code.
+6. **Session Documentation & Anti-Compaction**: Generate a structured markdown summary with `agy_session_summary` in Claude Code or in Codex when its packaged session hook is trusted.
 7. **Deep Web Research**: When comprehensive live information with cited sources is required (`agy_research`).
-8. **Spoken Status Updates**: Use `agy_say` for explicit text on every host. Automatic checkpoint narration with `agy_narrate` is Claude Code-only in the MVP; `agy_narrate_voices` remains portable.
+8. **Spoken Status Updates**: Use `agy_say` for explicit text on every host. `agy_narrate` can derive a checkpoint from Claude Code or a hook-backed Codex session; `agy_narrate_voices` remains portable.
 9. **Real-Time Voice Conversation**: Backing a live spoken session ("Modo Charla") with a persistent, streaming `agy` process (`agy_voice_stream`). Normally driven by the `voice-chat/` scripts, not called by hand.
 10. **Mobile Notifications & Approvals**: Pushing a notification, asking a blocking question, or sending a voice note to the user's phone (`telegram_notify`, `telegram_ask`, `telegram_send_voice`).
 
@@ -144,13 +144,12 @@ Persist defaults for model, effort, or ALLOW/DENY policies in `~/.claude/antigra
 }
 ```
 
-### 9. `agy_session_summary` (Claude Code only in the MVP)
-Read Claude Code's session JSONL log, preprocess turns to filter noise, and generate a structured markdown summary using Gemini. Solves context compaction degradation.
-
-Do not call this from Codex as a summary of the current thread: the current
-implementation only discovers Claude Code logs and could select unrelated state.
-Use Codex's own handoff/context facilities until the session adapter tracked as
-`FEAT-048` exists.
+### 9. `agy_session_summary`
+Read the active Claude Code or Codex session JSONL, preprocess turns to filter
+noise, and generate a structured markdown summary using Gemini. Codex requires
+the packaged session hook to be trusted. Its pointer is matched by working
+directory and, when needed, `session_id`; missing, mismatched, unknown-schema or
+ambiguous state fails closed instead of selecting the newest transcript.
 
 ```json
 {
@@ -159,13 +158,13 @@ Use Codex's own handoff/context facilities until the session adapter tracked as
   "effort": "high"
 }
 ```
-Available focuses: `"full"`, `"decisions"`, `"changes"`, `"debugging"`. Summaries are saved to `~/.claude/session-summaries/<date>-<session-id>.md`.
+Available focuses: `"full"`, `"decisions"`, `"changes"`, `"debugging"`, `"handoff"`. Summaries are saved to `~/.claude/session-summaries/<date>-<session-id>.md`.
 
 ### 10. `agy_narrate` / `agy_say` / `agy_narrate_voices`
 
 Two speaking tools, and the difference is **who writes the words**:
 
-- **`agy_narrate` — Claude Code only in the MVP.** It takes no text. The plugin reads Claude Code's session log itself, has Gemini draft a 2-3 sentence update, and sends it to Voicebox. This is the one for "narrate what just happened" / "cuéntame cómo fue" inside Claude Code.
+- **`agy_narrate` — checkpoint from the active session.** It takes no text. The plugin reads the Claude Code log or a hook-backed Codex transcript, has Gemini draft a 2-3 sentence update, and sends it to Voicebox. Use it for "narrate what just happened" / "cuéntame cómo fue" when that session source is available.
 - **`agy_say` — you already have the exact message.** Pass it in `text`. Use it for anything you composed yourself: a heads-up, an answer, a warning, a line the user dictated.
 
 Picking the wrong one is the common failure: calling `agy_narrate` when the user asked you to say a *specific* sentence makes it ignore that sentence entirely and narrate the session instead.
@@ -176,8 +175,9 @@ Picking the wrong one is the common failure: calling `agy_narrate` when the user
 
 For both: pass `voice`/`language` when the user names one ("narralo con Diego"); `send_telegram` is on by default so the voice note also reaches their phone, and `local_playback` is off by default so nothing startles anyone.
 
-In Codex, never substitute `agy_narrate` for a current-thread update. Compose the
-short update in the host and pass it to `agy_say`.
+In Codex, a missing/untrusted hook or ambiguous session makes `agy_narrate` fail
+closed. In that case, compose the short update in the host and pass it to
+`agy_say`; do not guess a transcript.
 
 ### 11. `agy_voice_stream`
 Backs the Real-Time Voice Mode ("Modo Charla") by keeping one long-lived streaming `agy` process alive across turns, instead of the blocking one-shot `agy_run` uses. Actions: `start`, `send`, `drain`, `status`, `stop`.

@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { recordCodexSession, resolveSessionSource } = require('../mcp-server/session-source.js');
+const { inferPluginDataDir, recordCodexSession, resolveSessionSource } = require('../mcp-server/session-source.js');
 const { preprocessSessionLog } = require('../mcp-server/session-log.js');
 const { extractLastCheckpoint } = require('../mcp-server/checkpoint.js');
 
@@ -80,6 +80,10 @@ source = resolveSessionSource({ cwd, env: emptyEnv });
 check('Codex no cae silenciosamente en el último log Claude', source.codex === true && /trust/.test(source.error || ''), JSON.stringify(source));
 const skipped = recordCodexSession({ session_id: firstId, transcript_path: firstLog, cwd }, { PLUGIN_DATA: data });
 check('el hook es no-op fuera de Codex', skipped.skipped === true, JSON.stringify(skipped));
+const fakeCache = path.join(root, '.codex', 'plugins', 'cache', 'market', 'lagrange', '1.0.0');
+check('el MCP infiere el data dir desde una copia cacheada',
+  inferPluginDataDir(fakeCache) === path.join(root, '.codex', 'plugins', 'data', 'lagrange-market'),
+  inferPluginDataDir(fakeCache));
 
 console.log(`\n${passed}/${passed + failed} checks passed`);
 process.exit(failed ? 1 : 0);

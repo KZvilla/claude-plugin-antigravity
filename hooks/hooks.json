@@ -8,7 +8,7 @@
           {
             "type": "command",
             "command": "node \"$PLUGIN_ROOT/hooks/codex-session-pointer.js\"",
-            "commandWindows": "node \"%PLUGIN_ROOT%\\hooks\\codex-session-pointer.js\"",
+            "commandWindows": "node \"$env:PLUGIN_ROOT\\hooks\\codex-session-pointer.js\"",
             "timeout": 5,
             "statusMessage": "Registering Lagrange session source"
           }
@@ -21,7 +21,7 @@
           {
             "type": "command",
             "command": "node \"$PLUGIN_ROOT/hooks/codex-session-pointer.js\"",
-            "commandWindows": "node \"%PLUGIN_ROOT%\\hooks\\codex-session-pointer.js\"",
+            "commandWindows": "node \"$env:PLUGIN_ROOT\\hooks\\codex-session-pointer.js\"",
             "timeout": 3
           }
         ]

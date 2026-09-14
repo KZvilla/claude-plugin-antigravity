@@ -1,20 +1,22 @@
 ---
 name: session-summary
-description: '[skill, loads itself] Claude Code-only background knowledge for session summaries; Claude Code exposes /lagrange:summary as the explicit trigger. Use this skill only in Claude Code when the user wants to summarize its session, preserve context before compaction, or generate a handoff document. In other hosts, use their native handoff/context facilities instead.'
+description: '[skill, loads itself] Host-aware background knowledge for Lagrange session summaries in Claude Code and Codex. Use when the user wants to summarize the active session, preserve context before compaction, or generate a handoff document. Codex requires the packaged session hook to be trusted; unsupported hosts should use their native handoff facilities.'
 user-invocable: false
 ---
 
 # Session Summary Skill
 
-This skill teaches Claude Code how to generate structured summaries of development sessions by delegating to Antigravity (Gemini).
+This skill teaches Claude Code and Codex how to generate structured summaries of development sessions by delegating to Antigravity (Gemini).
 
-## Platform boundary — mandatory
+## Host boundary — mandatory
 
-This skill is **Claude Code only in the current MVP**. `agy_session_summary`
-discovers Claude Code JSONL logs under `~/.claude/projects/`; it does not yet
-identify the active Codex thread. In Codex or another host, do not call it as a
-summary of the current session and do not guess a transcript. Use that host's
-native summary/handoff mechanism until the `FEAT-048` session adapter exists.
+`agy_session_summary` supports Claude Code by discovering its project JSONL and
+supports Codex through the packaged `SessionStart`/`SessionEnd` hook. In Codex,
+the hook must be trusted so it can register the exact session ID, transcript and
+working directory under plugin data. The resolver fails closed when the pointer
+is missing, the schema is unknown, or concurrent sessions are ambiguous; never
+guess the most recent transcript. If resolution fails, use the host's native
+handoff mechanism. Other MCP hosts do not have a session adapter.
 
 ## Why This Exists
 
@@ -35,7 +37,7 @@ Claude Code's context window compaction is lossy — it discards details, interm
 
 ## How to Use
 
-### Basic (summarize current session)
+### Basic in Claude Code (summarize current session)
 ```
 /lagrange:summary
 ```
@@ -121,6 +123,11 @@ accuses, and does it in convincing prose.
 }
 ```
 
+Codex invokes this MCP tool directly. Omit `session_id` when exactly one active
+session matches `cwd`; pass the thread UUID when multiple sessions share that
+directory. A hook-trust or ambiguity error is a real stop condition, not a cue
+to search for another transcript.
+
 ## Output Location
 
 Summaries are saved to `~/.claude/session-summaries/<date>-<session-id-short>.md` by default.
@@ -135,7 +142,8 @@ date: "2026-08-28"
 start_time: "2026-08-28T10:00:00Z"
 end_time: "2026-08-28T14:30:00Z"
 summarized_by: "antigravity-mcp"
-claude_version: "2.1.241"
+host: "codex"
+host_version: "0.154.0"
 ---
 ```
 
@@ -143,7 +151,9 @@ claude_version: "2.1.241"
 
 If you detect that the user's session has been long and productive (many tool calls, multiple files modified), consider suggesting:
 
-> "This has been a productive session. Want me to generate a summary before we wrap up? Run `/lagrange:summary` to save a structured record."
+> "This has been a productive session. Want me to generate a structured summary before we wrap up?"
+
+Use `/lagrange:summary` in Claude Code or call `agy_session_summary` in Codex.
 
 ## Size Handling
 

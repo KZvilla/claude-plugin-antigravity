@@ -15,13 +15,30 @@ function canonical(value) {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
-function pluginDataDir(env = process.env) {
-  const value = env.PLUGIN_DATA || env.CLAUDE_PLUGIN_DATA;
-  return value && path.isAbsolute(value) ? path.resolve(value) : null;
+function inferPluginDataDir(pluginRoot = path.resolve(__dirname, '..')) {
+  const resolved = path.resolve(pluginRoot);
+  const parts = resolved.split(path.sep);
+  for (let index = parts.length - 5; index >= 0; index--) {
+    if (parts[index].toLowerCase() !== 'plugins' || parts[index + 1]?.toLowerCase() !== 'cache') continue;
+    const marketplace = parts[index + 2];
+    const plugin = parts[index + 3];
+    const version = parts[index + 4];
+    if (!marketplace || !plugin || !version || index + 5 !== parts.length) continue;
+    const pluginsRoot = parts.slice(0, index + 1).join(path.sep) || path.parse(resolved).root;
+    const dataRoot = path.resolve(pluginsRoot, 'data');
+    const candidate = path.resolve(dataRoot, `${plugin}-${marketplace}`);
+    if (candidate.startsWith(dataRoot + path.sep)) return candidate;
+  }
+  return null;
 }
 
-function pointerDirectory(env = process.env) {
-  const root = pluginDataDir(env);
+function pluginDataDir(env = process.env, pluginRoot) {
+  const value = env.PLUGIN_DATA || env.CLAUDE_PLUGIN_DATA;
+  return value && path.isAbsolute(value) ? path.resolve(value) : inferPluginDataDir(pluginRoot);
+}
+
+function pointerDirectory(env = process.env, pluginRoot) {
+  const root = pluginDataDir(env, pluginRoot);
   return root ? path.join(root, POINTER_DIR) : null;
 }
 
@@ -128,7 +145,7 @@ function findClaudeSessionFile(logDir, sessionId) {
 
 function resolveSessionSource({ cwd, sessionId, env = process.env }) {
   const wantedCwd = canonical(cwd || process.cwd());
-  const codexHost = Boolean(env.PLUGIN_ROOT);
+  const codexHost = Boolean(env.PLUGIN_ROOT || inferPluginDataDir());
   const safeId = sessionId ? safeSessionId(sessionId) : null;
   if (sessionId && !safeId) return { error: 'Invalid session_id.' };
   const codex = listCodexPointers(env).filter(pointer => canonical(pointer.cwd) === wantedCwd);
@@ -175,6 +192,7 @@ module.exports = {
   POINTER_VERSION,
   findClaudeSessionFile,
   getProjectLogDir,
+  inferPluginDataDir,
   listCodexPointers,
   pluginDataDir,
   readPointer,

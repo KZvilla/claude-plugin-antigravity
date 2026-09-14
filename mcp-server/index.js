@@ -1693,7 +1693,7 @@ function saveSummary(content, sessionId, sessionMeta, outputPath, cwd = process.
   }
 
   // Build frontmatter
-  const frontmatter = [
+  const frontmatterLines = [
     '---',
     `session_id: "${sessionId || 'unknown'}"`,
     `host: "${sessionMeta.host || 'claude'}"`,
@@ -1703,10 +1703,17 @@ function saveSummary(content, sessionId, sessionMeta, outputPath, cwd = process.
     `start_time: "${sessionMeta.startTime || 'unknown'}"`,
     `end_time: "${sessionMeta.endTime || 'unknown'}"`,
     `summarized_by: "antigravity-mcp"`,
-    `host_version: "${sessionMeta.version || 'unknown'}"`,
+    `host_version: "${sessionMeta.version || 'unknown'}"`
+  ];
+  // Preserve the legacy field for Claude consumers while adding host-neutral metadata.
+  if (!sessionMeta.host || sessionMeta.host === 'claude') {
+    frontmatterLines.push(`claude_version: "${sessionMeta.version || 'unknown'}"`);
+  }
+  frontmatterLines.push(
     '---',
     ''
-  ].join('\n');
+  );
+  const frontmatter = frontmatterLines.join('\n');
 
   const fullContent = frontmatter + content;
 
