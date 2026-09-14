@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: "[skill, loads itself] Background knowledge for running several Antigravity subagents concurrently, each confined to its own git worktree; /lagrange:fanout is the explicit trigger. Use when a plan is already broken into atomic tasks and the user wants them implemented in parallel, or mentions fan-out, subagentes concurrentes, paralelizar tareas, worktrees por subagente, or asks to split implementation work across several agy instances. Covers the disjointness contract, the branch and worktree conventions, what --sandbox actually does, and why auditing and testing must stay with Claude."
+description: "[skill, loads itself] Background knowledge for running several Antigravity subagents concurrently, each confined to its own git worktree; agy_fanout is the semantic trigger. Use when a plan is already broken into atomic tasks and the user wants them implemented in parallel, or mentions fan-out, subagentes concurrentes, paralelizar tareas, worktrees por subagente, or asks to split implementation work across several agy instances. Covers the disjointness contract, branch and worktree conventions, what --sandbox actually does, and why auditing and testing stay with the host agent."
 user-invocable: false
 ---
 
@@ -84,7 +84,7 @@ frontera es deliberada.
 4. **Cribar** con `agy_review` en paralelo sobre cada diff. Es read-only y
    barato; sirve de primer filtro para no saturar tu contexto con N diffs.
 5. **Auditar** vos lo que el filtro marque, más el diff completo de lo crítico.
-   Para una auditoría hostil, `/lagrange:audit`.
+   Para una auditoría hostil, usá `agy_audit`.
 6. **Corregir** reanudando con `conversation_id`. Máximo dos rondas; agotadas,
    la tarea la tomás vos. Sin tope se entra en un bucle caro.
 7. **Testear vos.** Los subagentes tienen prohibido escribir y correr tests.
@@ -95,10 +95,12 @@ frontera es deliberada.
    pendiente; los que conservan commits sin mergear se preservan y se informan.
 
 El paso 2 es una única llamada MCP bloqueante — puede tardar 15+ minutos sin
-ninguna señal intermedia. Con `/lagrange:setup` (track E) se puede activar una
+ninguna señal intermedia. Claude Code puede activar desde el track E de la skill
+`setup` una
 línea de progreso en la statusline (`🔀 fanout <slug>: 3/5 ok · 1
 reintentando(429) · 1 corriendo`) mientras corre, sin esperar a que termine el
-lote entero.
+lote entero. Esa statusline es Claude Code-only en el MVP; no se anuncia en
+Codex.
 
 ---
 
@@ -122,4 +124,4 @@ mismo.
   no se amortiza. Usá `agy_run` directo.
 - **Trabajo exploratorio.** El fan-out asume un plan ya cerrado. Si todavía no
   sabés qué archivos toca cada parte, no está descompuesto: usá
-  `/lagrange:plan` primero.
+  `agy_plan` primero.

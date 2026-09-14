@@ -1,4 +1,4 @@
-# Antigravity Claude Code Plugin
+# Lagrange — Antigravity for Claude Code and Codex
 
 ![Version](https://img.shields.io/github/package-json/v/KZvilla/claude-plugin-antigravity?color=blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)
@@ -6,9 +6,9 @@
 ![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 
-A Claude Code plugin that integrates **Google Antigravity CLI (`agy`)** as an autonomous subagent and pair-programming partner.
+A dual-host plugin that integrates **Google Antigravity CLI (`agy`)** with Claude Code and OpenAI Codex as an autonomous subagent and pair-programming partner.
 
-Delegate deep reasoning, architectural planning, TDD implementation, adversarial code reviews, session documentation, and cited web research to Antigravity — running directly in your terminal, orchestrated by Claude.
+Delegate deep reasoning, architectural planning, TDD implementation, adversarial code reviews and cited web research to Antigravity, running directly in your terminal. Claude Code remains fully supported; Codex uses the same skills and MCP server through its native plugin manifest.
 
 ---
 
@@ -32,12 +32,14 @@ Delegate deep reasoning, architectural planning, TDD implementation, adversarial
 - [Deep Web Research (`/lagrange:research`)](#-deep-web-research-lagrangeresearch)
 - [Components](#-components)
 - [Installation & Setup](#-installation--setup)
-- [Other MCP Clients (opencode, Codex)](#other-mcp-clients)
+- [Codex and Other MCP Clients](#codex-and-other-mcp-clients)
 - [Telegram Bridge & Remote Control](#-telegram-bridge-setup-manual--never-automated)
 
 ---
 
 ## ⚡ Quick Start
+
+### Claude Code
 
 **1. Install** - two commands inside Claude Code, any platform:
 
@@ -75,6 +77,22 @@ at startup - a restart is what makes `agy_run` and friends appear.
 ```text
 /lagrange:usage
 ```
+
+### Codex
+
+Until the first dual-host release is tagged, install from a local clone:
+
+```bash
+git clone https://github.com/KZvilla/claude-plugin-antigravity.git
+codex plugin marketplace add /absolute/path/to/claude-plugin-antigravity
+codex plugin add lagrange@kzvilla-lagrange-codex
+```
+
+Start a new Codex thread after installing so it discovers the plugin's skills
+and MCP tools. Ask it to use `$agy-cli` or describe the delegation in natural
+language; Claude-only `/lagrange:*` commands do not apply in Codex. The plugin
+keeps its current state under `~/.claude/` during the MVP so Claude Code and
+Codex do not split agent memory or configuration.
 
 ---
 
@@ -869,19 +887,53 @@ claude plugin list
 claude plugin details lagrange@kzvilla-lagrange
 ```
 
-### Other MCP Clients
+### Codex and Other MCP Clients
 
 The MCP server is plain JSON-RPC over stdio: it does not depend on Claude Code
-and reads no `CLAUDE_*` variable. What ties it to Claude Code is only how it is
-registered (`.mcp.json` points at `${CLAUDE_PLUGIN_ROOT}`). Any MCP client can
-run it with `node` and the **absolute path** to `mcp-server/index.js` in a clone:
+and reads no `CLAUDE_*` variable. Claude registers it through `.mcp.json` and
+`${CLAUDE_PLUGIN_ROOT}`; Codex uses `.codex-plugin/plugin.json` and
+a relative working directory that its plugin loader resolves against the
+installed plugin root. Both launch the same `mcp-server/index.js`.
+
+#### Native Codex plugin
+
+This repository includes a native Codex manifest, the five shared skills and a
+repo-local marketplace. The local installation flow, verified with Codex CLI
+0.154.0, is:
 
 ```bash
 git clone https://github.com/KZvilla/claude-plugin-antigravity.git
+codex plugin marketplace add /absolute/path/to/claude-plugin-antigravity
+codex plugin add lagrange@kzvilla-lagrange-codex
 ```
 
-The server has **no npm dependencies**, so no `npm install` is needed for it.
-The Telegram bridge does need one (`npm install --prefix telegram-bridge`).
+For a tagged release, Codex also accepts a Git marketplace source:
+
+```bash
+codex plugin marketplace add KZvilla/claude-plugin-antigravity --ref <release-tag>
+codex plugin add lagrange@kzvilla-lagrange-codex
+```
+
+Use a new thread after installation. Skills refer to semantic tool names such as
+`agy_plan` and `agy_run`; Codex resolves the host-specific MCP namespace.
+
+| Capability | Claude Code | Codex MVP |
+|---|---:|---:|
+| Planning, implementation, review, audit and research | Full | Full |
+| Persistent agents, fan-out and Almas | Full | Full; effective permissions are verified in the next phase |
+| Explicit speech with `agy_say` and outbound Telegram | Full | Full |
+| `agy_session_summary` | Full | Not supported for the current Codex thread |
+| Automatic checkpoint narration with `agy_narrate` | Full | Not supported; use `agy_say` |
+| Fan-out statusline | Full | Not supported |
+| Telegram `/claude` reverse control | Full | Claude Code only |
+| Slash commands | `/lagrange:*` | Not applicable; use skills or semantic tool intent |
+
+#### Generic MCP clients
+
+Any other MCP client can run the server with `node` and the **absolute path**
+to `mcp-server/index.js` in a clone. The server has **no npm dependencies**, so
+no `npm install` is needed for it. The Telegram bridge does need one
+(`npm install --prefix telegram-bridge`).
 
 **opencode** (`opencode.json`):
 
@@ -919,14 +971,6 @@ Because opencode namespaces MCP tools by server name, the ported commands,
 subagent and skills use `lagrange_<tool>` names (e.g. `lagrange_agy_run`) instead
 of Claude Code's `mcp__lagrange__agy_run`.
 
-**Codex** (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.lagrange]
-command = "node"
-args = ["/abs/path/claude-plugin-antigravity/mcp-server/index.js"]
-```
-
 **Clients with an `mcpServers` block:**
 
 ```json
@@ -936,28 +980,29 @@ args = ["/abs/path/claude-plugin-antigravity/mcp-server/index.js"]
 These formats belong to each client and change more often than this README:
 check them against your client's docs.
 
-**What works:** every MCP tool (`agy_*`, `cast_agent`, `telegram_*`), the same
-as in Claude Code. `agy` has to be installed either way.
+**What works in generic clients:** every MCP tool (`agy_*`, `cast_agent`,
+`telegram_*`). `agy` has to be installed either way.
 
 **What does not carry over:**
 
-- **Slash commands and skills** (`/lagrange:*`) are Claude Code features with no
-  automatic port to arbitrary clients. opencode is covered by the `.opencode/`
-  integration above; in any other client you call the tools directly.
+- **Slash commands** (`/lagrange:*`) remain Claude Code-specific. Codex loads
+  the shared `skills/**` directly; opencode is covered by its `.opencode/`
+  integration; generic clients call the tools directly.
 - **Config and state stay in `~/.claude/`** (`antigravity.json`, usage, the agent
   registry), even if you never use Claude Code. This is deliberate: one
   directory per client would split the persistent agents' memory.
 - **`agy_session_summary` and `agy_narrate` read Claude Code session logs**
-  (`~/.claude/projects/`). Elsewhere the summary has nothing to read, and the
-  narration falls back to a generic checkpoint.
+  (`~/.claude/projects/`). Do not use either as if it understood the active
+  Codex or generic-client session; use host-native handoff and `agy_say`.
 - **The fan-out statusline** relies on Claude Code's `statusLine` contract.
 - **Telegram:** the outbound tools (`telegram_notify`, `telegram_ask`,
   `telegram_send_voice`) work from any client. The bot's `/claude` command
   (Remote Control) launches Claude Code only.
 - **`agy_fanout` creates `.claude/worktrees/` in your repo.** Add `.claude/` to
   your `.gitignore`.
-- **Tool descriptions still mention Claude and `.claude/antigravity.json`**, so the
-  model in another client will read those names.
+- **Host-specific names remain only where they are real contracts**, notably
+  the temporary `~/.claude/` state namespace and Claude session/statusline
+  integrations.
 
 ### 🔐 Telegram Bridge Setup (Manual — Never Automated)
 

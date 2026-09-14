@@ -1,12 +1,20 @@
 ---
 name: session-summary
-description: '[skill, loads itself] Background knowledge for session summaries; /lagrange:summary is the explicit trigger. Use this skill when the user wants to create a session summary, document what was done in a session, preserve context before compaction, generate a handoff document, or mentions "summarize session", "session summary", "what did we do", "document this session", or "save session notes".'
+description: '[skill, loads itself] Claude Code-only background knowledge for session summaries; Claude Code exposes /lagrange:summary as the explicit trigger. Use this skill only in Claude Code when the user wants to summarize its session, preserve context before compaction, or generate a handoff document. In other hosts, use their native handoff/context facilities instead.'
 user-invocable: false
 ---
 
 # Session Summary Skill
 
 This skill teaches Claude Code how to generate structured summaries of development sessions by delegating to Antigravity (Gemini).
+
+## Platform boundary — mandatory
+
+This skill is **Claude Code only in the current MVP**. `agy_session_summary`
+discovers Claude Code JSONL logs under `~/.claude/projects/`; it does not yet
+identify the active Codex thread. In Codex or another host, do not call it as a
+summary of the current session and do not guess a transcript. Use that host's
+native summary/handoff mechanism until the `FEAT-048` session adapter exists.
 
 ## Why This Exists
 

@@ -50,4 +50,7 @@ state.json
 
 # Agent rules & workspace customizations (excluded from repo)
 AGENTS.md
-.agents/
+.agents/*
+!.agents/plugins/
+.agents/plugins/*
+!.agents/plugins/marketplace.json

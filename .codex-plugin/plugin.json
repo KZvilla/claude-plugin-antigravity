@@ -1,0 +1,48 @@
+{
+  "name": "lagrange",
+  "version": "0.25.0",
+  "description": "Delegate planning, implementation, adversarial review, research, voice and persistent-agent work to Google Antigravity CLI (agy).",
+  "author": {
+    "name": "KZvilla",
+    "email": "krisvilla93@gmail.com",
+    "url": "https://github.com/KZvilla"
+  },
+  "homepage": "https://github.com/KZvilla/claude-plugin-antigravity",
+  "repository": "https://github.com/KZvilla/claude-plugin-antigravity",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "claude-code",
+    "mcp",
+    "antigravity",
+    "multi-agent"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "lagrange": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "mcp-server/index.js"
+      ],
+      "cwd": "."
+    }
+  },
+  "interface": {
+    "displayName": "Lagrange",
+    "shortDescription": "Delegate complex work to Google Antigravity CLI",
+    "longDescription": "Planning, implementation, adversarial review, research, voice and persistent agents through the local agy CLI.",
+    "developerName": "KZvilla",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Network"
+    ],
+    "websiteURL": "https://github.com/KZvilla/claude-plugin-antigravity",
+    "defaultPrompt": [
+      "Audit this implementation against its plan",
+      "Delegate this task to Antigravity"
+    ]
+  }
+}

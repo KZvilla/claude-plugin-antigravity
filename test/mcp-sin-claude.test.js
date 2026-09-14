@@ -36,9 +36,26 @@ async function main() {
     await group('arranca sin CLAUDE_PLUGIN_ROOT y fuera del repo', async () => {
       const init = await server.initialize();
       check('initialize responde', !!(init.result && init.result.serverInfo), JSON.stringify(init).slice(0, 200));
-      const nombres = (((await server.listTools()).result || {}).tools || []).map((t) => t.name);
+      const tools = (((await server.listTools()).result || {}).tools || []);
+      const nombres = tools.map((t) => t.name);
       for (const t of ['agy_run', 'agy_plan', 'agy_usage', 'cast_agent', 'telegram_notify', 'agy_alma']) {
         check(`tools/list trae ${t}`, nombres.includes(t));
+      }
+      const porNombre = Object.fromEntries(tools.map((t) => [t.name, t]));
+      const soloLecturaLocal = {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      };
+      check('agy_status declara lectura local segura',
+        JSON.stringify(porNombre.agy_status?.annotations) === JSON.stringify(soloLecturaLocal),
+        JSON.stringify(porNombre.agy_status?.annotations));
+      check('telegram_bridge_status declara lectura local segura',
+        JSON.stringify(porNombre.telegram_bridge_status?.annotations) === JSON.stringify(soloLecturaLocal),
+        JSON.stringify(porNombre.telegram_bridge_status?.annotations));
+      for (const nombre of ['agy_run', 'agy_usage', 'agy_set_config', 'agy_voice_stream', 'agy_alma']) {
+        check(`${nombre} no se presenta como solo lectura`, porNombre[nombre]?.annotations?.readOnlyHint !== true);
       }
     });
 

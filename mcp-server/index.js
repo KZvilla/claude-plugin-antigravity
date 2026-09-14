@@ -595,6 +595,17 @@ const READONLY_PERMISSIONS_SCHEMA = {
 };
 
 // MCP Tool Definitions
+// MCP annotations are a host-neutral security contract. Keep this set narrow:
+// only tools whose implementation performs no writes, starts no persistent
+// service and contacts no external endpoint may use it. Mixed-action tools
+// stay unannotated so clients conservatively request approval.
+const LOCAL_READ_ONLY_TOOL_ANNOTATIONS = Object.freeze({
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false
+});
+
 const TOOLS = [
   {
     name: 'agy_run',
@@ -873,6 +884,7 @@ const TOOLS = [
   {
     name: 'agy_status',
     description: 'Check the status, version, active model/effort/timeout defaults, ALLOW/DENY permission policies, and binary path of Antigravity CLI.',
+    annotations: LOCAL_READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
       properties: {}
@@ -1276,6 +1288,7 @@ const TOOLS = [
   {
     name: 'telegram_bridge_status',
     description: 'Diagnose the Telegram bridge: whether the daemon is running, WHICH COPY of the bridge code it runs, where its credentials and shared state resolve to, and whether any of that disagrees with the copy these MCP tools run from. Read-only. Use it when Telegram behaves inconsistently — a notification that reports success but never arrives, a telegram_ask that never unblocks, or behaviour that does not match a change that was just made.',
+    annotations: LOCAL_READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
       properties: {}

@@ -1,6 +1,6 @@
 ---
 name: setup
-description: '[skill, loads itself] Guided setup and troubleshooting for the optional parts of this plugin: the Antigravity CLI itself, local Voicebox TTS, outbound Telegram notifications, the bidirectional Telegram daemon, and live agy_fanout progress in the statusline. /lagrange:setup is the explicit trigger. Use this skill when the user wants to configure, install, connect or fix any of those — or mentions "configurar telegram", "instalar voicebox", "set up the bridge", "no me llegan las notificaciones", "el bot no responde", "how do I get the voice narration working", "quiero ver el progreso del fanout", "trackear subagentes en la statusline", or asks why a Telegram/voice tool is failing.'
+description: '[skill, loads itself] Guided setup and troubleshooting for Antigravity CLI, local Voicebox TTS, Telegram notifications, the bidirectional daemon, and the Claude Code-only fanout statusline. Use when the user wants to configure, install, connect or fix those components. Claude Code also exposes /lagrange:setup; other hosts discover this skill by intent.'
 user-invocable: false
 license: MIT
 ---
@@ -15,11 +15,10 @@ first, then guide only what is actually missing.
 **Never ask the user to paste a bot token, API key, or any other secret into the
 chat, and never write one to disk for them.**
 
-This is not generic caution. In this repository there is a concrete path:
-anything typed in the conversation is stored in Claude Code's session JSONL, and
-`agy_session_summary` reads that raw JSONL and embeds it inside a prompt sent to
-Gemini. A token pasted here can reach a third-party model through the plugin's
-own tooling.
+This is not generic caution. Hosts can persist chat transcripts. In Claude Code
+there is an additional concrete path: `agy_session_summary` reads its raw session
+JSONL and embeds it inside a prompt sent to Gemini. A token pasted into chat can
+therefore reach a third-party model through the plugin's own tooling.
 
 So: tell the user exactly which file to create and which two lines to put in it,
 and let them do it in their editor. Then verify **by effect** — send a test
@@ -39,9 +38,9 @@ dedicated status tool — diagnose it by reading `statusLine.command` directly
 
 | Tool | Tells you |
 |---|---|
-| `mcp__lagrange__agy_status` | `agy` binary path, version, model/effort defaults, permission policy |
-| `mcp__lagrange__agy_narrate_voices` | whether Voicebox is reachable, which voice profiles exist |
-| `mcp__lagrange__telegram_bridge_status` | daemon state, which copy of the code each half runs, the effective `.env` path, shared state |
+| `agy_status` | `agy` binary path, version, model/effort defaults, permission policy |
+| `agy_narrate_voices` | whether Voicebox is reachable, which voice profiles exist |
+| `telegram_bridge_status` | daemon state, which copy of the code each half runs, the effective `.env` path, shared state |
 
 Report a short status of all five tracks, then work only on what is missing.
 
@@ -56,7 +55,7 @@ desktop notifications into registering a background daemon they do not need.
 | **B. Voicebox** | `agy_narrate`, `agy_say`, voice chat | Yes |
 | **C. Telegram outbound** | `telegram_notify`, `telegram_ask`, voice notes to phone | Yes |
 | **D. Telegram daemon** | messaging the bot *from* the phone, answering `telegram_ask` | Yes — and it needs C |
-| **E. Fanout statusline** | seeing `agy_fanout` progress live, without waiting for the whole batch | Yes — only useful if they use `agy_fanout` |
+| **E. Fanout statusline (Claude Code only)** | seeing `agy_fanout` progress live, without waiting for the whole batch | Yes — unavailable in Codex MVP |
 
 Ask which ones they want before walking through anything. If they already said
 ("configurar telegram"), do C, mention D exists, and skip B.
@@ -78,7 +77,7 @@ needs is the app installed and opened **once**, so it downloads the CUDA
 backend and the voice models. If `agy_narrate_voices` reports that no server
 binary was found, that first run is what is missing; if it warns that Voicebox
 runs on CPU, the CUDA backend is. If it reports profiles, the track is done;
-offer `/lagrange:voices` to see them and `/lagrange:narrate` to try one.
+offer `agy_narrate_voices` to inspect them and `agy_say` with a short test line.
 
 GPU memory: `agy_voice_model` (`status`, `pin`, `release`, `unload`) and
 `keep_model: true` on the narration tools keep a voice's model loaded; unpinned
@@ -209,6 +208,10 @@ from their phone. `npm run bridge:daemon` gives the platform-native view, and on
 Linux additionally reports the linger state.
 
 ### Track E — Fanout status in the statusline (optional)
+
+This track is **Claude Code only in the current MVP**. Codex does not consume
+Claude Code's `statusLine.command`; when the active host is Codex, report the
+limitation and skip this track without editing `~/.claude/settings.json`.
 
 `agy_fanout` is a single MCP tool call that can block for 15+ minutes with no
 intermediate feedback. This track makes its progress visible in the
