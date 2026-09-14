@@ -13,6 +13,7 @@
  */
 
 const fs = require('node:fs');
+const { codexAsClaudeObjects, isCodexTranscript, parseCodexSession } = require('./codex-session.js');
 
 // Cuantos turnos de usuario se puede retroceder buscando trabajo que narrar.
 // Con un tope, porque narrar algo de hace media hora como si acabara de pasar
@@ -259,7 +260,9 @@ function extractLastCheckpoint(filePath) {
     throw new Error(`Session log file not found: ${filePath}`);
   }
 
-  const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim());
+  const lines = isCodexTranscript(filePath)
+    ? codexAsClaudeObjects(parseCodexSession(filePath)).map(row => JSON.stringify(row))
+    : fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim());
 
   const userMessages = [];
   for (let i = 0; i < lines.length; i++) {

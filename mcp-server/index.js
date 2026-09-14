@@ -21,6 +21,7 @@ const {
 } = require('./spoken-text.js');
 const { extractLastCheckpoint } = require('./checkpoint.js');
 const { preprocessSessionLog, renderFacts, renderFinalState } = require('./session-log.js');
+const { resolveSessionSource } = require('./session-source.js');
 const { getSummaryPrompt, recuperarDocumentoEnlazado, validarDocumento, separarDigest, MARCA_DIGEST } = require('./summary-doc.js');
 const { executeAgyStdin, executeAgyStreaming } = require('./agy-stream.js');
 const { auditarDocumento, renderAuditoria, renderKeyPoints, getStrictReviewPrompt } = require('./summary-audit.js');
@@ -1020,17 +1021,17 @@ const TOOLS = [
   },
   {
     name: 'agy_session_summary',
-    description: 'Read a Claude Code session log (JSONL) and generate a structured summary document via Gemini. Solves context compaction loss by creating persistent, high-quality session documentation with decisions, changes, problems, and continuation context. The summary is saved as a markdown file for future reference.',
+    description: 'Read the current Claude Code or Codex session log (JSONL) and generate a structured summary document via Gemini. Codex support requires trusting the packaged session hook. Solves context compaction loss by creating persistent, high-quality session documentation with decisions, changes, problems, and continuation context.',
     inputSchema: {
       type: 'object',
       properties: {
         session_id: {
           type: 'string',
-          description: 'UUID of the Claude Code session to summarize. If omitted, uses the most recent session for the current project.'
+          description: 'UUID of the Claude Code or Codex session to summarize. In Codex, pass it when multiple active sessions share a working directory.'
         },
         cwd: {
           type: 'string',
-          description: 'Project working directory. Used to locate the correct session log directory under ~/.claude/projects/.'
+          description: 'Project working directory. Used to resolve the host-specific session source.'
         },
         output_path: {
           type: 'string',
@@ -1154,7 +1155,7 @@ const TOOLS = [
   },
   {
     name: 'agy_narrate',
-    description: 'Narrate a voice summary of the latest completed checkpoint or task via Voicebox Text-To-Speech. Zero-Claude-token architecture: it takes no text and writes the script itself, extracting checkpoint details directly from Claude Code session logs and condensing them into a 2-3 sentence spoken update via Gemini (agy). To speak a specific message you already have, use agy_say instead.',
+    description: 'Narrate a voice summary of the latest completed checkpoint or task via Voicebox Text-To-Speech. It takes no text and writes the script itself from the current Claude Code or Codex session log; Codex support requires trusting the packaged session hook. To speak a specific message you already have, use agy_say instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1177,7 +1178,7 @@ const TOOLS = [
         },
         session_id: {
           type: 'string',
-          description: 'Optional Claude Code session ID to summarize. Defaults to the current/most recent session.'
+          description: 'Optional Claude Code or Codex session ID. Required in Codex when multiple active sessions share a working directory.'
         },
         cwd: {
           type: 'string',
@@ -1666,67 +1667,6 @@ Section rules: Mode 1 includes Plan coverage. Mode 2 includes Over-engineering. 
 Direct, skeptical, and factual. Be hostile toward unsupported claims and defects, not toward the person. Every finding must cite concrete evidence. Do not use praise sandwiches.
 `;
 
-// Session Log Discovery & Pre-processing
-function getProjectLogDir(cwd) {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-  const projectsDir = path.join(homeDir, '.claude', 'projects');
-  if (!fs.existsSync(projectsDir)) return null;
-
-  // Claude Code encodes project paths as directory names: /foo/bar → -foo-bar (unix), c:\foo\bar → c--foo-bar (win)
-  const normalizedCwd = (cwd || process.cwd()).replace(/\\/g, '/');
-  const entries = fs.readdirSync(projectsDir);
-
-  // Strategy 1: Try direct encoding match
-  const encoded = normalizedCwd.replace(/^\//, '').replace(/:/g, '').replace(/\//g, '-');
-  const winEncoded = (cwd || process.cwd()).replace(/:/g, '').replace(/\\/g, '-').replace(/\//g, '-');
-
-  for (const entry of entries) {
-    const lower = entry.toLowerCase();
-    if (lower === encoded.toLowerCase() || lower === winEncoded.toLowerCase()) {
-      const full = path.join(projectsDir, entry);
-      if (fs.statSync(full).isDirectory()) return full;
-    }
-  }
-
-  // Strategy 2: Fuzzy — check if the cwd basename appears in any project dir
-  const cwdBase = path.basename(cwd || process.cwd()).toLowerCase();
-  for (const entry of entries) {
-    if (entry.toLowerCase().includes(cwdBase)) {
-      const full = path.join(projectsDir, entry);
-      if (fs.statSync(full).isDirectory()) return full;
-    }
-  }
-
-  return null;
-}
-
-function findSessionFile(logDir, sessionId) {
-  if (!logDir || !fs.existsSync(logDir)) return null;
-
-  if (sessionId) {
-    // P1 Security: Sanitize sessionId to strictly prevent path traversal (alphanumeric, dashes, underscores only)
-    const safeId = path.basename(sessionId).replace(/[^a-zA-Z0-9_-]/g, '');
-    if (!safeId) return null;
-    const target = path.join(logDir, `${safeId}.jsonl`);
-    const resolvedTarget = path.resolve(target);
-    const resolvedLogDir = path.resolve(logDir);
-    if (!resolvedTarget.startsWith(resolvedLogDir)) return null;
-    return fs.existsSync(resolvedTarget) ? resolvedTarget : null;
-  }
-
-  // Find most recent .jsonl file by modification time
-  const files = fs.readdirSync(logDir)
-    .filter(f => f.endsWith('.jsonl'))
-    .map(f => ({
-      name: f,
-      path: path.join(logDir, f),
-      mtime: fs.statSync(path.join(logDir, f)).mtimeMs
-    }))
-    .sort((a, b) => b.mtime - a.mtime);
-
-  return files.length > 0 ? files[0].path : null;
-}
-
 function saveSummary(content, sessionId, sessionMeta, outputPath, cwd = process.cwd()) {
   const homeDir = process.env.HOME || process.env.USERPROFILE || '';
   const today = new Date().toISOString().slice(0, 10);
@@ -1756,13 +1696,14 @@ function saveSummary(content, sessionId, sessionMeta, outputPath, cwd = process.
   const frontmatter = [
     '---',
     `session_id: "${sessionId || 'unknown'}"`,
+    `host: "${sessionMeta.host || 'claude'}"`,
     `project: "${(sessionMeta.cwd || 'unknown').replace(/\\/g, '/')}"`,
     `branch: "${sessionMeta.branch || 'unknown'}"`,
     `date: "${today}"`,
     `start_time: "${sessionMeta.startTime || 'unknown'}"`,
     `end_time: "${sessionMeta.endTime || 'unknown'}"`,
     `summarized_by: "antigravity-mcp"`,
-    `claude_version: "${sessionMeta.version || 'unknown'}"`,
+    `host_version: "${sessionMeta.version || 'unknown'}"`,
     '---',
     ''
   ].join('\n');
@@ -4435,41 +4376,22 @@ Be thorough but concise. Prioritize primary sources and official documentation o
     case 'agy_session_summary': {
       const cwd = args.cwd || process.cwd();
 
-      // 1. Discover the session log directory
-      const logDir = getProjectLogDir(cwd);
-      if (!logDir) {
+      // 1-2. Resolve the host-specific session source. Codex pointers are
+      // written by the trusted plugin hook; Claude discovery remains intact.
+      const sessionSource = resolveSessionSource({ cwd, sessionId: args.session_id });
+      if (sessionSource.error) {
         return {
           isError: true,
           content: [{
             type: 'text',
-            text: `Could not find Claude Code session logs for project: ${cwd}\n\nExpected location: ~/.claude/projects/<encoded-project-path>/\nMake sure you're running this from within a project that has active Claude Code sessions.`
+            text: `Could not resolve a session log for project: ${cwd}\n\n${sessionSource.error}`
           }]
         };
       }
 
-      // 2. Find the specific session file
-      const sessionFile = findSessionFile(logDir, args.session_id);
-      if (!sessionFile) {
-        const hint = args.session_id
-          ? `Session ID "${args.session_id}" not found in ${logDir}`
-          : `No .jsonl session files found in ${logDir}`;
-        return {
-          isError: true,
-          content: [{
-            type: 'text',
-            text: `Could not find session log file.\n${hint}\n\nAvailable sessions:\n${
-              fs.readdirSync(logDir)
-                .filter(f => f.endsWith('.jsonl'))
-                .slice(0, 10)
-                .map(f => `  - ${f.replace('.jsonl', '')}`)
-                .join('\n') || '  (none)'
-            }`
-          }]
-        };
-      }
-
-      // 3. Extract session ID from filename
-      const sessionId = path.basename(sessionFile, '.jsonl');
+      const sessionFile = sessionSource.filePath;
+      const sessionId = sessionSource.sessionId;
+      const sessionHost = sessionSource.host;
       const fileSize = fs.statSync(sessionFile).size;
 
       process.stderr.write(`[antigravity-mcp] Session summary: processing ${sessionFile} (${(fileSize / 1024).toFixed(1)}KB)\n`);
@@ -4525,7 +4447,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       const keyBlock = renderKeyPoints(keyPoints);
       const factsBlock = renderFacts(processed.facts);
       const finalBlock = renderFinalState(processed.finalState, processed.facts);
-      const fullPrompt = `${summarySystemPrompt}\n\n---\n\n## Session Metadata\n- Project: ${processed.sessionMeta.cwd || cwd}\n- Branch: ${processed.sessionMeta.branch || 'unknown'}\n- Claude Version: ${processed.sessionMeta.version || 'unknown'}\n- Session Start: ${processed.sessionMeta.startTime || 'unknown'}\n- Session End: ${processed.sessionMeta.endTime || 'unknown'}\n- Total Turns: ${processed.totalTurns}\n- Log File Size: ${(fileSize / 1024).toFixed(1)}KB\n\n---\n\n${keyBlock ? `${keyBlock}
+      const fullPrompt = `${summarySystemPrompt}\n\n---\n\n## Session Metadata\n- Host: ${sessionHost}\n- Project: ${processed.sessionMeta.cwd || cwd}\n- Branch: ${processed.sessionMeta.branch || 'unknown'}\n- Host Version: ${processed.sessionMeta.version || 'unknown'}\n- Session Start: ${processed.sessionMeta.startTime || 'unknown'}\n- Session End: ${processed.sessionMeta.endTime || 'unknown'}\n- Total Turns: ${processed.totalTurns}\n- Log File Size: ${(fileSize / 1024).toFixed(1)}KB\n\n---\n\n${keyBlock ? `${keyBlock}
 
 ---
 
@@ -4702,6 +4624,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       let formatted = `### 📋 Session Summary\n\n${responseText.trim()}\n\n---\n`;
       formatted += `**Summary Details:**\n`;
       formatted += `- Session: \`${sessionId}\`\n`;
+      formatted += `- Host: \`${sessionHost}\`\n`;
       formatted += `- Source: \`${sessionFile}\` (${(fileSize / 1024).toFixed(1)}KB)\n`;
       formatted += `- Turns Processed: ${processed.totalTurns}\n`;
       formatted += `- Focus: \`${focus}\`\n`;
@@ -4768,12 +4691,15 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       if (destino.error) return destino.error;
       const { voiceboxUrl, voiceResolution, profile: chosenProfile, language: targetLang } = destino;
 
-      // 4. Locate session log & extract last checkpoint
-      const logDir = getProjectLogDir(cwd);
-      let sessionFile = null;
-      if (logDir) {
-        sessionFile = findSessionFile(logDir, args.session_id);
+      // 4. Locate the host-specific session log & extract its last checkpoint.
+      const sessionSource = resolveSessionSource({ cwd, sessionId: args.session_id });
+      if (sessionSource.error && (sessionSource.codex || sessionSource.ambiguous || args.session_id)) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Could not resolve a session log for narration.\n\n${sessionSource.error}\n\nUse agy_say when you already have the exact text to speak.` }]
+        };
       }
+      const sessionFile = sessionSource.filePath || null;
 
       let checkpoint = {
         userGoal: 'Tarea de desarrollo completada',

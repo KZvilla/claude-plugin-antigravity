@@ -1,0 +1,31 @@
+{
+  "description": "Record Codex transcript identity for session summaries and narration.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "^(startup|resume|clear|compact)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/hooks/codex-session-pointer.js\"",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\hooks\\codex-session-pointer.js\"",
+            "timeout": 5,
+            "statusMessage": "Registering Lagrange session source"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/hooks/codex-session-pointer.js\"",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\hooks\\codex-session-pointer.js\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

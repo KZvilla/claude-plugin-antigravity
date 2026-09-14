@@ -25,6 +25,7 @@ async function main() {
   const mcpClaude = json('.mcp.json');
   const codex = json('.codex-plugin/plugin.json');
   const marketCodex = json('.agents/plugins/marketplace.json');
+  const hooksCodex = json('hooks/hooks.json');
   const entradaClaude = marketClaude.plugins.find(p => p.name === 'lagrange');
   const entradaCodex = marketCodex.plugins.find(p => p.name === 'lagrange');
 
@@ -34,6 +35,11 @@ async function main() {
     const versiones = [paquete.version, claude.version, marketClaude.metadata?.version, entradaClaude?.version, codex.version];
     check('las cinco versiones coinciden', new Set(versiones).size === 1, versiones.join(' / '));
     check('Codex descubre las skills compartidas', codex.skills === './skills/' && fs.existsSync(path.join(ROOT, 'skills')));
+    check('Codex declara los hooks de sesión', codex.hooks === './hooks/hooks.json' && Boolean(hooksCodex.hooks?.SessionStart && hooksCodex.hooks?.SessionEnd));
+    const hookInicio = hooksCodex.hooks.SessionStart[0].hooks[0];
+    check('el hook resuelve PLUGIN_ROOT en ambos shells',
+      hookInicio.command.includes('$PLUGIN_ROOT') && hookInicio.commandWindows.includes('%PLUGIN_ROOT%'),
+      JSON.stringify(hookInicio));
     check('no hay una copia de skills dentro del overlay', !fs.existsSync(path.join(ROOT, '.codex-plugin', 'skills')));
   });
 

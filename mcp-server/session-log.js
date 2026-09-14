@@ -21,6 +21,7 @@
  * es donde se descubrio primero que los tool_result van anidados.
  */
 const fs = require('fs');
+const { codexAsClaudeObjects, isCodexTranscript, parseCodexSession } = require('./codex-session.js');
 
 const LIMITE_RESULTADO = 300;
 const LIMITE_PENSAMIENTO = 250;
@@ -122,11 +123,12 @@ function firmaDeHito(comando, limite = 200) {
 }
 
 function preprocessSessionLog(filePath, maxChars = 1000000) {
-  const content = fs.readFileSync(filePath, 'utf8');
-  const lines = content.split(/\r?\n/).filter(l => l.trim());
+  const lines = isCodexTranscript(filePath)
+    ? codexAsClaudeObjects(parseCodexSession(filePath)).map(row => JSON.stringify(row))
+    : fs.readFileSync(filePath, 'utf8').split(/\r?\n/).filter(l => l.trim());
 
   const turns = [];
-  const sessionMeta = { cwd: null, branch: null, version: null, startTime: null, endTime: null };
+  const sessionMeta = { host: 'claude', cwd: null, branch: null, version: null, startTime: null, endTime: null };
 
   // Hechos derivados: se acumulan al recorrer, no se reconstruyen despues.
   const archivos = new Set();
@@ -147,6 +149,7 @@ function preprocessSessionLog(filePath, maxChars = 1000000) {
 
     // Extract session metadata from first user message
     if (obj.cwd && !sessionMeta.cwd) sessionMeta.cwd = obj.cwd;
+    if (obj.host) sessionMeta.host = obj.host;
     if (obj.gitBranch && !sessionMeta.branch) sessionMeta.branch = obj.gitBranch;
     if (obj.version && !sessionMeta.version) sessionMeta.version = obj.version;
     if (obj.timestamp) {
