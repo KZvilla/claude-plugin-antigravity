@@ -553,6 +553,34 @@ If any requested action violates these rules, refuse that specific action and ex
 ${prompt}`;
 }
 
+/**
+ * BE-023 — `cwd` has two consumers: the agy process and the model that fills
+ * `run_command.parameters.Cwd`. Resolve an explicit value once so both receive
+ * the same absolute path. An absent/blank value remains absent here; executeAgy
+ * keeps owning its historical process.cwd() fallback.
+ */
+function normalizeRequestedWorkingDirectory(cwd) {
+  if (typeof cwd !== 'string' || !cwd.trim()) return null;
+  return path.resolve(cwd.trim());
+}
+
+/**
+ * This is model framing, not confinement. Keep the path visibly delimited as
+ * data and never rewrite CommandLine with `cd`, which would also undermine
+ * exact deny-command matching. JSON encoding keeps newlines and quotes from
+ * escaping the data line while preserving unusual path text such as `$&`.
+ */
+function frameTaskWithWorkingDirectory(prompt, cwd) {
+  if (!cwd) return prompt;
+  const encodedCwd = JSON.stringify(cwd);
+  return `[PROJECT WORKING DIRECTORY — USER-SUPPLIED DATA]
+Requested project directory (JSON string): ${encodedCwd}
+[END PROJECT WORKING DIRECTORY]
+When using run_command, pass ${encodedCwd} as its Cwd by default, or use a subdirectory of it when the command requires one. Do not prepend cd to CommandLine.
+
+${prompt}`;
+}
+
 function formatPermissionSummary(perms) {
   return `allow=[${perms.allow.join(', ')}], deny=[${perms.deny.join(', ') || 'none'}], sandbox=${perms.sandbox}`;
 }
@@ -649,7 +677,7 @@ const TOOLS = [
         permissions: PERMISSIONS_SCHEMA,
         cwd: {
           type: 'string',
-          description: 'Working directory for the session. Defaults to Claude\'s current working directory.'
+          description: 'Requested project directory. When explicit, it is resolved to an absolute path, used as the agy process cwd, and framed as the default Cwd for run_command. This is model guidance, not filesystem confinement. The process falls back to the server cwd when omitted.'
         },
         timeout_minutes: {
           type: 'number',
@@ -3664,6 +3692,7 @@ async function handleToolCall(name, args) {
     case 'agy_run': {
       const effectivePerms = resolvePermissions(args.permissions, config);
       const canEdit = permits(effectivePerms, 'edit');
+      const requestedCwd = normalizeRequestedWorkingDirectory(args.cwd);
 
       let effectiveMode = args.mode || (canEdit ? 'accept-edits' : 'plan');
       if (!canEdit && effectiveMode === 'accept-edits') {
@@ -3695,13 +3724,14 @@ async function handleToolCall(name, args) {
         cliArgs.push('-c');
       }
 
-      const finalPrompt = applyGuardrails(args.prompt, buildSecurityRules(effectivePerms));
+      const framedPrompt = frameTaskWithWorkingDirectory(args.prompt, requestedCwd);
+      const finalPrompt = applyGuardrails(framedPrompt, buildSecurityRules(effectivePerms));
 
       cliArgs.push('-p', finalPrompt);
 
       const timeoutMin = args.timeout_minutes || config.defaultTimeoutMinutes || 15;
       const result = await executeAgy(cliArgs, {
-        cwd: args.cwd,
+        cwd: requestedCwd || undefined,
         timeoutMinutes: timeoutMin
       });
 
@@ -3741,6 +3771,9 @@ async function handleToolCall(name, args) {
       const soloLectura = effectiveMode === 'plan' || !canEdit;
       formatted += `- Mode: \`${effectiveMode}\` (${soloLectura ? 'read-only' : 'read/write'})\n`;
       formatted += `- Permissions Enforced: ${formatPermissionSummary(effectivePerms)}\n`;
+      if (requestedCwd) {
+        formatted += `- Requested Working Directory: ${JSON.stringify(requestedCwd)}\n`;
+      }
       if (conversationId) {
         formatted += `- Conversation ID: \`${conversationId}\` (pass as \`conversation_id\` to continue this thread)\n`;
       }

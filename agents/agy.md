@@ -68,7 +68,7 @@ Antigravity is powered by Google Gemini models (Gemini 3.8 / 3.7 Flash, 3.1 Pro)
   - `conversation_id`: Resume a previous session thread to maintain full context.
   - `continue_session`: Set `true` to continue the most recent session (`-c`).
   - `dangerously_skip_permissions`: Defaults to `true` for headless execution.
-  - `cwd`: Target directory.
+  - `cwd`: Requested project directory. Lagrange resolves it, uses it for the agy process and frames it as the default `Cwd` of `run_command`; guidance, not confinement.
 - `mcp__lagrange__agy_plan`:
   - `task`: Task description.
   - `model`: Model override.

@@ -191,7 +191,7 @@ Twenty-one tools exposed via the MCP server — sixteen `agy_*` tools, four `tel
 | `conversation_id` | `string` | — | Resume a previous conversation |
 | `continue_session` | `boolean` | — | Continue the most recent conversation (`-c`) |
 | `timeout_minutes` | `number` | `15` | Max runtime in minutes |
-| `cwd` | `string` | — | Working directory |
+| `cwd` | `string` | — | Requested project directory. The absolute path is used for the agy process and framed as the default `Cwd` of `run_command`; this is guidance, not confinement |
 | `dangerously_skip_permissions` | `boolean` | `true` | Run headlessly without interactive prompts |
 
 ---

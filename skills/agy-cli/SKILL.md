@@ -39,6 +39,8 @@ Delegate tasks to Antigravity when:
 ### 1. `agy_run`
 Run an autonomous Antigravity session.
 
+When `cwd` is explicit, Lagrange resolves it to an absolute path, uses it for the agy process, and instructs `run_command` to pass that path as its default `Cwd` (or a subdirectory when needed) without prepending `cd`. This is model guidance, not filesystem confinement. The execution footer labels it **Requested Working Directory**; it is not a verified observation of every inner command.
+
 ```json
 {
   "prompt": "Implement the missing test cases in src/lib/__tests__/date-contract.test.ts. Run 'npm test' to verify and fix any failures.",
