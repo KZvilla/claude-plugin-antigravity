@@ -49,9 +49,9 @@ except ImportError as err:
 
 from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
-    resolve_voice_profile, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
-    get_model_status, resolve_engine_and_model, tts_model_name, unload_model, stt_full_model_name,
-    unload_all_loaded_models, LatidoUso, activar_motor_chat,
+    resolve_voice_request, resolve_and_activate_voice, synthesize_sentence, voicebox_cancel, transcribe_wav_bytes,
+    get_model_status, tts_model_name, unload_model, stt_full_model_name,
+    unload_all_loaded_models, LatidoUso,
     Senales, TiemposTurno, decidir_senal, clave_de_paso,
     accion_para_turno, pregunta_de_negaciones, aviso_escrituras, AVISO_CONFIRMACION
 )
@@ -168,7 +168,8 @@ class VadListener:
 def main():
     parser = argparse.ArgumentParser(description="Fase 4 - loop completo con mic + VAD (Modo Charla)")
     parser.add_argument("--voice", default=None, help='Perfil de voz (ej. "Diego Alvarez")')
-    parser.add_argument("--language", default="es", choices=["es", "en"])
+    parser.add_argument("--language", default=None, choices=["es", "en"])
+    parser.add_argument("--soul", default=None, help="Clave Soul para la identidad; es independiente del perfil acústico.")
     parser.add_argument("--effort", default="low", choices=["low", "medium", "high"])
     parser.add_argument("--device", default=None, help="Indice o nombre (parcial) del dispositivo de entrada")
     parser.add_argument("--vad-threshold", type=float, default=0.5)
@@ -212,11 +213,20 @@ def main():
         return
 
     if args.list_engines:
-        for m in get_model_status().values():
-            estado = "cargado" if m.get("loaded") else ("descargado en disco" if m.get("downloaded") else "no descargado")
-            print(f"  {m['model_name']:24s} {m['display_name']:28s} [{estado}]")
+        try:
+            for m in get_model_status().values():
+                estado = "cargado" if m.get("loaded") else ("descargado en disco" if m.get("downloaded") else "no descargado")
+                print(f"  {m['model_name']:24s} {m.get('display_name', ''):28s} [{estado}]")
+        except RuntimeError as err:
+            print(f"[voice-loop] Discovery no inició Voicebox: {err}")
         return
 
+    try:
+        selected = resolve_voice_request(args.voice, args.language, os.getcwd(), args.motor,
+                                         args.engine, args.model_size, args.soul)
+    except RuntimeError as err:
+        print(f"[voice-loop] {err}")
+        return
     device = args.device
     if device is not None:
         try:
@@ -227,30 +237,23 @@ def main():
     print("[voice-loop] Conectando al servidor MCP real (mcp-server/index.js)...")
     mcp = McpClient()
 
-    # Voicebox arriba sin depender de la GUI: el MCP lo levanta si hace falta.
-    print("[voice-loop] " + mcp.call_tool("agy_voice_model", {"action": "start"}).splitlines()[0])
     if args.soltar_pin:
         print("[voice-loop] " + mcp.call_tool("agy_voice_model", {"action": "release"}))
 
-    print(f"[voice-loop] Resolviendo perfil de voz en Voicebox (preferido: {args.voice or 'default'})...")
-    profile = resolve_voice_profile(args.voice, args.language)
-    print(f"[voice-loop] Perfil elegido: {profile['name']}")
-
-    # No asumir "qwen"/"1.7B": cada perfil declara su propio default_engine y lo
-    # que esta realmente descargado varia por maquina - se consulta en vivo.
-    model_status = get_model_status()
-    engine, model_size = resolve_engine_and_model(profile, model_status, args.engine, args.model_size)
-
-    # Antes de abrir el microfono: el modelo de esta voz pasa a ser el activo.
-    # Si hay otro fijado, o no hay VRAM, se dice ahora y no a mitad de la charla.
-    # La charla va por OmniVoice si la voz tiene muestra (regla del usuario).
     try:
-        proveedor, muestra = activar_motor_chat(mcp, profile, engine, model_size, args.motor)
+        profile, args.language, engine, model_size, proveedor, muestra, rechazados = resolve_and_activate_voice(mcp, selected)
+        # El micrófono depende además de STT en Voicebox. Esta orden ocurre
+        # después del consentimiento de voz y antes de abrir el dispositivo.
+        mcp.call_tool("agy_voice_model", {"action": "start"})
+        stt = get_model_status().get(stt_full_model_name(args.stt_model))
+        if not stt or not stt.get("downloaded"):
+            raise RuntimeError(f"model_not_downloaded: falta {stt_full_model_name(args.stt_model)} para transcribir.")
     except RuntimeError as err:
         print(f"[voice-loop] {err}")
         print("[voice-loop] Si hay un modelo fijado de otra voz, volve a correr con --soltar-pin.")
         mcp.close()
         return
+    print(f"[voice-loop] Perfil elegido: {profile['name']}")
     voz = "OmniVoice" if proveedor == "omnivoice" else f"Voicebox · {engine}" + (f" ({model_size})" if model_size else "")
     print(f"[voice-loop] Voz: {voz}")
     print(f"[voice-loop] Modelo STT: {args.stt_model}")
@@ -287,10 +290,12 @@ def main():
     # cerrar consolida lo que aprendio (FEAT-044). El nombre del perfil es la
     # misma clave que usan las narraciones, asi que comparten alma.
     start_args = {"action": "start", "effort": args.effort, "confirmacion": True, "cwd": os.getcwd(),
-                  "alma": profile["name"],
+                  "alma": selected["identity"].get("soul") if selected["identity"].get("mode") == "soul" else None,
+                  "voice": profile["name"],
                   "prewarm_voicebox": is_qwen_engine and proveedor == "voicebox"}
     if is_qwen_engine:
-        start_args["voicebox_model_size"] = model_size or "1.7B"
+        if model_size:
+            start_args["voicebox_model_size"] = model_size
     start_text = mcp.call_tool("agy_voice_stream", start_args)
     stream_id = start_text.split("stream_id: `")[1].split("`")[0]
     print(f"[voice-loop] Sesion lista: {stream_id}")

@@ -104,8 +104,8 @@ Codex do not split agent memory or configuration.
 | 🔀 | **Concurrent Fan-Out** | Runs parallel Antigravity subagents across isolated git worktrees with disjoint-file safety checks (`/lagrange:fanout`) |
 | 👁️ | **Live Fan-Out Viewer** | Watch every subagent in your browser — streamed prose, tool calls, elapsed time, failure reasons, and a stop button (`/lagrange:watch`) |
 | 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (3.8 / 3.7 Flash, 3.1 Pro) with configurable reasoning effort |
-| 🎙️ | **Voice Checkpoint Narration** | Zero-Claude-token spoken status updates via Voicebox TTS with automatic profile fallback |
-| 🗣️ | **Real-Time Voice Mode** | Full-duplex spoken conversation with barge-in, mic capture, and Silero VAD (`voice-chat/`), spoken progress cues, and a confirmation brake: agy asks for your "sí" before running commands or MCP tools — zero-cloud audio via a local Voicebox TTS/STT engine |
+| 🎙️ | **Voice Checkpoint Narration** | Zero-Claude-token spoken status updates with declarative voice routing, independent Souls, and text-only degradation |
+| 🗣️ | **Real-Time Voice Mode** | Full-duplex spoken conversation with barge-in, mic capture, Silero VAD and independent Soul/acoustic routing through local Voicebox or OmniVoice providers |
 | 📋 | **Anti-Compaction Session Summary** | Analyzes raw JSONL session logs with Gemini (1M-2M context) to generate persistent, structured Markdown docs before context degrades |
 | 🌐 | **Cited Web Research** | Leverages Antigravity's native web search and synthesis capabilities that Claude Code lacks out of the box |
 | 📱 | **Telegram Bridge & Remote Control** | Control tasks from your phone, approve plans, receive voice notes, and launch `claude --remote-control` sessions |
@@ -140,14 +140,14 @@ Codex do not split agent memory or configuration.
 | `/lagrange:review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
 | `/lagrange:audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
 | `/lagrange:summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
-| `/lagrange:narrate [voice/lang]` | Narrate spoken voice summary of the latest task/checkpoint via Voicebox TTS (`emily`, `diego`, `es`, `en`) |
-| `/lagrange:voices [lang]` | List all installed Voicebox voice profiles, languages, roles, and service health |
+| `/lagrange:narrate [voice/lang]` | Narrate the latest task/checkpoint with an explicit profile or the configured `voice_setup` route |
+| `/lagrange:voices [lang]` | Inspect live/cached profiles, configured roles, languages, and service health without starting providers |
 | `/lagrange:research <topic>` | Conduct deep web research with cited sources and structured insights |
 | `/lagrange:usage` | Display token telemetry, context saturation, and quota health |
 | `/lagrange:bridge` | Diagnose the Telegram bridge: daemon state, which copy of the code each half runs, credentials and shared state |
 | `/lagrange:setup [track]` | Guided setup for the optional pieces — Voicebox, Telegram notifications, the bidirectional daemon (`voicebox`, `telegram`, `daemon`) |
 
-> **Tip:** You can also ask Claude naturally — *"Delegale a agy que resuma esta sesión"*, *"¿Qué voces tengo disponibles?"* o *"Cuando termines, ejecuta la narración con Diego"* — and it will pick the right tool automatically.
+> **Tip:** You can also ask Claude naturally — *"Delegale a agy que resuma esta sesión"*, *"¿Qué voces tengo disponibles?"* o *"Cuando termines, ejecuta la narración con Cloud Finch"* — and it will pick the right tool automatically.
 
 ---
 
@@ -165,19 +165,19 @@ Twenty-one tools exposed via the MCP server — sixteen `agy_*` tools, four `tel
 | `agy_research` | read-only | 20m | Deep web research with cited sources — requires the `network` capability, errors out if denied |
 | `agy_session_summary` | read-only | 15m | Parse session JSONL and generate structured summary doc with Gemini |
 | `agy_voice_stream` | conversational | persistent (no fixed timeout) | Manage a long-lived, streaming `agy.exe` process for low-latency voice chat ("Modo Charla") — the backend behind `voice-chat/` |
-| `agy_narrate` | audio TTS | 3m | Spoken audio update of latest checkpoint via Voicebox (zero Claude tokens). Takes no text — it writes the script from the session log |
+| `agy_narrate` | audio/text | 3m | Update of the latest checkpoint through the configured voice route, with text-only preservation when audio is unavailable; it writes the script from the session log |
 | `agy_say` | audio TTS | — (3m with `polish`) | Speak a specific text you already have. Sanitized locally by default (markdown, paths, URLs, emoji stripped; secrets redacted); `polish: true` has Gemini condense it first |
-| `agy_narrate_voices` | read-only | — | List installed Voicebox voice profiles, languages, roles, and GPU health |
+| `agy_narrate_voices` | read-only | — | Inspect live/cached profiles, setup state, languages, roles, and service health; never starts a provider or loads a model |
 | `agy_voice_model` | GPU memory | — | Start Voicebox headless (or OmniVoice with `engine: "omnivoice"`), and pin / release / unload the TTS model in VRAM across both (`status` is read-only) |
 | `agy_usage` | — | — | Session token telemetry, context window saturation, model limits, quota health |
 | `agy_status` | — | — | Binary path, CLI version, active model/effort defaults, permission policies |
-| `agy_set_config` | — | — | Persist model, effort, timeout, or permission preferences |
+| `agy_set_config` | — | — | Persist model, effort, timeout, permissions, or the versioned `voice_setup` block |
 | `telegram_notify` | outbound | — | Push a notification (with optional file attachment) to your phone — see [Telegram Bridge Setup](#-telegram-bridge-setup-manual--never-automated) |
 | `telegram_ask` | Human-in-the-Loop | 5m | Ask a question with tappable choice buttons and block until you answer on your phone |
 | `telegram_send_voice` | outbound audio | — | Send an audio file (or the latest Voicebox generation) as a native voice note |
 | `cast_agent` | read-only by default | 15m | Cast a persistent, SKILL-bound agent that keeps its identity, thread and accumulated criteria across sessions — see [Persistent SKILL-Bound Agents](#-persistent-skill-bound-agents-cast_agent) |
 | `telegram_bridge_status` | read-only | — | Diagnose the bridge: daemon state, which copy of the code each half runs, where credentials and shared state resolve — `/lagrange:bridge` |
-| `agy_alma` | local files | — | Souls for the voices: list, inspect, seed from a Voicebox profile and prune the identity and memory files; install the tool-less `lagrange-alma` agent — see [Souls](#-souls-agy_alma) |
+| `agy_alma` | local files | — | Manage Souls independently from acoustic profiles: list, inspect, explicitly seed and prune identity/memory files; install the tool-less `lagrange-alma` agent — see [Souls](#-souls-agy_alma) |
 
 ### `agy_run` — Full Parameters
 
@@ -246,11 +246,42 @@ Denying `"network"` blocks web search and URL fetching, and makes `agy_research`
   },
   "fanout_statusline": true,
   "fanout_progress_log": true,
-  "fanout_control": true
+  "fanout_control": true,
+  "voice_setup": {
+    "version": 3,
+    "status": "configured",
+    "languages": ["es", "en"],
+    "default_language": "en",
+    "defaults": {
+      "es": {
+        "identity": { "mode": "soul", "soul": "brisa" },
+        "audio": { "profile": "Marina Sol", "provider": "omnivoice" }
+      },
+      "en": {
+        "identity": { "mode": "neutral" },
+        "audio": {
+          "profile": "Rowan Vale",
+          "provider": "voicebox",
+          "engine": "qwen",
+          "model_size": "0.6B"
+        }
+      }
+    },
+    "fallbacks": {
+      "es": [
+        { "profile": "Cobre Claro", "provider": "voicebox", "engine": "kokoro" }
+      ],
+      "en": [
+        { "profile": "Juniper Reed", "provider": "omnivoice" }
+      ]
+    }
+  }
 }
 ```
 
 > **Scope:** Place in `~/.claude/antigravity.json` for global defaults, or `.claude/antigravity.json` in a project root for per-project overrides.
+> A project-level `voice_setup` replaces the complete global block; defaults,
+> identities and fallbacks are never deep-merged across scopes.
 
 ---
 
@@ -455,18 +486,19 @@ Design rationale, verification evidence and the remaining backlog live in `docs/
 
 ## 🫀 Souls (`agy_alma`)
 
-A feature built in phases: the voices get an identity and a memory of their own.
+A Soul is a durable identity and memory that can speak through any compatible
+acoustic profile. It is not owned by a Voicebox profile.
 
-- **Narrations already use the identity.** With `personality: true`, `agy_say`, `agy_narrate` and the spoken digest of `agy_session_summary` speak from the voice's `alma.md` instead of the two Voicebox profile fields. A voice without a soul gets one seeded from its profile the first time it narrates. To tune how a voice talks, edit its `alma.md`: the next narration follows it. `agy_say` and `agy_narrate` write the script as the tool-less `lagrange-alma` agent. The summary keeps its own call, because the persona there only changes the digest's tone.
-- **You can talk to a soul on Telegram, and that is where it remembers.** `/charla [voice] <message>` starts a conversation, replying to one of its messages continues it, and `/charla nuevo` opens a clean thread. It answers in character from its own memory, and stores what is worth keeping — every reply tells you what it saved (`🧠 recordó 1`). `/alma` shows that memory with its ids, `/alma olvidar <id>` prunes it. Free text in the chat is still work: a reply to a plan still adjusts the plan.
-- **Voice chat starts with the soul and learns when it ends.** The Python loops pass their voice as `alma`, so the session is primed with that soul's identity, memory and what it knows about you — before the priming, which still has the last word ("the rules of this chat override your personality"). Nothing is written mid-conversation: on `stop`, if the chat had at least three turns, a **detached** process (`mcp-server/almas/consolidar.js`) reads the transcript in a fresh tool-less thread and decides what to keep. `stop` stays instant, and the consolidation survives the loop exiting — Ctrl+C included.
+- **Narration uses a Soul only when explicitly selected.** `voice_setup.identity.soul` or the per-call `soul` argument selects an existing `alma.md`; choosing an acoustic `voice` never creates or selects a Soul implicitly. Missing Souls degrade visibly to neutral. `agy_say` and `agy_narrate` write Soul-authored scripts as the tool-less `lagrange-alma` agent.
+- **You can talk to a Soul on Telegram, and that is where it remembers.** `/charla [soul] <message>` starts a conversation, replying to one of its messages continues it, and `/charla nuevo` opens a clean thread. It answers from its own memory and reports what it retained. `/alma` shows that memory with stable ids; `/alma olvidar <id>` prunes it.
+- **Voice chat keeps Soul and timbre separate.** The Python loops resolve the acoustic route from `--voice` or `voice_setup` and prime identity only from `--soul` or `identity.soul`. Nothing is written mid-conversation: on `stop`, after at least three turns, a detached process consolidates the transcript for the selected Soul. No Soul means no consolidation.
 - **Emoji reactions go back to the authoring soul.** Reacting to one of its Telegram replies or narrated voice notes produces one short text response with the soul's current thread and memory. Removed/custom emoji, progress messages and bursts inside ten seconds are ignored; changing the emoji on the same message never answers twice.
 - **Memory reaches the chat and the voice chat, never the narrations.** A narration may only rewrite what it was given (REWRITE ONLY), and memory would add facts. Each narration only leaves a line in the soul's diary.
 
 ```
 ~/.claude/lagrange-almas/        (override: LAGRANGE_ALMAS_DIR)
   usuario.md        what the souls know about you, shared by every voice (cap: 1375 chars)
-  alya/
+  brisa/
     alma.md         identity: seeded once from the Voicebox profile, then yours to edit
     memoria.md      the soul's memory of the relationship (cap: 2200 chars)
     diario.jsonl    a diary written by code, not by the model; rotated
@@ -474,14 +506,14 @@ A feature built in phases: the voices get an identity and a memory of their own.
 ```
 
 ```
-agy_alma  action:"semilla"  voz:"Alya"            → alma.md from the Voicebox profile
-agy_alma  action:"ver"      voz:"Alya"            → identity, memory with ids, diary
-agy_alma  action:"olvidar"  voz:"Alya"  id:"m3"   → delete one entry
+agy_alma  action:"semilla"  voz:"Marina Sol"      → explicitly create a Soul from that profile
+agy_alma  action:"ver"      voz:"brisa"            → identity, memory with ids, diary
+agy_alma  action:"olvidar"  voz:"brisa"  id:"m3"  → delete one entry
 agy_alma  action:"listar"                         → souls on disk, voices without one
 agy_alma  action:"agente"                         → install / verify the lagrange-alma agent
 ```
 
-- **Seeding matches the name exactly.** "Diego" finds a "Diego Alvarez" profile, but "Ana" never finds "Anabel", and there is no fallback voice: seeding another voice's soul is worse than not seeding. Re-seeding an existing soul needs `forzar: true`, and it keeps the previous file as `alma.md.anterior`.
+- **Seeding matches the name exactly.** "Marina" can find a unique "Marina Sol" profile, but "Mara" never guesses "Marabelle", and there is no fallback voice: seeding another profile's Soul is worse than not seeding. Re-seeding an existing Soul needs `forzar: true`, and it keeps the previous file as `alma.md.anterior`.
 - **Memory entries have stable ids** (`- [m3] [2026-09-12] …`, `u2` in `usuario.md`). Ids are never reused, the caps are hard, and a write that would exceed them is rejected rather than silently dropping something. The files are plain text: edit them by hand whenever you want.
 - **Memory is scanned before it is written.** Invisible characters, command-shaped text ("run this command", not "run a marathon"), URLs and secret-shaped strings are rejected. This is the hygiene layer. The hard barrier is the agent:
 - **Soul calls will run as `lagrange-alma`, an agent with `tools: []`.** Verified live, that leaves it with *no* native tools at all. Note that `tools:` with no items is **not** empty: agy then grants a default read set. The MCP roster still arrives (see SEC-010 above), but soul calls never pass `--dangerously-skip-permissions`, so agy denies it on its own. And because agy fixes a thread's identity on its first turn, soul threads are always born as this agent, never converted.
@@ -591,7 +623,7 @@ it had been given.
 
 ### Hearing it
 
-`narrate: true` speaks a short digest through Voicebox. The digest is written in the
+`narrate: true` sends a short digest through the configured voice route. The digest is written in the
 same call that produces the document, by something that just read the whole session —
 narrating the finished document instead reaches only its first few percent.
 
@@ -599,14 +631,16 @@ narrating the finished document instead reaches only its first few percent.
 
 ## 🎙️ Voice Checkpoint Narration (`/lagrange:narrate`)
 
-Narrate a spoken audio status update upon completing a task or checkpoint via **Voicebox Text-To-Speech (TTS)**.
+Narrate a spoken status update after a task or checkpoint. FEAT-049 v3 treats
+the words, their authoring identity, and their acoustic delivery as separate
+decisions: Voicebox and OmniVoice are delivery providers, not identities.
 
 ### Zero-Claude-Token Architecture
 Claude **does not** generate or summarize the text in its context window. Instead:
 1. Claude simply invokes `/lagrange:narrate` (or the `agy_narrate` tool).
 2. The plugin locates Claude Code's session log (`.jsonl`), extracts the latest task checkpoint (user goal, modified files, and final test execution status).
 3. The plugin invokes Gemini CLI (`agy`) with `--effort low` to draft a concise 2-3 sentence conversational spoken script in ~1-2 seconds (using Gemini quota, **0 Claude tokens**).
-4. The plugin sends the text to Voicebox HTTP (`POST /generate`), which synthesizes a `.wav` silently, and then plays that file with the native OS audio player. (It deliberately avoids `POST /speak` — letting Voicebox do its own playback triggers a double-playback bug.)
+4. The pure resolver chooses only declared, verifiably available audio resources. The activation phase then coordinates providers and VRAM. If no route can be used, the completed script is returned as `text-only` instead of being lost.
 
 Running `/lagrange:narrate` plays the result on your speakers. When `agy_narrate` is called programmatically, local playback is off by default (`local_playback: false`) so background narration doesn't startle anyone — it still reaches your phone if the Telegram bridge is configured.
 
@@ -618,7 +652,9 @@ Running `/lagrange:narrate` plays the result on your speakers. When `agy_narrate
 { "text": "El deploy termino, treinta y cinco pruebas en verde." }
 ```
 
-It shares the whole emission pipeline with `agy_narrate` — same voice resolution, same Voicebox call, same local playback and Telegram delivery — and differs only in where the words come from. Two things are worth knowing:
+It shares the whole emission pipeline with `agy_narrate` — same resolver,
+activation, text-only fallback, local playback and Telegram delivery — and
+differs only in where the words come from. Two things are worth knowing:
 
 - **The text is sanitized locally, always.** Markdown, code blocks, file paths, URLs and emoji are stripped (none of them survive being read aloud), and anything shaped like a bot token is redacted *before* synthesis. That matters because the spoken text also becomes the Telegram caption and lands in `daemon.log`.
 - **`polish: true` is opt-in, not the default.** It has Gemini rewrite the text in spoken style, which is worth a few seconds for a raw log or long output, and wasted latency for a sentence you already phrased for the ear. The polish prompt is a *rewrite* instruction, not a summarize-from-facts one: it is explicitly forbidden from adding information the message didn't contain, so a narration can never invent a status that wasn't reported.
@@ -629,32 +665,77 @@ It shares the whole emission pipeline with `agy_narrate` — same voice resoluti
 /lagrange:narrate
 ```
 
-With specific voice or language preference:
+With a fictitious explicit profile or language preference:
 ```text
-/lagrange:narrate emily       # English narration with Emily voice
-/lagrange:narrate diego       # Spanish narration with Diego Alvarez voice
-/lagrange:narrate en          # English narration (defaults to Emily)
-/lagrange:narrate es          # Spanish narration (defaults to Diego Alvarez)
+/lagrange:narrate "Cloud Finch"  # one-shot consent for that exact acoustic profile
+/lagrange:narrate en             # use the declared English route from voice_setup
+/lagrange:narrate es             # use the declared Spanish route from voice_setup
 ```
 
 Or ask Claude conversationally:
-> *"Cuando termines de implementar las pruebas, ejecuta la narración con Diego"*
-> *"Narra el último checkpoint con Emily en inglés"*
+> *"Cuando termines, narralo con el perfil Marina Sol."*
+> *"Narra el último checkpoint en inglés usando la Soul brisa."*
 
-### Voicebox Detection & Automatic Fallback Hierarchy
-The plugin detects available voices installed in your local Voicebox (`http://127.0.0.1:17493` by default):
+### Voice setup v3: identity and sound are independent
 
-- **Spanish (`es`)**:
-  - Preferred: `Diego Alvarez`
-  - Fallback: `Isabel` $\rightarrow$ `Ono Anna` $\rightarrow$ First installed Spanish profile
-- **English (`en`)**:
-  - Preferred: `Emily`
-  - Fallback: `Aria` $\rightarrow$ `Aiden` $\rightarrow$ First installed English profile
+`voice_setup` is the only source of implicit voice preference. Detecting a
+profile, sample, model or running server never makes it a default. A fresh
+installation without a configured setup remains `unconfigured` and does not
+start audio services on its own.
+
+Each language default has two independent parts:
+
+- `identity`: `neutral`, an explicit persistent `soul`, or the compatibility
+  mode `profile`.
+- `audio`: a profile plus its provider and, for Voicebox, its engine/model
+  evidence. Qwen routes require an explicit `model_size`; OmniVoice routes do
+  not accept `engine` or `model_size`.
+
+The complete fictitious example in [Persistent Defaults](#persistent-defaults-claudeantigravityjson)
+means: Spanish text is authored by Soul `brisa` and normally spoken with
+`Marina Sol` through OmniVoice; English is neutral and uses `Rowan Vale`
+through Voicebox. Only the listed alternatives may be tried, in order. An
+acoustic fallback never changes the authoring Soul.
+
+Per-call selection remains ergonomic and does not require setup:
+
+```json
+{
+  "text": "The migration finished successfully.",
+  "voice": "Cloud Finch",
+  "language": "en",
+  "soul": "brisa"
+}
+```
+
+Here `voice` authorizes that acoustic profile for this call only; `soul`
+selects an already-existing identity independently. If `Cloud Finch` cannot be
+synthesized, the resolver does not silently substitute another profile. A
+contradictory language or unavailable route yields a diagnostic `text-only`
+result while preserving the message. `send_telegram: false` is always honored;
+when Telegram is enabled, a text-only Soul message keeps its reaction authorship.
+
+To explicitly keep a new installation unconfigured:
+
+```json
+{
+  "voice_setup": {
+    "version": 3,
+    "status": "unconfigured",
+    "languages": []
+  }
+}
+```
+
+`agy_narrate_voices` can inspect live or cached capabilities and setup roles,
+but discovery never starts Voicebox/OmniVoice, loads or downloads a model,
+generates audio, pins VRAM, or seeds a Soul.
 
 ### Voicebox without the desktop app
 
-The desktop app does not need to be open. On Windows, when a voice tool finds
-Voicebox down, the plugin starts its server headless — the CUDA backend under
+The desktop app does not need to be open. On Windows, once an explicit request
+or configured route has authorized Voicebox, the plugin can start its server
+headless — the CUDA backend under
 `%APPDATA%\sh.voicebox.app\backends\cuda\` (downloaded the first time you open
 the app), falling back to the CPU one in Program Files — with the app's own data
 directory, so the same voices are there. If the app *is* open, nothing is started.
@@ -685,12 +766,12 @@ total, measured live (`nvidia-smi`, cached 3 s), with a `⚠` above 85 %
 voices from their samples, about ten times faster than Qwen 1.7B (≈6 s for 36 s
 of audio) and in ~2 GB of VRAM, with somewhat flatter prosody. Once installed:
 
-- **Immediate** narration — `agy_say`, `agy_narrate` (default `modo:
-  "inmediato"`) and the voice chat — goes through OmniVoice.
-- **Deferred** narration — `modo: "diferido"`, and session summaries with
-  `narrate` — goes through Qwen via Voicebox.
-- `voz_por_perfil` pins a voice to one engine (`{"Priscilla": "voicebox"}`);
-  `motor` forces one per call. Preset voices (no sample) always use Voicebox.
+- New v3 setups declare the provider per route. `modo` only orders compatible
+  providers when a one-shot voice request leaves the provider unspecified.
+- `provider` is the advanced per-call override; `motor` remains its legacy
+  alias. Contradictory aliases fail visibly instead of choosing one.
+- Legacy `voz_por_perfil` remains supported only when no configured
+  `voice_setup` exists; it is never merged into a configured v3 setup.
 - Voicebox stays the source of truth for voices and samples; a small cache lets
   OmniVoice keep narrating if Voicebox is down.
 - Its own server (port 17494) frees its model and shuts down when idle, like
@@ -699,16 +780,22 @@ of audio) and in ~2 GB of VRAM, with somewhat flatter prosody. Once installed:
 Install (Windows + NVIDIA, ~8 GB into `%LOCALAPPDATA%\lagrange-omnivoice`):
 `npm run omnivoice:install`. The OmniVoice weights are **CC-BY-NC** (non-commercial).
 
-If Voicebox cannot be reached or started, the plugin returns a diagnostic naming the cause without failing your development session.
+If no declared provider can be reached or started, the plugin preserves the
+content as text and returns stable reason codes such as `sample_missing`,
+`model_not_downloaded`, `provider_unavailable`, or `setup_required`.
 
 ### 🎭 Enriquecer la Personalidad desde Voicebox (Sin tocar código)
 
-La naturalidad y el estilo de la narración en personaje se adaptan automáticamente según cómo completes la ficha de cada voz en la interfaz de Voicebox:
+El modo de identidad `profile` puede adaptar la naturalidad y el estilo según
+la ficha del perfil en Voicebox. Es una compatibilidad efímera: no crea una
+Soul ni memoria persistente.
 
 - **`description`**: Describe la identidad, acento o tono (ej: *"Comediante uruguayo de internet con voz rasposa"* o *"Locutor profesional español"*).
 - **`personality`**: Define modismos, actitud y muletillas (ej: *"Humor bizarro e irreverente, usa modismos como '¡Sapeee!', 'más bien loquita', festejando con euforia si los tests pasaron"*).
 
-Gemini (`agy`) lee estos campos dinámicamente en tiempo real desde la API de Voicebox. Al activar el modo personaje (con `/lagrange:narrate <voz> personality` o pidiéndoselo a Claude), el guión adoptará ese personaje manteniendo siempre la veracidad técnica sobre los archivos y tests del proyecto.
+Gemini (`agy`) puede leer esos campos para reescribir el guion sin alterar sus
+hechos. Para identidad persistente usa `identity: { "mode": "soul", "soul":
+"<clave>" }` o el argumento puntual `soul`; la Soul debe existir previamente.
 
 ---
 
@@ -719,7 +806,13 @@ Full-duplex spoken conversation with Antigravity — not a Claude Code slash com
 - `voice-chat/text_loop.py` — console input, zero pip dependencies (stdlib only).
 - `voice-chat/voice_loop.py` — real microphone input via Silero VAD, with real barge-in: the instant it detects you starting to speak, it cuts playback and cancels any in-flight Voicebox synthesis.
 
-Both use a local Voicebox at `http://127.0.0.1:17493` (or `VOICEBOX_URL`) for TTS/STT, started headless through the MCP server if it is not running; they refuse to open the mic if another voice's model is pinned (`--soltar-pin` releases it); `voice_loop.py` additionally needs `pip install -r voice-chat/requirements.txt` (`sounddevice`, `silero-vad`, `numpy`).
+Both use the same global-plus-project `voice_setup` resolution as Node. They
+exit with `setup_required` before starting a provider or opening the microphone
+unless a persisted setup or explicit `--voice` authorizes the route. `--soul`
+selects identity independently. The microphone loop also verifies its STT model
+before opening the device and refuses conflicting VRAM pins (`--soltar-pin`
+releases one); it needs `pip install -r voice-chat/requirements.txt`
+(`sounddevice`, `silero-vad`, `numpy`).
 
 **Progress signals.** While agy works, the chat plays short pre-recorded cues in the chat voice (OmniVoice only, cached between sessions): "Pensando", "Buscando en la web", "Leyendo la página", "Revisando archivos", and, named after the MCP server agy is calling, "Usando el navegador" (playwright, puppeteer, chrome), "Consultando la memoria" and "Revisando la agenda" (calendar servers). Any other tool is "Usando una herramienta"; during a turn you authorized, "Ejecutando un comando" and "Escribiendo el archivo" as well. At most three per turn and never the same one twice; `--senal-ms 0` turns them off.
 
@@ -729,10 +822,13 @@ Both use a local Voicebox at `http://127.0.0.1:17493` (or `VOICEBOX_URL`) for TT
 
 ```bash
 # Console-only, zero extra dependencies
-python voice-chat/text_loop.py --voice "Diego Alvarez" --language es
+python voice-chat/text_loop.py --voice "Cloud Finch" --language en --soul brisa
 
 # Real microphone + VAD
-python voice-chat/voice_loop.py --voice "Diego Alvarez" --language es --stt-model turbo
+python voice-chat/voice_loop.py --voice "Marina Sol" --language es --stt-model turbo
+
+# Omit --voice/--language to use voice_setup.default_language and its route
+python voice-chat/text_loop.py
 ```
 
 Run either script with `--help` for the full flag list (TTS engine/model overrides, VAD sensitivity, input device selection, VRAM unload-on-exit).

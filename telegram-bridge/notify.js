@@ -224,7 +224,8 @@ export async function sendTelegramNotification(options = {}) {
     message,
     level = 'info', // 'info' | 'success' | 'warning' | 'error'
     filePath = null,
-    targetChatId = null
+    targetChatId = null,
+    reaccionable = null
   } = typeof options === 'string' ? { message: options } : options;
 
   // Se valida antes de emitir nada. Si se dejara solo la comprobación de
@@ -280,7 +281,25 @@ export async function sendTelegramNotification(options = {}) {
     });
   }
 
-  return await sendChunkedMessage(chatId, formattedText);
+  const sent = await sendChunkedMessage(chatId, formattedText);
+  // FEAT-049: el fallback textual conserva la misma autoría que una nota de
+  // voz. En mensajes troceados se registra el último, que contiene el cierre.
+  try {
+    const alma = reaccionable && typeof reaccionable.alma === 'string' ? reaccionable.alma.trim() : '';
+    const extracto = reaccionable && typeof reaccionable.extracto === 'string' ? reaccionable.extracto.trim() : '';
+    const last = Array.isArray(sent) ? sent[sent.length - 1] : sent;
+    if (alma && extracto && last?.message_id !== undefined && last?.chat?.id !== undefined) {
+      registrarReaccionable(last.message_id, {
+        alma,
+        superficie: 'telegram',
+        modalidad: 'texto',
+        extracto
+      }, last.chat.id);
+    }
+  } catch (err) {
+    console.warn(`[notify] El texto se entregó, pero no se pudo registrar como reaccionable: ${redactSecrets(err.message)}`);
+  }
+  return sent;
 }
 
 /**

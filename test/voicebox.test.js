@@ -77,7 +77,7 @@ async function main() {
     const dora = vb.resolverMotor({ name: 'Dora', default_engine: 'kokoro' }, estado);
     check('Dora → kokoro sin tamaño', dora.engine === 'kokoro' && dora.modelSize === null);
     const diego = vb.resolverMotor({ name: 'Diego Alvarez', default_engine: '' }, estado);
-    check('Diego (sin default_engine) → qwen 1.7B', diego.engine === 'qwen' && diego.modelSize === '1.7B');
+    check('perfil sin default_engine no inventa qwen', diego.unavailable && diego.reason === 'compatibility_unknown');
     const ono = vb.resolverMotor({ name: 'Ono Anna', default_engine: 'qwen_custom_voice' }, estado);
     check('Ono Anna → qwen_custom_voice 1.7B', ono.engine === 'qwen_custom_voice' && ono.modelSize === '1.7B');
     const soloChico = vb.resolverMotor({ default_engine: 'qwen' }, { 'qwen-tts-0.6B': { downloaded: true } });

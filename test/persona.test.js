@@ -131,7 +131,7 @@ async function main() {
       check('sin personality: modo neutral', /Neutral/.test(texto || ''));
     });
 
-    // Almas, fase 1: las narraciones con personality hablan desde alma.md.
+    // FEAT-049: la Soul se crea explícitamente y no deriva de elegir una voz.
     const spawns = () => fs.readFileSync(captura, 'utf8').split('\n').filter(l => l.includes('"cmd"')).map(l => JSON.parse(l));
     const ultimo = () => spawns()[spawns().length - 1];
     const promptDe = s => (s && s.args[s.args.indexOf('-p') + 1]) || '';
@@ -141,17 +141,21 @@ async function main() {
       const ruta = path.join(home, '.claude', 'lagrange-almas', 'alya', 'diario.jsonl');
       return fs.existsSync(ruta) ? fs.readFileSync(ruta, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
     };
-    const base = { voice: 'Alya', send_telegram: false, local_playback: false, voicebox_url: vbox.url };
+    const base = { voice: 'Alya', soul: 'alya', send_telegram: false, local_playback: false, voicebox_url: vbox.url };
 
-    await group('agy_say con alma: lagrange-alma sin skip, semilla y diario', async () => {
-      const primero = spawns()[0];
+    fs.mkdirSync(path.dirname(almaMd), { recursive: true });
+    fs.writeFileSync(almaMd, '# Alya\n\nSos Alya, del ALMA EXPLÍCITA DE PRUEBA.\n');
+
+    await group('agy_say con Soul explícita: lagrange-alma sin siembra implícita', async () => {
+      await server.callTool('agy_say', { ...base, text: 'Con Soul explícita.', personality: true }, 60000);
+      const primero = ultimo();
       check('corrió como lagrange-alma', agenteDe(primero) === 'lagrange-alma', JSON.stringify(primero && primero.args));
       check('sin skip ni --mode plan', !primero.args.includes('--dangerously-skip-permissions') && !primero.args.includes('--mode'));
-      check('sembró alma.md desde el perfil', fs.existsSync(almaMd) && fs.readFileSync(almaMd, 'utf8').includes('Orgullosa y tsundere'));
-      check('el prompt trae el alma', /soul file alma\.md/.test(promptDe(primero)) && promptDe(primero).includes('Orgullosa y tsundere'));
+      check('usa el alma preexistente sin derivarla del perfil', fs.readFileSync(almaMd, 'utf8').includes('ALMA EXPLÍCITA') && !fs.readFileSync(almaMd, 'utf8').includes('Orgullosa y tsundere'));
+      check('el prompt trae el alma', /soul file alma\.md/.test(promptDe(primero)) && promptDe(primero).includes('ALMA EXPLÍCITA'));
       check('instaló el agent.md en el HOME', fs.existsSync(path.join(home, '.gemini', 'config', 'agents', 'lagrange-alma', 'agent.md')));
       const d = diario();
-      check('diario: la semilla y la narración', d.some(e => e.tipo === 'semilla') && d.some(e => e.superficie === 'narracion' && e.herramienta === 'agy_say'));
+      check('diario: narración pero ninguna siembra implícita', !d.some(e => e.tipo === 'semilla') && d.some(e => e.superficie === 'narracion' && e.herramienta === 'agy_say'));
 
       fs.writeFileSync(almaMd, '# Alya\n\nSos una voz EDITADA A MANO.\n');
       const res = await server.callTool('agy_say', { ...base, text: 'Otra vez.', personality: true }, 60000);
@@ -167,7 +171,7 @@ async function main() {
       check('agy_narrate con alma: lagrange-alma y el alma editada', agenteDe(ultimo()) === 'lagrange-alma' && promptDe(ultimo()).includes('EDITADA A MANO'), JSON.stringify(ultimo() && ultimo().args).slice(0, 300));
 
       const narraciones = diario().filter(e => e.superficie === 'narracion' && e.herramienta);
-      check('diario: cuatro narraciones, ninguna sin personality', narraciones.length === 4, String(narraciones.length));
+      check('diario: cuatro narraciones Soul explícitas', narraciones.length === 4, String(narraciones.length));
     });
 
     await group('sin el agente: el régimen de siempre, y lo dice', async () => {

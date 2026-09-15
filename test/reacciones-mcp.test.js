@@ -117,7 +117,7 @@ async function main() {
     });
 
     const base = {
-      voice: 'Alya', local_playback: false, send_telegram: true, voicebox_url: vbox.url
+      voice: 'Alya', soul: 'alya', local_playback: false, send_telegram: true, voicebox_url: vbox.url
     };
     await group('narraciones: solo las emitidas con alma son reaccionables', async () => {
       const inicio = envios().length;
@@ -129,7 +129,7 @@ async function main() {
           && envios()[inicio].reaccionable.extracto.length > 0,
         JSON.stringify(envios()[inicio]));
 
-      res = await server.callTool('agy_say', { ...base, text: 'Texto neutral.' }, 60000);
+      res = await server.callTool('agy_say', { ...base, soul: undefined, text: 'Texto neutral.' }, 60000);
       check('agy_say neutral no inventa autoría', !res.result?.isError && !envios()[inicio + 1]?.reaccionable, JSON.stringify(envios()[inicio + 1]));
 
       res = await server.callTool('agy_narrate', { ...base, personality: true, cwd }, 60000);
@@ -139,7 +139,7 @@ async function main() {
 
       res = await server.callTool('agy_session_summary', {
         session_id: 'sess-reaccion', cwd, output_path: path.join(cwd, 'resumen.md'),
-        narrate: true, personality: true,
+        narrate: true, personality: true, soul: 'alya',
         voice: 'Alya', voicebox_url: vbox.url, send_telegram: true, local_playback: false
       }, 60000);
       check('el digest con alma propaga reaccionable',

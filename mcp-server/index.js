@@ -38,6 +38,7 @@ const almas = require('./almas/index.js');
 const { esfuerzoParaCli, validarModeloEsfuerzo } = require('./lib/cli-compat.js');
 const vb = require('./voicebox-server.js');
 const om = require('./omnivoice.js');
+const vr = require('./voice-resolution.js');
 
 // Verdad de campo para la verificacion. Si el directorio no es un repositorio
 // git, se devuelve vacio y los chequeos que dependen de esto simplemente no
@@ -149,7 +150,8 @@ const CLAVES_VOICEBOX_CONFIG = [
   'omnivoice_port',
   'omnivoice_dir',
   'omnivoice_class_temperature',
-  'voz_por_perfil'
+  'voz_por_perfil',
+  'voice_setup'
 ];
 
 function saveConfig(updates, scope = 'global', cwd = process.cwd()) {
@@ -641,6 +643,66 @@ const OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS = Object.freeze({
   openWorldHint: true
 });
 
+const VOICE_IDENTITY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    mode: { type: 'string', enum: ['neutral', 'soul', 'profile'] },
+    soul: { type: 'string', maxLength: 64 }
+  },
+  required: ['mode']
+};
+
+const VOICE_AUDIO_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    profile: { type: 'string', maxLength: 128 },
+    provider: { type: 'string', enum: ['voicebox', 'omnivoice'] },
+    engine: { type: 'string', maxLength: 64 },
+    model_size: { type: 'string', maxLength: 32 }
+  },
+  required: ['profile', 'provider']
+};
+
+const VOICE_DEFAULT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { identity: VOICE_IDENTITY_SCHEMA, audio: VOICE_AUDIO_SCHEMA },
+  required: ['identity', 'audio']
+};
+
+const VOICE_SETUP_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    version: { type: 'number', enum: [3] },
+    status: { type: 'string', enum: ['configured', 'unconfigured'] },
+    languages: { type: 'array', uniqueItems: true, items: { type: 'string', enum: ['es', 'en'] } },
+    default_language: { type: 'string', enum: ['es', 'en'] },
+    defaults: {
+      type: 'object', additionalProperties: false,
+      properties: { es: VOICE_DEFAULT_SCHEMA, en: VOICE_DEFAULT_SCHEMA }
+    },
+    fallbacks: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        es: { type: 'array', maxItems: 3, items: VOICE_AUDIO_SCHEMA },
+        en: { type: 'array', maxItems: 3, items: VOICE_AUDIO_SCHEMA }
+      }
+    }
+  },
+  required: ['version', 'status', 'languages']
+};
+
+const ADVANCED_VOICE_PROPERTIES = {
+  voice: { type: 'string', description: 'Acoustic voice profile. Supplying it explicitly authorizes this one voice operation.' },
+  soul: { type: 'string', description: 'Optional Soul key, independent from the acoustic voice profile.' },
+  provider: { type: 'string', enum: ['omnivoice', 'voicebox'], description: 'Advanced provider override. `motor` remains a deprecated alias.' },
+  engine: { type: 'string', description: 'Advanced Voicebox engine override.' },
+  model_size: { type: 'string', description: 'Advanced model-size override for versioned Voicebox engines.' }
+};
+
 const TOOLS = [
   {
     name: 'agy_run',
@@ -1043,6 +1105,10 @@ const TOOLS = [
           type: 'object',
           additionalProperties: { type: 'string', enum: ['omnivoice', 'voicebox'] },
           description: 'Per-voice engine override, e.g. {"Priscilla": "voicebox"}. Wins over modo.'
+        },
+        voice_setup: {
+          ...VOICE_SETUP_SCHEMA,
+          description: 'Explicit FEAT-049 voice setup. Project scope replaces the complete global object; setup never starts or downloads voice resources.'
         }
       }
     }
@@ -1110,6 +1176,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...ADVANCED_VOICE_PROPERTIES,
         action: {
           type: 'string',
           enum: ['start', 'send', 'drain', 'status', 'stop', 'confirm', 'stop_exec'],
@@ -1143,7 +1210,7 @@ const TOOLS = [
         },
         alma: {
           type: 'string',
-          description: 'Voice name or soul key ("Alya", "Diego Alvarez") whose soul primes the session on "start": its identity, what it knows about the user and its memory go in before the priming, and when the session is stopped a detached process decides what to remember from the conversation. Without it the session behaves exactly as before. A soul problem never fails the session: it starts without one and says so.'
+          description: 'Deprecated alias for an explicit Soul key. It is independent from the acoustic `voice` profile and never creates a Soul implicitly.'
         },
         conversation_id: {
           type: 'string',
@@ -1167,7 +1234,7 @@ const TOOLS = [
         },
         voicebox_model_size: {
           type: 'string',
-          description: 'TTS model size to pre-warm in Voicebox (e.g. "1.7B", "0.6B"). Defaults to "1.7B".'
+          description: 'TTS model size to pre-warm in Voicebox (e.g. "1.7B", "0.6B"). Required when pre-warming a versioned Qwen model.'
         },
         voicebox_url: {
           type: 'string',
@@ -1187,6 +1254,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...ADVANCED_VOICE_PROPERTIES,
         voice: {
           type: 'string',
           description: 'Voice profile name or keyword (e.g. "Emily", "Diego Alvarez", "Isabel", "Aria", "Aiden"). Defaults to "Emily" for English and "Diego Alvarez" for Spanish.'
@@ -1256,6 +1324,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...ADVANCED_VOICE_PROPERTIES,
         text: {
           type: 'string',
           description: 'The text to speak. Written for the ear, not the eye: keep it to a couple of sentences. Markdown, code blocks, URLs, file paths and emoji are stripped automatically (they are unlistenable), and anything that looks like a secret is redacted before it is spoken or sent. Text beyond ~1200 characters is truncated at a sentence boundary — pass polish:true instead to have it condensed.'
@@ -2094,6 +2163,31 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
   return out;
 }
 
+function formatTextOnlyOutput({ spokenText, destino, emision, personality, personaAplicada, alma }) {
+  const profile = destino.profile;
+  let out = `**Texto conservado:**\n> "${spokenText}"\n\n`;
+  out += `**Estado de entrega:** \`text-only\`\n`;
+  out += `- **Motivo**: \`${destino.reason || 'provider_unavailable'}\``;
+  if (destino.reasons && destino.reasons.length > 1) out += ` (${destino.reasons.join(', ')})`;
+  out += '\n';
+  if (profile) out += `- **Perfil acústico solicitado**: \`${profile.name}\`\n`;
+  if (destino.decision?.identity?.mode === 'soul') out += `- **Identidad**: Soul \`${destino.decision.identity.soul}\`\n`;
+  else if (personality && personaAplicada) out += '- **Identidad**: personalidad de perfil aplicada\n';
+  else if (alma && alma.aviso) out += `- **Identidad**: neutral (${alma.aviso})\n`;
+  if (emision.localPlaybackOmitted) out += '- **Reproducción local**: omitida porque no hubo audio (`playback_omitted_text_only`)\n';
+  if (emision.telegramDelivered) out += '- **Telegram**: texto entregado\n';
+  else if (emision.telegramError) out += `- **Telegram**: falló el envío de texto — ${emision.telegramError}\n`;
+  else out += '- **Telegram**: no solicitado\n';
+  return out;
+}
+
+function personalityEnabled(args, destino) {
+  if (args.personality === false) return false;
+  if (args.personality === true) return true;
+  return Boolean(destino.decision && destino.decision.identity
+    && (destino.decision.identity.mode !== 'neutral' || destino.decision.identity.reason));
+}
+
 /**
  * Resuelve Voicebox y el perfil de voz, o devuelve el error ya formateado para
  * el cliente. Los dos primeros pasos son identicos en ambas herramientas.
@@ -2117,50 +2211,35 @@ function formatNarrationOutput({ spokenText, profile, language, personality, loc
  * hay forma de sembrar otra voz. Una narración nunca falla por el alma: con un
  * aviso, sigue con la persona del perfil como antes.
  */
-function almaParaNarrar(profile) {
-  const { rutas, semilla, contexto, diario } = almas;
-  const clave = profile && rutas.claveDeVoz(profile.name);
-  if (!clave) return { aviso: 'la voz no tiene un nombre que sirva de alma' };
+function almaParaNarrar(profile, identity = null) {
+  const { rutas, contexto } = almas;
+  if (identity && identity.reason === 'identity_unavailable') {
+    return { aviso: `identity_unavailable: la Soul ${identity.requested_soul || ''} no existe` };
+  }
+  if (!identity || identity.mode !== 'soul') {
+    return identity && identity.mode === 'profile'
+      ? { aviso: 'personalidad efímera tomada del perfil; no usa una Soul' }
+      : null;
+  }
+  const clave = identity.soul;
+  if (!clave) return { aviso: 'no se declaró una clave de Soul' };
   try {
-    let sembrada = false;
-    if (!fs.existsSync(rutas.rutasDe(clave).alma)) {
-      sembrada = semilla.sembrar(clave, profile).creado;
-      if (sembrada) diario.anotar(clave, { superficie: 'narracion', tipo: 'semilla', resumen: 'sembrada al narrar' });
-    }
+    if (!fs.existsSync(rutas.rutasDe(clave).alma)) return { aviso: `la Soul ${clave} no existe` };
     const id = contexto.identidad(clave);
     if (!id) return { aviso: 'alma.md está vacía' };
-    return { clave, texto: id.texto, recortado: id.recortado, sembrada };
+    return { clave, texto: id.texto, recortado: id.recortado, sembrada: false };
   } catch (err) {
     return { aviso: `no se pudo leer el alma (${err.message})` };
   }
 }
 
-/**
- * FEAT-044 — El alma que prima una charla de voz: `{clave, texto}`, o
- * `{aviso}`. A diferencia de `almaParaNarrar`, acá solo llega un nombre, así
- * que para sembrar hay que ir a buscar el perfil a Voicebox — con la misma
- * búsqueda estricta de la fase 0, que nunca cae en otra voz. El timeout es
- * corto a propósito: los dos loops le piden `/profiles` a Voicebox segundos
- * antes (`voice-chat/common.py:233`), así que si no contesta en 1,5 s no está,
- * y la charla no puede esperar 4 s por una siembra.
- */
-async function almaParaCharla(nombre, voiceboxUrl) {
-  const { rutas, semilla, contexto, diario } = almas;
+/** FEAT-049 — una charla solo usa una Soul que ya exista; la voz no la crea. */
+async function almaParaCharla(nombre) {
+  const { rutas, contexto } = almas;
   const clave = rutas.claveDeVoz(nombre);
   if (!clave) return { aviso: 'el nombre no sirve de alma' };
   try {
-    if (!fs.existsSync(rutas.rutasDe(clave).alma)) {
-      let perfil = null;
-      try {
-        perfil = semilla.perfilPorNombre(await getVoiceboxProfiles(voiceboxUrl, { timeoutMs: 1500 }), nombre);
-      } catch (err) {
-        return { aviso: `no se pudo leer el perfil para sembrarla (${err.message})` };
-      }
-      if (!perfil) return { aviso: 'ninguna voz de Voicebox resuelve ese nombre' };
-      if (semilla.sembrar(clave, perfil).creado) {
-        diario.anotar(clave, { superficie: 'voz', tipo: 'semilla', resumen: 'sembrada al abrir la charla' });
-      }
-    }
+    if (!fs.existsSync(rutas.rutasDe(clave).alma)) return { aviso: `la Soul ${clave} no existe` };
     const texto = contexto.componerContexto(clave, { conMemoria: true });
     if (!texto) return { aviso: 'alma.md está vacía' };
     return { clave, texto };
@@ -2282,118 +2361,198 @@ function camposEmision(destino) {
  * Voicebox diciendo por qué. Si Voicebox no levanta pero la voz sale por
  * OmniVoice, perfiles y muestra vienen de la caché de voces.
  */
-async function prepareNarrationTarget(args, config, opciones = {}) {
+async function buildVoiceSnapshot(args, config, { allowStart = false } = {}) {
   const voiceboxUrl = resolveVoiceboxUrl(args, config);
-  const modo = args.modo === 'diferido' || args.modo === 'inmediato' ? args.modo : (opciones.modoPorDefecto || 'inmediato');
-  const errorTexto = (texto, isError = false) => ({
-    error: { ...(isError ? { isError: true } : {}), content: [{ type: 'text', text: texto }] }
-  });
-
-  // Si no corre, se levanta sin GUI. El error ya nombra la causa.
-  const health = await vb.ensureVoicebox(voiceboxUrl, { config });
+  let health = await vb.salud(voiceboxUrl);
   let profiles = null;
-  let errorPerfiles = health.ok ? null : health.error;
+  let desdeCache = false;
   if (health.ok) {
     try {
       profiles = await getVoiceboxProfiles(voiceboxUrl);
       om.guardarCacheVoces({ perfiles: profiles });
-    } catch (err) {
-      errorPerfiles = `Error al consultar los perfiles de voz de Voicebox: ${err.message}`;
-    }
+    } catch {}
   }
-  let desdeCache = false;
   if (!profiles) {
     const cache = om.leerCacheVoces();
-    if (!(cache && Array.isArray(cache.perfiles) && cache.perfiles.length)) {
-      return errorTexto(`⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${errorPerfiles}`);
+    if (cache && Array.isArray(cache.perfiles) && cache.perfiles.length) {
+      profiles = cache.perfiles;
+      desdeCache = true;
     }
-    profiles = cache.perfiles;
-    desdeCache = true;
+  }
+  // Solo una emisión ya autorizada puede arrancar Voicebox para completar el
+  // snapshot. Discovery y una instalación sin setup no pasan allowStart.
+  if ((!profiles || !health.ok) && allowStart) {
+    const started = await vb.ensureVoicebox(voiceboxUrl, { config });
+    if (started.ok) {
+      health = started;
+      try {
+        profiles = await getVoiceboxProfiles(voiceboxUrl);
+        om.guardarCacheVoces({ perfiles: profiles });
+        desdeCache = false;
+      } catch {}
+    }
+  }
+  profiles = profiles || [];
+  let models = [];
+  if (health.ok) {
+    try { models = await vb.estadoModelos(voiceboxUrl); } catch {}
+  }
+  const samples = {};
+  for (const profile of profiles) {
+    try {
+      const sample = await om.muestraDePerfil(health.ok ? voiceboxUrl : null, profile);
+      if (sample) {
+        samples[String(profile.id || profile.name).toLowerCase()] = {
+          sample_exists: fs.existsSync(sample.audioPath),
+          sample_path_token: sample.audioPath,
+          ref_text_present: Boolean(sample.refText),
+          sample
+        };
+      }
+    } catch {}
+  }
+  const omniInstalled = om.omniInstalado({ config });
+  const omniUrl = om.urlOmni(config);
+  const omniHealth = omniInstalled ? await vb.salud(omniUrl, 1500) : { ok: false };
+  const souls = {};
+  for (const key of almas.rutas.listarClaves()) souls[key] = true;
+  return {
+    voiceboxUrl,
+    health,
+    omniUrl,
+    desdeCache,
+    snapshot: {
+      profiles,
+      voicebox: {
+        reachable: Boolean(health.ok),
+        installed: Boolean(vb.resolverEjecutable().exe),
+        startable: Boolean(health.ok || vb.resolverEjecutable().exe),
+        models
+      },
+      omnivoice: {
+        reachable: Boolean(omniHealth.ok),
+        installed: omniInstalled,
+        startable: omniInstalled,
+        weights_downloaded: omniInstalled,
+        loaded: false
+      },
+      samples,
+      souls
+    }
+  };
+}
+
+async function emitTextOnly({ spokenText, sendTelegram = true, localPlayback = false, alma = null, reason = 'provider_unavailable' }) {
+  let telegramDelivered = false;
+  let telegramError = null;
+  if (sendTelegram) {
+    try {
+      const payload = {
+        title: 'Narración entregada como texto',
+        message: spokenText,
+        level: 'warning'
+      };
+      const clave = typeof alma === 'string' ? alma.trim() : String(alma?.clave || '').trim();
+      if (clave) payload.reaccionable = { alma: clave, extracto: spokenText };
+      const result = await invokeTelegramBridge('--notify-json', payload);
+      telegramDelivered = Boolean(result && result.ok);
+      if (!telegramDelivered) telegramError = result?.error || 'Fallo desconocido enviando texto a Telegram.';
+    } catch (err) {
+      telegramError = err.message;
+    }
+  }
+  return {
+    ok: true,
+    textOnly: true,
+    reason,
+    localPlaybackOmitted: Boolean(localPlayback),
+    localPlayed: false,
+    telegramDelivered,
+    telegramError
+  };
+}
+
+function textOnlyTarget(decision, built, modo) {
+  return {
+    status: 'text-only',
+    decision,
+    reason: decision.reason || 'provider_unavailable',
+    reasons: decision.reasons || [],
+    profile: decision.profile || null,
+    language: decision.language || 'es',
+    voiceboxUrl: built.voiceboxUrl,
+    health: built.health,
+    modo,
+    desdeCache: built.desdeCache,
+    voiceResolution: { isFallback: false, reason: decision.reason || 'text_only' }
+  };
+}
+
+async function prepareNarrationTarget(args, config, opciones = {}) {
+  const modo = args.modo === 'diferido' || args.modo === 'inmediato' ? args.modo : (opciones.modoPorDefecto || 'inmediato');
+  const explicitVoice = Boolean(args.voice || args.profile);
+  const state = vr.setupState(config, args.language);
+  const authorized = explicitVoice || state === 'configured';
+
+  if (!authorized) {
+    const built = { voiceboxUrl: resolveVoiceboxUrl(args, config), health: { ok: false }, desdeCache: false };
+    return textOnlyTarget(vr.resolveVoice({ args: { ...args, modo }, config, snapshot: { souls: {} } }), built, modo);
   }
 
-  let voiceResolution;
-  try {
-    voiceResolution = resolveVoiceProfile(profiles, args.voice, args.language);
-  } catch (err) {
-    return errorTexto(`⚠️ Error resolviendo el perfil de voz: ${err.message}`);
-  }
-  const perfil = voiceResolution.profile;
+  const built = await buildVoiceSnapshot(args, config, { allowStart: true });
+  let decision = vr.resolveVoice({ args: { ...args, modo }, config, snapshot: built.snapshot });
+  if (decision.status !== 'audio') return textOnlyTarget(decision, built, modo);
 
-  const preferencia = om.preferenciaProveedor({ motorPedido: args.motor, modo, perfil, config });
-  let proveedor = 'voicebox';
-  let motivoProveedor = preferencia.motivo;
+  const perfil = decision.profile;
+  const proveedor = decision.audio.provider;
   let muestra = null;
   let omniUrl = null;
-  if (preferencia.proveedor === 'omnivoice') {
-    if (!om.omniInstalado({ config })) {
-      motivoProveedor = 'OmniVoice no está instalado (npm run omnivoice:install)';
-    } else {
-      muestra = await om.muestraDePerfil(health.ok ? voiceboxUrl : null, perfil);
-      if (!muestra) {
-        motivoProveedor = `${perfil.name} no tiene muestra (perfil preset): OmniVoice necesita una para clonar`;
-      } else if (!fs.existsSync(muestra.audioPath)) {
-        // Sin esto, OmniVoice respondería con un error de Python al abrir el archivo.
-        motivoProveedor = `la muestra de ${perfil.name} ya no está en disco (${muestra.audioPath})`;
-        muestra = null;
-      } else {
-        const s = await om.ensureOmniVoice(om.urlOmni(config), { config });
-        if (s.ok) {
-          proveedor = 'omnivoice';
-          omniUrl = om.urlOmni(config);
-        } else {
-          motivoProveedor = `OmniVoice no arrancó: ${s.error}`;
-          muestra = null;
-        }
-      }
+  if (proveedor === 'omnivoice') {
+    const entry = built.snapshot.samples[String(perfil.id || perfil.name).toLowerCase()];
+    muestra = entry && entry.sample;
+    const started = await om.ensureOmniVoice(built.omniUrl, { config });
+    if (!started.ok) {
+      decision = { ...decision, status: 'text-only', reason: 'provider_unavailable', reasons: ['provider_unavailable'] };
+      return textOnlyTarget(decision, built, modo);
     }
-  }
-  const fallback = preferencia.proveedor === 'omnivoice' && proveedor !== 'omnivoice';
-  if (proveedor === 'voicebox' && !health.ok) {
-    return errorTexto(`⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}` +
-      (fallback ? `\n\nY OmniVoice no se pudo usar: ${motivoProveedor}.` : ''));
+    omniUrl = built.omniUrl;
   }
 
-  // Motor y VRAM: el modelo de esta voz pasa a ser el activo. El coordinador ve
-  // los dos servidores, respeta el pin y descarga los TTS ajenos sin uso.
-  let motor;
-  if (proveedor === 'omnivoice') {
-    motor = { engine: vb.MODELO_OMNI, modelSize: null };
-  } else {
-    const modelos = {};
-    try {
-      for (const m of await vb.estadoModelos(voiceboxUrl)) modelos[m.model_name] = m;
-    } catch {}
-    motor = vb.resolverMotor(perfil, modelos);
-  }
+  const motor = proveedor === 'omnivoice'
+    ? { engine: vb.MODELO_OMNI, modelSize: null }
+    : { engine: decision.audio.engine, modelSize: decision.audio.model_size };
   let activacion;
   try {
-    activacion = await vb.aplicarModeloActivo(servidoresVoz(health.ok ? voiceboxUrl : null, config), {
+    activacion = await vb.aplicarModeloActivo(servidoresVoz(built.health.ok ? built.voiceboxUrl : null, config), {
       proveedor,
       ...motor,
       voz: perfil.name,
       fijar: Boolean(args.keep_model)
     });
   } catch (err) {
-    // Sin inventario no se puede ordenar la VRAM, pero sí se puede hablar.
-    activacion = { ok: true, omitida: err.message };
+    return { ...textOnlyTarget({ ...decision, status: 'blocked', reason: 'vram_blocked' }, built, modo), status: 'blocked', error: err.message };
   }
-  if (!activacion.ok) return errorTexto(`⚠️ ${activacion.error}`, true);
+  if (!activacion.ok) {
+    return { ...textOnlyTarget({ ...decision, status: 'blocked', reason: activacion.conflicto ? 'pin_conflict' : 'vram_blocked' }, built, modo), status: 'blocked', error: activacion.error };
+  }
 
   return {
-    voiceboxUrl,
-    voiceResolution,
+    status: 'audio',
+    decision,
+    voiceboxUrl: built.voiceboxUrl,
+    voiceResolution: { isFallback: decision.fallback, reason: decision.fallback ? 'declared_fallback' : 'selected' },
     profile: perfil,
-    language: voiceResolution.language,
+    language: decision.language,
     motor,
     activacion,
-    health,
+    health: built.health,
     proveedor,
-    motivoProveedor,
-    fallback,
+    motivoProveedor: decision.fallback ? `fallback declarado tras: ${decision.reasons.join(', ')}` : 'ruta seleccionada',
+    fallback: decision.fallback,
     modo,
     muestra,
     omniUrl,
-    desdeCache,
+    desdeCache: built.desdeCache,
     classTemperature: config.omnivoiceClassTemperature,
     avisoMuestra: proveedor === 'omnivoice' ? om.avisoMuestraLarga(muestra, perfil) : null
   };
@@ -3207,12 +3366,27 @@ async function handleToolCall(name, args) {
         if (args[clave] !== undefined) updates[clave] = args[clave];
       }
 
+      if (updates.voice_setup !== undefined) {
+        try {
+          vr.validateVoiceSetup(updates.voice_setup);
+        } catch (err) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `No se guardó voice_setup: ${err.message}` }]
+          };
+        }
+      }
+
       const result = saveConfig(updates, scope, args.cwd);
+      const voiceSetup = result.config.voice_setup;
+      const voiceSetupSummary = voiceSetup
+        ? `\n- Voice setup: ${voiceSetup.status} · v${voiceSetup.version} · idiomas [${(voiceSetup.languages || []).join(', ')}]${voiceSetup.default_language ? ` · principal ${voiceSetup.default_language}` : ''}`
+        : '\n- Voice setup: unconfigured';
       return {
         content: [
           {
             type: 'text',
-            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || '(none: agy decides)'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Fanout statusline: ${result.config.fanout_statusline === false ? 'disabled' : 'enabled'}\n- Voicebox: autostart ${result.config.voicebox_autostart === false ? 'off' : 'on'}, idle unload ${result.config.voicebox_idle_unload_minutes ?? 10}m, idle shutdown ${result.config.voicebox_idle_shutdown_minutes ?? 30}m, statusline ${result.config.statusline_voicebox === false ? 'off' : 'on'}${result.config.voicebox_url ? `, url ${result.config.voicebox_url}` : ''}${result.config.voicebox_port ? `, port ${result.config.voicebox_port}` : ''}${result.config.voicebox_server_exe ? `, exe ${result.config.voicebox_server_exe}` : ''}${result.config.voz_por_perfil ? `, voz_por_perfil ${JSON.stringify(result.config.voz_por_perfil)}` : ''}${result.config.omnivoice_class_temperature !== undefined ? `, omnivoice class_temperature ${result.config.omnivoice_class_temperature}` : ''}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
+            text: `Antigravity configuration updated successfully (${scope} scope in ${result.targetFile}):\n- Default Model: ${result.config.model || '(cli default)'}\n- Default Effort: ${result.config.effort || '(none: agy decides)'}\n- Default Timeout: ${result.config.timeout_minutes || 15}m\n- Fanout statusline: ${result.config.fanout_statusline === false ? 'disabled' : 'enabled'}\n- Voicebox: autostart ${result.config.voicebox_autostart === false ? 'off' : 'on'}, idle unload ${result.config.voicebox_idle_unload_minutes ?? 10}m, idle shutdown ${result.config.voicebox_idle_shutdown_minutes ?? 30}m, statusline ${result.config.statusline_voicebox === false ? 'off' : 'on'}${result.config.voicebox_url ? `, url ${result.config.voicebox_url}` : ''}${result.config.voicebox_port ? `, port ${result.config.voicebox_port}` : ''}${result.config.voicebox_server_exe ? `, exe ${result.config.voicebox_server_exe}` : ''}${result.config.voz_por_perfil ? `, voz_por_perfil ${JSON.stringify(result.config.voz_por_perfil)}` : ''}${result.config.omnivoice_class_temperature !== undefined ? `, omnivoice class_temperature ${result.config.omnivoice_class_temperature}` : ''}${voiceSetupSummary}\n- Permissions: ${JSON.stringify(result.config.permissions || {}, null, 2)}`
           }
         ]
       };
@@ -3818,9 +3992,15 @@ async function handleToolCall(name, args) {
         });
 
         let prewarmNote = '';
-        if (args.prewarm_voicebox !== false) {
+        const setup = config.voiceSetup || config.voice_setup || null;
+        const setupLang = vr.language(args.language) || (setup && setup.default_language);
+        const setupAudio = setup && setup.defaults && setup.defaults[setupLang] && setup.defaults[setupLang].audio;
+        const voiceAuthorized = Boolean(args.voice || args.profile) || vr.setupState(config, setupLang) === 'configured';
+        const prewarmProvider = args.provider || args.motor || (setupAudio && setupAudio.provider);
+        const prewarmSize = args.voicebox_model_size || args.model_size || (setupAudio && setupAudio.model_size);
+        if (args.prewarm_voicebox !== false && voiceAuthorized && prewarmProvider === 'voicebox' && prewarmSize) {
           const voiceboxUrl = resolveVoiceboxUrl(args, config);
-          const modelSize = args.voicebox_model_size || '1.7B';
+          const modelSize = prewarmSize;
           // Además de precargar: levanta Voicebox si no corre, y respeta el pin
           // y la regla de un solo TTS residente antes de cargar (plan A y C).
           (async () => {
@@ -3852,8 +4032,9 @@ async function handleToolCall(name, args) {
         // los archivos y la eventual siembra se solapan con su arranque. Un
         // problema del alma nunca frena la charla: queda como aviso.
         let almaNota = '';
-        if (args.alma) {
-          const alma = await almaParaCharla(args.alma, resolveVoiceboxUrl(args, config));
+        const soulKey = args.soul || args.alma;
+        if (soulKey) {
+          const alma = await almaParaCharla(soulKey);
           if (alma.clave) {
             session.alma = { clave: alma.clave };
             session.almaTexto = alma.texto;
@@ -4468,16 +4649,14 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       // sale en persona en esta misma llamada a agy, sin reescribirlo después.
       // Si falla, el resumen sigue sin persona y la narración informa el fallo.
       let destinoVoz = null;
-      if (args.narrate && args.personality) {
-        const d = await prepareNarrationTarget(args, config, { modoPorDefecto: 'diferido' });
-        if (!d.error) destinoVoz = d;
-      }
+      if (args.narrate) destinoVoz = await prepareNarrationTarget(args, config, { modoPorDefecto: 'diferido' });
       // Almas, fase 1: el digest en persona habla desde alma.md. La llamada del
       // resumen conserva su régimen (modelo por tamaño, sus permisos): cambiarle
       // el agente cambiaría el documento entero, no solo el digest. Solo cambia
       // el texto de la persona, que escribe el usuario, sin memoria del modelo.
-      const almaResumen = destinoVoz ? almaParaNarrar(destinoVoz.profile) : null;
-      const personaResumen = destinoVoz
+      const conIdentidadResumen = destinoVoz ? personalityEnabled(args, destinoVoz) : false;
+      const almaResumen = conIdentidadResumen ? almaParaNarrar(destinoVoz.profile, destinoVoz.decision?.identity) : null;
+      const personaResumen = conIdentidadResumen
         ? (almaResumen && almaResumen.texto ? { ...destinoVoz.profile, alma: almaResumen.texto } : destinoVoz.profile)
         : null;
       const summarySystemPrompt = getSummaryPrompt(focus, Boolean(args.narrate), personaResumen);
@@ -4681,11 +4860,9 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         } else {
           // Diferido por defecto: el resumen se narra cuando termina, nadie lo espera en vivo.
           const destino = destinoVoz || await prepareNarrationTarget(args, config, { modoPorDefecto: 'diferido' });
-          if (destino.error) {
-            formatted += `- Narracion: fallo la preparacion de voz; el digest va abajo en texto\n`;
-          } else {
-            const { text: textoHablado } = normalizeSpokenText(digestHablado);
-            const emision = await emitNarration({
+          const { text: textoHablado } = normalizeSpokenText(digestHablado);
+          const emision = destino.status === 'audio'
+            ? await emitNarration({
               spokenText: textoHablado,
               voiceboxUrl: destino.voiceboxUrl,
               profile: destino.profile,
@@ -4694,14 +4871,22 @@ Be thorough but concise. Prioritize primary sources and official documentation o
               sendTelegram: args.send_telegram !== false,
               alma: destinoVoz && almaResumen && almaResumen.texto ? almaResumen : null,
               ...camposEmision(destino)
+            })
+            : await emitTextOnly({
+              spokenText: textoHablado,
+              localPlayback: args.local_playback !== false,
+              sendTelegram: args.send_telegram !== false,
+              alma: almaResumen && almaResumen.texto ? almaResumen : null,
+              reason: destino.reason
             });
-            const conAlma = Boolean(destinoVoz && almaResumen && almaResumen.texto);
-            if (conAlma && emision && emision.ok !== false) anotarNarracion(almaResumen, 'agy_session_summary', textoHablado);
-            const enPersona = conAlma
+          const conAlma = Boolean(destinoVoz && almaResumen && almaResumen.texto);
+          if (conAlma && emision && emision.ok !== false) anotarNarracion(almaResumen, 'agy_session_summary', textoHablado);
+          const enPersona = conAlma
               ? `emitida, con el digest escrito en personaje desde el alma \`${almaResumen.clave}\``
               : (destinoVoz ? 'emitida, con el digest escrito en personaje' : 'emitida');
-            formatted += `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : enPersona}\n`;
-          }
+          formatted += destino.status === 'audio'
+            ? `- Narracion: ${emision && emision.ok === false ? `fallo (${emision.error || 'sin detalle'})` : enPersona}\n`
+            : `- Narracion: text-only (${destino.reason}); digest conservado${emision.telegramDelivered ? ' y enviado por texto a Telegram' : ''}\n`;
           formatted += `\n**Digest hablado:** ${digestHablado}\n`;
         }
       }
@@ -4728,7 +4913,6 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
       // 1-3. Voicebox, perfiles y resolucion de voz (comun con agy_say)
       const destino = await prepareNarrationTarget(args, config);
-      if (destino.error) return destino.error;
       const { voiceboxUrl, voiceResolution, profile: chosenProfile, language: targetLang } = destino;
 
       // 4. Locate the host-specific session log & extract its last checkpoint.
@@ -4760,9 +4944,9 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       }
 
       // 5. Generate conversational spoken narration script via agy (Gemini)
-      const enablePersonality = Boolean(args.personality);
+      const enablePersonality = personalityEnabled(args, destino);
       // Almas, fase 1: con personality, la persona sale de alma.md.
-      const alma = enablePersonality ? almaParaNarrar(chosenProfile) : null;
+      const alma = enablePersonality ? almaParaNarrar(chosenProfile, destino.decision?.identity) : null;
       const almaUsada = alma && alma.texto ? alma : null;
       const narratePrompt = getNarrationPrompt(checkpoint, targetLang, chosenProfile, enablePersonality, almaUsada && almaUsada.texto);
       const effectiveModel = args.model || config.defaultModel;
@@ -4814,16 +4998,24 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
       // Emision compartida con agy_say: Voicebox, altavoces, Telegram, limpieza.
       const playLocally = Boolean(args.local_playback);
-      const emision = await emitNarration({
-        spokenText,
-        voiceboxUrl,
-        profile: chosenProfile,
-        language: targetLang,
-        localPlayback: playLocally,
-        sendTelegram: args.send_telegram !== false,
-        alma: personaAplicada ? almaUsada : null,
-        ...camposEmision(destino)
-      });
+      const emision = destino.status === 'audio'
+        ? await emitNarration({
+          spokenText,
+          voiceboxUrl,
+          profile: chosenProfile,
+          language: targetLang,
+          localPlayback: playLocally,
+          sendTelegram: args.send_telegram !== false,
+          alma: personaAplicada ? almaUsada : null,
+          ...camposEmision(destino)
+        })
+        : await emitTextOnly({
+          spokenText,
+          localPlayback: playLocally,
+          sendTelegram: args.send_telegram !== false,
+          alma: personaAplicada ? almaUsada : null,
+          reason: destino.reason
+        });
 
       if (!emision.ok) {
         return {
@@ -4838,20 +5030,24 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
       // 7. Salida estructurada. La cabecera comun la genera formatNarrationOutput;
       // el contexto del checkpoint es lo unico propio de esta herramienta.
-      let out = `### 🎙️ Narración de Voz Emitida (Voicebox)\n\n`;
-      out += formatNarrationOutput({
-        spokenText,
-        profile: chosenProfile,
-        language: targetLang,
-        personality: enablePersonality,
-        localPlayback: playLocally,
-        emision,
-        voiceboxUrl,
-        voiceResolution,
-        destino,
-        personaAplicada,
-        alma: infoAlma(alma, almaConAgente, almaMotivo)
-      });
+      let out = destino.status === 'audio'
+        ? `### 🎙️ Narración de Voz Emitida\n\n${formatNarrationOutput({
+          spokenText,
+          profile: chosenProfile,
+          language: targetLang,
+          personality: enablePersonality,
+          localPlayback: playLocally,
+          emision,
+          voiceboxUrl,
+          voiceResolution,
+          destino,
+          personaAplicada,
+          alma: infoAlma(alma, almaConAgente, almaMotivo)
+        })}`
+        : `### 📝 Narración en modo texto\n\n${formatTextOnlyOutput({
+          spokenText, destino, emision, personality: enablePersonality, personaAplicada,
+          alma: infoAlma(alma, almaConAgente, almaMotivo)
+        })}`;
       out += `\n**Contexto del Checkpoint detectado:**\n`;
       out += `- **Objetivo**: ${checkpoint.userGoal.slice(0, 150)}${checkpoint.userGoal.length > 150 ? '...' : ''}\n`;
       // Se informa el retroceso: si la petición de narrar no contenía trabajo,
@@ -4887,12 +5083,11 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       }
 
       const destino = await prepareNarrationTarget(args, config);
-      if (destino.error) return destino.error;
       const { voiceboxUrl, voiceResolution, profile: chosenProfile, language: targetLang } = destino;
 
-      const enablePersonality = Boolean(args.personality);
+      const enablePersonality = personalityEnabled(args, destino);
       // Almas, fase 1: con personality, la persona sale de alma.md.
-      const alma = enablePersonality ? almaParaNarrar(chosenProfile) : null;
+      const alma = enablePersonality ? almaParaNarrar(chosenProfile, destino.decision?.identity) : null;
       const almaUsada = alma && alma.texto ? alma : null;
       let almaConAgente = false;
       let almaMotivo = null;
@@ -4964,16 +5159,24 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       }
 
       const playLocally = Boolean(args.local_playback);
-      const emision = await emitNarration({
-        spokenText,
-        voiceboxUrl,
-        profile: chosenProfile,
-        language: targetLang,
-        localPlayback: playLocally,
-        sendTelegram: args.send_telegram !== false,
-        alma: personaAplicada ? almaUsada : null,
-        ...camposEmision(destino)
-      });
+      const emision = destino.status === 'audio'
+        ? await emitNarration({
+          spokenText,
+          voiceboxUrl,
+          profile: chosenProfile,
+          language: targetLang,
+          localPlayback: playLocally,
+          sendTelegram: args.send_telegram !== false,
+          alma: personaAplicada ? almaUsada : null,
+          ...camposEmision(destino)
+        })
+        : await emitTextOnly({
+          spokenText,
+          localPlayback: playLocally,
+          sendTelegram: args.send_telegram !== false,
+          alma: personaAplicada ? almaUsada : null,
+          reason: destino.reason
+        });
 
       if (!emision.ok) {
         return {
@@ -4986,20 +5189,24 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
       if (personaAplicada && almaUsada) anotarNarracion(almaUsada, 'agy_say', spokenText);
 
-      let out = `### 🗣️ Texto Narrado (Voicebox)\n\n`;
-      out += formatNarrationOutput({
-        spokenText,
-        profile: chosenProfile,
-        language: targetLang,
-        personality: enablePersonality,
-        localPlayback: playLocally,
-        emision,
-        voiceboxUrl,
-        voiceResolution,
-        destino,
-        personaAplicada,
-        alma: infoAlma(alma, almaConAgente, almaMotivo)
-      });
+      let out = destino.status === 'audio'
+        ? `### 🗣️ Texto Narrado\n\n${formatNarrationOutput({
+          spokenText,
+          profile: chosenProfile,
+          language: targetLang,
+          personality: enablePersonality,
+          localPlayback: playLocally,
+          emision,
+          voiceboxUrl,
+          voiceResolution,
+          destino,
+          personaAplicada,
+          alma: infoAlma(alma, almaConAgente, almaMotivo)
+        })}`
+        : `### 📝 Texto conservado sin audio\n\n${formatTextOnlyOutput({
+          spokenText, destino, emision, personality: enablePersonality, personaAplicada,
+          alma: infoAlma(alma, almaConAgente, almaMotivo)
+        })}`;
       let origen = '📝 Texto del llamante, saneado localmente';
       if (polishApplied) origen = `✨ Pulido por agy (${polishDuration.toFixed(1)}s)`;
       else if (personaAplicada) origen = `🎭 Reescrito en personaje por agy (${personaDuracion.toFixed(1)}s)`;
@@ -5121,6 +5328,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       const mapa = {};
       for (const m of await vb.estadoModelos(voiceboxUrl)) mapa[m.model_name] = m;
       const motor = vb.resolverMotor(perfil || {}, mapa, args.engine || null, args.model_size || null);
+      if (motor.unavailable) return responder(`No se activó ningún modelo: ${motor.reason}. Indicá un motor/model_size descargado y compatible.`, true);
       const r = await vb.aplicarModeloActivo(servidoresVoz(voiceboxUrl, config), { ...motor, voz: perfil ? perfil.name : null, fijar: action === 'pin' });
       if (!r.ok) return responder(`⚠️ ${r.error}`, true);
       return responder(formatearActivacion(r, action, perfil ? ` (voz ${perfil.name})` : ''));
@@ -5301,30 +5509,11 @@ Be thorough but concise. Prioritize primary sources and official documentation o
 
     case 'agy_narrate_voices': {
       const voiceboxUrl = resolveVoiceboxUrl(args, config);
-
-      // 1. Voicebox arriba (se levanta sin GUI si hace falta)
-      const health = await vb.ensureVoicebox(voiceboxUrl, { config });
-      if (!health.ok) {
-        return {
-          content: [{
-            type: 'text',
-            text: `⚠️ **Voicebox no está disponible en \`${voiceboxUrl}\`**\n\n${health.error}`
-          }]
-        };
-      }
-
-      // 2. Fetch available profiles
-      let profiles = [];
-      try {
-        profiles = await getVoiceboxProfiles(voiceboxUrl);
-      } catch (err) {
-        return {
-          content: [{
-            type: 'text',
-            text: `⚠️ Error al consultar los perfiles de voz de Voicebox: ${err.message}`
-          }]
-        };
-      }
+      // Discovery es estrictamente read-only: salud, caché y archivos locales;
+      // jamás arranca proveedores, carga modelos, descarga pesos ni crea Souls.
+      const built = await buildVoiceSnapshot(args, config, { allowStart: false });
+      const health = built.health;
+      const profiles = built.snapshot.profiles;
 
       // 3. Filter if requested
       const langFilter = (args.language || 'all').toLowerCase();
@@ -5332,19 +5521,19 @@ Be thorough but concise. Prioritize primary sources and official documentation o
         ? profiles
         : profiles.filter(p => (p.language || '').toLowerCase().startsWith(langFilter));
 
-      // 4. Role tagger helper
-      function getRoleTag(name, lang) {
-        const n = (name || '').toLowerCase();
-        const l = (lang || '').toLowerCase();
-        if (n.includes('diego')) return '⭐ **Default Español**';
-        if (n.includes('emily')) return '⭐ **Default English**';
-        if (n.includes('isabel')) return '🔄 Fallback Español (P1)';
-        if (n.includes('anna') || n.includes('ono')) return '🔄 Fallback Español (P2)';
-        if (n.includes('aria')) return '🔄 Fallback English (P1)';
-        if (n.includes('aiden')) return '🔄 Fallback English (P2)';
-        if (l.startsWith('es')) return 'Disponible (es)';
-        if (l.startsWith('en')) return 'Disponible (en)';
-        return 'Disponible';
+      const setup = config.voiceSetup || config.voice_setup || null;
+      function getRoleTag(profile) {
+        const matchesProfile = (value) => [profile.id, profile.name].some(x => String(x || '').toLowerCase() === String(value || '').toLowerCase());
+        if (setup && setup.status === 'configured') {
+          for (const lang of setup.languages || []) {
+            const primary = setup.defaults && setup.defaults[lang] && setup.defaults[lang].audio;
+            if (primary && matchesProfile(primary.profile)) return `⭐ Default ${lang}`;
+            const fallbacks = setup.fallbacks && setup.fallbacks[lang] || [];
+            const pos = fallbacks.findIndex(x => matchesProfile(x.profile));
+            if (pos >= 0) return `🔄 Fallback ${lang} (P${pos + 1})`;
+          }
+        }
+        return `Disponible${profile.language ? ` (${profile.language})` : ''}`;
       }
 
       // 5. Build presentation
@@ -5352,6 +5541,9 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       let out = `### 🎙️ Perfiles de Voz en Voicebox\n\n`;
       out += `**Estado del servicio:**\n`;
       out += `- **Endpoint**: \`${voiceboxUrl}\`\n`;
+      out += `- **Voicebox**: ${health.ok ? '✅ accesible' : '⚪ detenido/no accesible (no se inició durante discovery)'}\n`;
+      out += `- **Fuente de perfiles**: ${built.desdeCache ? 'caché local' : (health.ok ? 'servicio activo' : 'sin datos')}\n`;
+      out += `- **voice_setup**: \`${vr.setupState(config, args.language)}\`\n`;
       if (hInfo.gpu_type) out += `- **Aceleración**: \`${hInfo.gpu_type}\` (${hInfo.backend_variant || 'cuda'})\n`;
       if (hInfo.model_size) out += `- **Modelo TTS**: \`${hInfo.model_size}\` (${hInfo.model_loaded ? 'Cargado en memoria' : 'Descargado'})\n`;
       out += `- **Total de perfiles instalados**: ${profiles.length}${langFilter !== 'all' ? ` (${filtered.length} mostrando filtro: \`${langFilter}\`)` : ''}\n\n`;
@@ -5360,7 +5552,7 @@ Be thorough but concise. Prioritize primary sources and official documentation o
       out += `|---|---|---|---|---|\n`;
 
       for (const p of filtered) {
-        const role = getRoleTag(p.name, p.language);
+        const role = getRoleTag(p);
         const pers = p.personality ? '✅ Sí' : '—';
         out += `| **${p.name}** | \`${p.language || '?'}\` | ${p.voice_type || 'cloned'} | ${role} | ${pers} |\n`;
       }

@@ -49,12 +49,174 @@ VOICEBOX_DATA_DIR = os.environ.get("VOICEBOX_DIR") or os.path.join(
 TIMEOUT_OMNI_S = 90
 
 
-def leer_config():
+def leer_config(cwd=None):
+    """Misma precedencia que Node: global y luego proyecto.
+
+    ``voice_setup`` se reemplaza como bloque completo; nunca se mezclan sus
+    defaults/fallbacks entre ámbitos porque eso produciría una configuración
+    que el usuario no escribió en ninguno de los dos sitios.
+    """
+    merged = {}
+    paths = [CONFIG_PATH]
+    project = os.path.join(os.path.abspath(cwd or os.getcwd()), ".claude", "antigravity.json")
+    if os.path.normcase(project) != os.path.normcase(CONFIG_PATH):
+        paths.append(project)
+    for config_path in paths:
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                value = json.load(f)
+            if isinstance(value, dict):
+                merged.update(value)
+        except (OSError, ValueError):
+            pass
+    return merged
+
+
+def resolve_voice_request(preferred_name=None, language=None, cwd=None, provider=None,
+                          engine=None, model_size=None, soul=None):
+    """Resuelve consentimiento/configuración antes de iniciar servidores o micrófono."""
+    config = leer_config(cwd)
+    setup = config.get("voice_setup")
+    selected_language = language
+    identity = {"mode": "soul", "soul": soul} if soul else {"mode": "neutral"}
+    if preferred_name:
+        legacy = config.get("voz_por_perfil") if not isinstance(setup, dict) or setup.get("status") != "configured" else {}
+        legacy_provider = next((value for name, value in (legacy or {}).items()
+                                if name.lower() == preferred_name.lower()), None)
+        return {
+            "profile": preferred_name, "language": selected_language,
+            "provider": provider or legacy_provider, "engine": engine, "model_size": model_size,
+            "identity": identity, "source": "explicit",
+            "candidates": [{"profile": preferred_name, "provider": provider or legacy_provider,
+                            "engine": engine, "model_size": model_size}]
+        }
+    if not isinstance(setup, dict) or setup.get("version") != 3 or setup.get("status") != "configured":
+        raise RuntimeError("setup_required: elegí --voice o configurá voice_setup v3 antes de iniciar Modo Charla.")
+    selected_language = selected_language or setup.get("default_language")
+    languages = setup.get("languages")
+    if (not isinstance(languages, list) or len(languages) != len(set(languages))
+            or selected_language not in languages or selected_language not in ("es", "en")):
+        raise RuntimeError("invalid_setup: languages/default_language no forman una configuración válida.")
+    default = (setup.get("defaults") or {}).get(selected_language)
+    if not isinstance(default, dict) or not isinstance(default.get("audio"), dict):
+        raise RuntimeError(f"setup_required: voice_setup no tiene un default para {selected_language!r}.")
+    audio = default["audio"]
+    configured_identity = default.get("identity") if isinstance(default.get("identity"), dict) else {"mode": "neutral"}
+    if configured_identity.get("mode") not in ("neutral", "profile", "soul"):
+        raise RuntimeError("invalid_setup: identity.mode debe ser neutral, profile o soul.")
+    if configured_identity.get("mode") == "soul" and not configured_identity.get("soul"):
+        raise RuntimeError("invalid_setup: identity.soul es obligatorio en modo soul.")
+    fallbacks = (setup.get("fallbacks") or {}).get(selected_language) or []
+    if not isinstance(fallbacks, list) or len(fallbacks) > 3:
+        raise RuntimeError("invalid_setup: se permiten hasta tres fallbacks por idioma.")
+    declared = [audio] + list(fallbacks)
+    for candidate in declared:
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("profile"), str) or not candidate["profile"].strip():
+            raise RuntimeError("invalid_setup: cada ruta requiere profile.")
+        candidate_provider = candidate.get("provider")
+        if candidate_provider not in ("voicebox", "omnivoice"):
+            raise RuntimeError("invalid_setup: provider debe ser voicebox u omnivoice.")
+        if candidate_provider == "omnivoice" and (candidate.get("engine") is not None or candidate.get("model_size") is not None):
+            raise RuntimeError("invalid_setup: OmniVoice no admite engine/model_size.")
+        if candidate_provider == "voicebox" and not candidate.get("engine"):
+            raise RuntimeError("invalid_setup: Voicebox requiere engine.")
+        if candidate_provider == "voicebox" and candidate.get("engine") in ("qwen", "qwen_custom_voice") and not candidate.get("model_size"):
+            raise RuntimeError("invalid_setup: Qwen requiere model_size.")
+    candidates = [{**candidate,
+                   "provider": provider or candidate.get("provider"),
+                   "engine": engine or candidate.get("engine"),
+                   "model_size": model_size or candidate.get("model_size")}
+                  for candidate in declared]
+    return {
+        "profile": audio.get("profile"), "language": selected_language,
+        "provider": provider or audio.get("provider"), "engine": engine or audio.get("engine"),
+        "model_size": model_size or audio.get("model_size"),
+        "identity": identity if soul else configured_identity, "source": "configured",
+        "candidates": candidates
+    }
+
+
+def _cached_profiles():
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
+        with open(CACHE_VOCES, encoding="utf-8") as f:
+            value = json.load(f)
+        return value.get("perfiles") if isinstance(value.get("perfiles"), list) else []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def _profiles_readonly():
+    try:
+        value = voicebox_request("/profiles", timeout=2)
+        return value if isinstance(value, list) else []
+    except RuntimeError:
+        return _cached_profiles()
+
+
+def resolve_and_activate_voice(mcp, selected):
+    """Consume defaults/fallbacks en orden y activa solo una ruta autorizada."""
+    profiles = _profiles_readonly()
+    started_voicebox = False
+    rejected = []
+
+    def ensure_profiles():
+        nonlocal profiles, started_voicebox
+        if not started_voicebox:
+            mcp.call_tool("agy_voice_model", {"action": "start"})
+            started_voicebox = True
+            profiles = voicebox_request("/profiles")
+
+    for candidate in selected.get("candidates") or []:
+        requested = candidate.get("profile")
+        profile = None
+        if profiles:
+            try:
+                profile = resolve_voice_profile(requested, selected.get("language"), profiles, selected.get("source") == "explicit")
+            except RuntimeError:
+                profile = None
+        if profile is None and candidate.get("provider") != "omnivoice":
+            try:
+                ensure_profiles()
+                profile = resolve_voice_profile(requested, selected.get("language"), profiles, selected.get("source") == "explicit")
+            except RuntimeError as err:
+                rejected.append(str(err))
+                continue
+        if profile is None:
+            rejected.append(f"profile_missing:{requested}")
+            continue
+        profile_language = (profile.get("language") or "")[:2].lower() or None
+        if selected.get("language") and profile_language and selected["language"] != profile_language:
+            rejected.append(f"language_mismatch:{requested}")
+            continue
+        resolved_language = selected.get("language") or profile_language or "es"
+        providers = [candidate.get("provider")] if candidate.get("provider") else ["omnivoice", "voicebox"]
+        for provider in providers:
+            if provider == "omnivoice":
+                sample = muestra_de_perfil(profile)
+                if not sample or not os.path.isfile(sample.get("audio_path", "")):
+                    rejected.append(f"sample_missing:{requested}")
+                    continue
+                try:
+                    mcp.call_tool("agy_voice_model", {"action": "activate", "engine": "omnivoice", "voice": profile["name"]})
+                    return profile, resolved_language, profile.get("default_engine"), None, "omnivoice", sample, rejected
+                except RuntimeError as err:
+                    rejected.append(str(err))
+                    continue
+            try:
+                ensure_profiles()
+                # Refrescar el perfil tras arrancar Voicebox evita usar metadata
+                # incompleta de una caché antigua.
+                profile = resolve_voice_profile(requested, resolved_language, profiles, selected.get("source") == "explicit")
+                status = get_model_status()
+                engine, size = resolve_engine_and_model(profile, status, candidate.get("engine"), candidate.get("model_size"))
+                activate = {"action": "activate", "engine": engine}
+                if size:
+                    activate["model_size"] = size
+                mcp.call_tool("agy_voice_model", activate)
+                return profile, resolved_language, engine, size, "voicebox", None, rejected
+            except RuntimeError as err:
+                rejected.append(str(err))
+    raise RuntimeError("text-only: ninguna ruta declarada es utilizable (" + "; ".join(rejected[:4]) + ")")
 
 
 def omnivoice_url():
@@ -243,27 +405,21 @@ def voicebox_request(path, method="GET", payload=None, timeout=15, raw_body=None
         )
 
 
-def resolve_voice_profile(preferred_name, language):
-    profiles = voicebox_request("/profiles")
+def resolve_voice_profile(preferred_name, language, profiles=None, partial=True):
+    profiles = profiles if profiles is not None else voicebox_request("/profiles")
     if not profiles:
         raise RuntimeError("Voicebox no devolvio ningun perfil de voz.")
 
-    if preferred_name:
-        for p in profiles:
-            if p["name"].lower() == preferred_name.lower():
-                return p
+    if not preferred_name:
+        raise RuntimeError("setup_required: no se indicó un perfil de voz.")
+    for p in profiles:
+        if p["name"].lower() == preferred_name.lower() or str(p.get("id", "")).lower() == preferred_name.lower():
+            return p
+    if partial:
         for p in profiles:
             if preferred_name.lower() in p["name"].lower():
                 return p
-
-    default_name = "diego alvarez" if language == "es" else "emily"
-    for p in profiles:
-        if default_name in p["name"].lower():
-            return p
-    for p in profiles:
-        if (p.get("language") or "").lower().startswith(language):
-            return p
-    return profiles[0]
+    raise RuntimeError(f"El perfil explícito {preferred_name!r} no existe; no se elegirá otro perfil automáticamente.")
 
 
 def get_model_status():
@@ -280,10 +436,10 @@ _QWEN_SIZE_PRIORITY = ["1.7B", "0.6B"]
 def resolve_engine_and_model(profile, model_status, engine_override=None, model_size_override=None):
     """No hardcodear "qwen"/"1.7B": cada perfil de Voicebox declara su propio
     default_engine (verificado en vivo: Bananero -> qwen, Dora -> kokoro), y lo
-    que el usuario tiene descargado varia por maquina. Prioridad: override de CLI
-    > default_engine del perfil > "qwen" como ultimo recurso (funciona para
-    cualquier voz clonada)."""
-    engine = engine_override or profile.get("default_engine") or "qwen"
+    que el usuario tiene descargado varia por maquina."""
+    engine = engine_override or profile.get("default_engine")
+    if not engine:
+        raise RuntimeError("compatibility_unknown: el perfil no declara motor y no se indicó --engine.")
 
     if engine not in ("qwen", "qwen_custom_voice"):
         # Kokoro, luxtts, chatterbox, tada, etc. no versionan por model_size de
@@ -295,12 +451,13 @@ def resolve_engine_and_model(profile, model_status, engine_override=None, model_
         return engine, model_size_override
 
     prefix = "qwen-tts-" if engine == "qwen" else "qwen-custom-voice-"
-    for size in _QWEN_SIZE_PRIORITY:
-        entry = model_status.get(f"{prefix}{size}")
-        if entry and entry.get("downloaded"):
-            return engine, size
-
-    return engine, "1.7B"  # default del schema si no encontramos nada ya descargado
+    downloaded = [name[len(prefix):] for name, entry in model_status.items()
+                  if name.startswith(prefix) and entry.get("downloaded")]
+    if len(downloaded) == 1:
+        return engine, downloaded[0]
+    if not downloaded:
+        raise RuntimeError(f"model_not_downloaded: no hay un modelo descargado para {engine}.")
+    raise RuntimeError(f"compatibility_unknown: hay varios tamaños descargados para {engine}; indicá --model-size.")
 
 
 def wait_for_generation_wav(generation_id, before_files, timeout=90, on_tick=None):
@@ -444,9 +601,9 @@ def tts_model_name(engine, model_size):
     /models/{model_name}/unload. Best-effort para los motores que no versionan
     por tamano (no hay forma generica de derivarlo del schema de Voicebox)."""
     if engine == "qwen":
-        return f"qwen-tts-{model_size or '1.7B'}"
+        return f"qwen-tts-{model_size}" if model_size else None
     if engine == "qwen_custom_voice":
-        return f"qwen-custom-voice-{model_size or '1.7B'}"
+        return f"qwen-custom-voice-{model_size}" if model_size else None
     if engine == "chatterbox":
         return "chatterbox-tts"
     if engine == "chatterbox_turbo":

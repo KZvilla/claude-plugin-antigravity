@@ -165,14 +165,14 @@ Picking the wrong one is the common failure: calling `agy_narrate` when the user
 
 `agy_say` sanitizes locally and instantly — markdown, code blocks, file paths, URLs and emoji come out (they are unlistenable), and anything shaped like a secret is redacted before it is spoken or sent to Telegram. Add `polish: true` only when the text was written to be *read* rather than heard — a raw log, long output, dense notes. That costs an agy round-trip of a few seconds, so leave it off for a sentence you already phrased conversationally.
 
-`agy_narrate_voices` lists the installed voice profiles, languages, and service health.
+`agy_narrate_voices` performs read-only discovery: it reports live or cached profiles, setup state, languages, and service health without starting providers or loading models.
 
-For both: pass `voice`/`language` when the user names one ("narralo con Diego"); `send_telegram` is on by default so the voice note also reaches their phone, and `local_playback` is off by default so nothing startles anyone.
+For both: an explicit `voice` is one-shot consent for that acoustic profile. If omitted, selection comes only from configured `voice_setup`; an unconfigured install returns `text-only/setup_required` and preserves the text. `soul` selects identity independently and is never inferred from the voice profile. `send_telegram` is on by default so audio—or preserved text when audio is unavailable—also reaches the phone, and `local_playback` is off by default.
 
 ### 11. `lagrange_agy_voice_stream`
 Backs the Real-Time Voice Mode ("Modo Charla") by keeping one long-lived streaming `agy` process alive across turns, instead of the blocking one-shot `agy_run` uses. Actions: `start`, `send`, `drain`, `status`, `stop`.
 
-This is normally driven by the `voice-chat/` scripts (`text_loop.py`, `voice_loop.py`), which poll `drain` in a loop and pipe sentences to TTS. Do not call it by hand during a normal opencode session unless the user explicitly asks to drive a voice session manually — and if you start one, always `stop` it, since the `agy` process outlives the tool call.
+This is normally driven by the `voice-chat/` scripts (`text_loop.py`, `voice_loop.py`), which require either `--voice` or configured `voice_setup` before starting providers/microphone. `--soul` is independent. The scripts poll `drain` in a loop and pipe sentences to TTS. Do not call it by hand during a normal opencode session unless the user explicitly asks to drive a voice session manually — and if you start one, always `stop` it, since the `agy` process outlives the tool call.
 
 ### 12. `telegram_notify` / `telegram_ask` / `telegram_send_voice`
 Reach the user on their phone via the Telegram bridge. `telegram_notify` pushes a message (optionally attaching a file); `telegram_ask` asks a question with tappable buttons and **blocks until they answer or it times out** (default 300s), returning their choice; `telegram_send_voice` sends an audio file as a native voice note.

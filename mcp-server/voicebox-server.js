@@ -69,7 +69,8 @@ const CONFIG_POR_DEFECTO = {
   omnivoicePort: 17494,
   omnivoiceDir: null,
   omnivoiceClassTemperature: 0.7,
-  vozPorPerfil: {}
+  vozPorPerfil: {},
+  voiceSetup: null
 };
 
 // ==============================================================================
@@ -162,6 +163,11 @@ function aplicarClavesVoicebox(destino, parsed) {
   if (Number.isFinite(parsed.omnivoice_class_temperature)) destino.omnivoiceClassTemperature = parsed.omnivoice_class_temperature;
   if (parsed.voz_por_perfil && typeof parsed.voz_por_perfil === 'object' && !Array.isArray(parsed.voz_por_perfil)) {
     destino.vozPorPerfil = { ...parsed.voz_por_perfil };
+  }
+  // FEAT-049: reemplazo atómico por alcance. Nunca mezclar defaults o
+  // fallbacks del setup global con los del proyecto.
+  if (parsed.voice_setup && typeof parsed.voice_setup === 'object' && !Array.isArray(parsed.voice_setup)) {
+    destino.voiceSetup = parsed.voice_setup;
   }
   return destino;
 }
@@ -336,21 +342,24 @@ const PRIORIDAD_TAMANO_QWEN = ['1.7B', '0.6B'];
 
 /**
  * Puerto de `resolve_engine_and_model` (voice-chat/common.py): override →
- * `default_engine` del perfil → qwen; para Qwen, el tamaño descargado de
- * mayor prioridad. Antes la narración mandaba siempre qwen 1.7B.
+ * `default_engine` del perfil; para Qwen, el único tamaño descargado que
+ * demuestre compatibilidad. Nunca inventa qwen ni 1.7B.
  */
 function resolverMotor(perfil, estadoModelos = {}, engineOverride = null, sizeOverride = null) {
-  const engine = engineOverride || (perfil && perfil.default_engine) || 'qwen';
+  const engine = engineOverride || (perfil && perfil.default_engine) || null;
+  if (!engine) return { engine: null, modelSize: null, unavailable: true, reason: 'compatibility_unknown' };
   if (engine !== 'qwen' && engine !== 'qwen_custom_voice') {
     return { engine, modelSize: sizeOverride || null };
   }
   if (sizeOverride) return { engine, modelSize: sizeOverride };
   const prefijo = engine === 'qwen' ? 'qwen-tts-' : 'qwen-custom-voice-';
+  const disponibles = [];
   for (const size of PRIORIDAD_TAMANO_QWEN) {
     const m = estadoModelos[`${prefijo}${size}`];
-    if (m && m.downloaded) return { engine, modelSize: size };
+    if (m && m.downloaded) disponibles.push(size);
   }
-  return { engine, modelSize: '1.7B' };
+  if (disponibles.length === 1) return { engine, modelSize: disponibles[0] };
+  return { engine, modelSize: null, unavailable: true, reason: disponibles.length ? 'compatibility_unknown' : 'model_not_downloaded' };
 }
 
 /**

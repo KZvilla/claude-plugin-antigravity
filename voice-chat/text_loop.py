@@ -28,9 +28,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 from common import (  # noqa: E402
     McpClient, AudioPlayer, SentenceSequencer,
-    resolve_voice_profile, synthesize_sentence, voicebox_cancel,
-    get_model_status, resolve_engine_and_model, unload_all_loaded_models,
-    LatidoUso, tts_model_name, activar_motor_chat,
+    resolve_voice_request, resolve_and_activate_voice, synthesize_sentence, voicebox_cancel,
+    unload_all_loaded_models, LatidoUso, tts_model_name,
     Senales, TiemposTurno, decidir_senal, clave_de_paso,
     accion_para_turno, pregunta_de_negaciones, aviso_escrituras, AVISO_CONFIRMACION
 )
@@ -39,7 +38,8 @@ from common import (  # noqa: E402
 def main():
     parser = argparse.ArgumentParser(description="Fase 4 - loop minimo texto->voz (Modo Charla)")
     parser.add_argument("--voice", default=None, help='Perfil de voz (ej. "Diego Alvarez")')
-    parser.add_argument("--language", default="es", choices=["es", "en"])
+    parser.add_argument("--language", default=None, choices=["es", "en"])
+    parser.add_argument("--soul", default=None, help="Clave Soul para la identidad; es independiente del perfil acústico.")
     parser.add_argument("--effort", default="low", choices=["low", "medium", "high"])
     parser.add_argument("--engine", default=None,
                          help="Forzar motor TTS (qwen, qwen_custom_voice, kokoro, luxtts, chatterbox, chatterbox_turbo, tada). "
@@ -62,33 +62,26 @@ def main():
         print(f"\nTotal liberado: {freed_gb:.2f} GB" if freed_gb else "Nada estaba cargado.")
         return
 
+    try:
+        selected = resolve_voice_request(args.voice, args.language, os.getcwd(), args.motor,
+                                         args.engine, args.model_size, args.soul)
+    except RuntimeError as err:
+        print(f"[voice-loop] {err}")
+        return
     print("[voice-loop] Conectando al servidor MCP real (mcp-server/index.js)...")
     mcp = McpClient()
 
-    # Voicebox arriba sin depender de la GUI: el MCP lo levanta si hace falta.
-    print("[voice-loop] " + mcp.call_tool("agy_voice_model", {"action": "start"}).splitlines()[0])
     if args.soltar_pin:
         print("[voice-loop] " + mcp.call_tool("agy_voice_model", {"action": "release"}))
 
-    print(f"[voice-loop] Resolviendo perfil de voz en Voicebox (preferido: {args.voice or 'default'})...")
-    profile = resolve_voice_profile(args.voice, args.language)
-    print(f"[voice-loop] Perfil elegido: {profile['name']}")
-
-    # No asumir "qwen"/"1.7B": cada perfil declara su propio default_engine y lo
-    # que esta realmente descargado varia por maquina - se consulta en vivo.
-    model_status = get_model_status()
-    engine, model_size = resolve_engine_and_model(profile, model_status, args.engine, args.model_size)
-
-    # El modelo de esta voz pasa a ser el activo antes de empezar: si hay otro
-    # fijado, o no hay VRAM, se dice ahora y no a mitad de la charla.
-    # La charla va por OmniVoice si la voz tiene muestra (regla del usuario).
     try:
-        proveedor, muestra = activar_motor_chat(mcp, profile, engine, model_size, args.motor)
+        profile, args.language, engine, model_size, proveedor, muestra, rechazados = resolve_and_activate_voice(mcp, selected)
     except RuntimeError as err:
         print(f"[voice-loop] {err}")
         print("[voice-loop] Si hay un modelo fijado de otra voz, volve a correr con --soltar-pin.")
         mcp.close()
         return
+    print(f"[voice-loop] Perfil elegido: {profile['name']}")
     voz = "OmniVoice" if proveedor == "omnivoice" else f"Voicebox · {engine}" + (f" ({model_size})" if model_size else "")
     print(f"[voice-loop] Voz: {voz}")
     latido = LatidoUso(["omnivoice" if proveedor == "omnivoice" else tts_model_name(engine, model_size)])
@@ -117,14 +110,18 @@ def main():
     con_prewarm = proveedor == "voicebox" and engine in ("qwen", "qwen_custom_voice")
     print("[voice-loop] Iniciando sesion agy_voice_stream" +
           (" (con pre-warm de Voicebox en paralelo)" if con_prewarm else "") + "...")
-    start_text = mcp.call_tool("agy_voice_stream", {
+    start_args = {
         # cwd: sin el, agy corre los comandos en su scratch/ y no en el proyecto.
         "action": "start", "effort": args.effort, "confirmacion": True, "cwd": os.getcwd(),
         # alma: identidad y memoria de esta voz en el priming, y consolidacion
         # al cerrar (FEAT-044).
-        "alma": profile["name"],
-        "prewarm_voicebox": con_prewarm, "voicebox_model_size": model_size or "1.7B"
-    })
+        "alma": selected["identity"].get("soul") if selected["identity"].get("mode") == "soul" else None,
+        "prewarm_voicebox": con_prewarm,
+        "voice": profile["name"]
+    }
+    if model_size:
+        start_args["voicebox_model_size"] = model_size
+    start_text = mcp.call_tool("agy_voice_stream", start_args)
     stream_id = start_text.split("stream_id: `")[1].split("`")[0]
     print(f"[voice-loop] Sesion lista: {stream_id}")
     print(f"[voice-loop] ⚠️ {AVISO_CONFIRMACION.get(args.language) or AVISO_CONFIRMACION['en']}\n")

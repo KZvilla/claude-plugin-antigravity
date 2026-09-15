@@ -50,7 +50,10 @@ async function main() {
     ]];
     if (url === '/profiles/p-alya/samples') return [200, [{ audio_path: muestra, reference_text: 'hola, soy Alya' }]];
     if (url === '/profiles/p-dora/samples') return [200, []];
-    if (url === '/models/status') return [200, { models: [] }];
+    if (url === '/models/status') return [200, { models: [
+      { model_name: 'qwen-tts-1.7B', loaded: false, downloaded: true },
+      { model_name: 'kokoro', loaded: false, downloaded: true }
+    ] }];
     if (url === '/tasks/active') return [200, { downloads: [], generations: [] }];
     if (url === '/generate' && m === 'POST') { vbGenerados.push(body); return [200, { id: `vb${vbGenerados.length}` }]; }
     return null;
@@ -107,7 +110,7 @@ async function main() {
       check('la salida lo dice', /Motor\*\*: Voicebox \(modo diferido/.test(r.texto || ''));
 
       r = await say({ text: 'Hola, soy Dora.', voice: 'Dora' });
-      check('preset (sin muestra) → Voicebox con motivo', vbGenerados.length === 2 && /no se usó OmniVoice: .*no tiene muestra/.test(r.texto || ''), r.texto);
+      check('preset (sin muestra) → Voicebox del mismo perfil', vbGenerados.length === 2 && omniGenerados.length === 1 && /Motor\*\*: Voicebox/.test(r.texto || ''), r.texto);
 
       r = await say({ text: 'Forzado.', voice: 'Alya', motor: 'voicebox' });
       check('motor explícito → Voicebox', vbGenerados.length === 3 && omniGenerados.length === 1);
@@ -118,7 +121,7 @@ async function main() {
       check('y lo dice', /voz desde la caché/.test(r.texto || ''), r.texto);
 
       r = await say({ text: 'Voicebox caído y diferido.', voice: 'Alya', voicebox_url: `http://127.0.0.1:${muerto}`, modo: 'diferido' });
-      check('Voicebox caído y diferido → error claro (no hay a quién pedirle)', /Voicebox no está disponible/.test(r.texto || ''), r.texto);
+      check('Voicebox caído y diferido → OmniVoice del mismo perfil', !r.error && omniGenerados.length === 3, r.texto);
     });
   } finally {
     await server.stop();
