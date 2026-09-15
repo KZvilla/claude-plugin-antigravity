@@ -64,7 +64,8 @@ const { pathToFileURL } = require('node:url');
 const { rutaEstado, rutaProgreso, marcarDetencion, DIR_WORKTREES } = require('./fanout-estado.js');
 const { listarWorktrees } = require('./worktrees.js');
 const tableroAgentes = require('./agents/tablero.js');
-const memoriaAgentes = require('./agents/memoria.js');
+const registroAgentes = require('./agents/registry.js');
+const inventario = require('./watch-inventory.js');
 const { interpretarEvento, crearSeguidor } = require('./fanout-tail.js');
 
 const PUERTO_POR_DEFECTO = 4517;
@@ -647,8 +648,11 @@ function paginaAgentes(token, haySlug) {
   <h1>agentes persistidos</h1>
   <span class="meta" id="resumen" aria-live="polite">cargando…</span>
   <nav>
-    ${haySlug ? `<a href="/?t=${token || ''}">fan-out</a>` : ''}
+    <a href="/?t=${token || ''}">resumen</a>
+    ${haySlug ? `<a href="/fanout?t=${token || ''}">fan-out</a>` : ''}
     <a class="activa" href="#">agentes</a>
+    <a href="/almas?t=${token || ''}">almas</a>
+    <a href="/profiles?t=${token || ''}">perfiles</a>
   </nav>
 </header>
 <main>
@@ -691,42 +695,51 @@ function pedir(ruta) {
 function pintarAvisos(datos) {
   const lista = [];
   if (!datos.agyDisponible) {
-    lista.push('No se pudo consultar <code>agy agents</code>, así que la columna '
-      + '"resuelve" no significa nada en esta carga: ' + esc(datos.motivoAgy || ''));
+    lista.push('No se pudo consultar agy agents; la columna resuelve queda desconocida: ' + (datos.motivoAgy || ''));
   }
   if (datos.registroIlegible) lista.push('El registro de agentes está ilegible en disco.');
   if (datos.estadoIlegible) lista.push('El estado de hilos está ilegible en disco.');
   const rotos = (datos.agentes || []).filter(a => datos.agyDisponible && a.enRegistro && !a.resuelve);
   if (rotos.length) {
-    lista.push('Antigravity no resuelve ' + rotos.map(a => '<code>' + esc(a.nombre) + '</code>').join(', ')
-      + '. Castearlos se aborta a propósito: <code>--agent</code> con un nombre inexistente '
+    lista.push('Antigravity no resuelve ' + rotos.map(a => a.nombre).join(', ')
+      + '. Castearlos se aborta a propósito: --agent con un nombre inexistente '
       + 'cae en silencio al agente por defecto, con escritura completa.');
   }
-  avisos.innerHTML = lista.map(t => '<div class="aviso">' + t + '</div>').join('');
+  avisos.textContent = '';
+  for (const texto of lista) {
+    const aviso = document.createElement('div');
+    aviso.className = 'aviso';
+    aviso.textContent = texto;
+    avisos.appendChild(aviso);
+  }
 }
 
 function pintarCriterio(celda, agente) {
-  celda.innerHTML = '<div class="vacio">buscando criterio acumulado…</div>';
-  pedir('/api/agentes/criterio?agente=' + encodeURIComponent(agente)).then(r => {
-    if (!r.ok) {
-      celda.innerHTML = '<div class="vacio">sin criterio disponible (' + esc(r.motivo) + ')</div>';
-      return;
+  celda.textContent = '';
+  const estado = document.createElement('div');
+  estado.className = 'vacio';
+  estado.textContent = 'consultando capas, criterio y preview…';
+  celda.appendChild(estado);
+  const base = '/api/agentes/' + encodeURIComponent(agente);
+  Promise.all([pedir(base + '/detalle'), pedir(base + '/criterio'), pedir(base + '/bootstrap')]).then(([detalle, criterio, bootstrap]) => {
+    celda.textContent = '';
+    for (const [titulo, datos] of [['capas locales + resolución', detalle], ['criterio acumulado', criterio], ['bootstrap basal (preview)', bootstrap]]) {
+      const bloque = document.createElement('div');
+      bloque.className = 'entrada';
+      const h = document.createElement('strong');
+      h.textContent = titulo;
+      const pre = document.createElement('pre');
+      pre.className = 'cuerpo';
+      pre.textContent = JSON.stringify(datos, null, 2);
+      bloque.append(h, pre);
+      celda.appendChild(bloque);
     }
-    if (!r.entradas.length) {
-      celda.innerHTML = '<div class="vacio">todavía no acumuló criterio. '
-        + 'Se llena solo cuando el agente emite su bloque de memoria al terminar un cast.</div>';
-      return;
-    }
-    celda.innerHTML = r.entradas.map(e =>
-      '<div class="entrada"><div class="cuerpo">' + esc(e.contenido) + '</div>'
-      + '<div class="pie">' + esc(e.tipo) + ' · ' + esc(fecha(e.creado))
-      // access_count es lo que separa el criterio que se usa del que quedó
-      // ocupando lugar en el budget de rehidratación.
-      + ' · <span class="' + (e.usos > 0 ? 'usos' : 'frio') + '">'
-      + (e.usos > 0 ? ('usado ' + e.usos + '×') : 'nunca usado') + '</span></div></div>'
-    ).join('') + (r.truncado ? '<div class="vacio">(lista truncada)</div>' : '');
   }).catch(err => {
-    celda.innerHTML = '<div class="vacio">error: ' + esc(err.message) + '</div>';
+    celda.textContent = '';
+    const fallo = document.createElement('div');
+    fallo.className = 'vacio';
+    fallo.textContent = 'error: ' + err.message;
+    celda.appendChild(fallo);
   });
 }
 
@@ -756,21 +769,17 @@ function pintar(datos) {
   for (const [i, a] of agentes.entries()) {
     const fila = document.createElement('tr');
     fila.className = 'fila';
-    const acceso = a.readOnly === null
-      ? '<span class="pill apagado">huérfano</span>'
-      : (a.readOnly ? '<span class="pill si">read-only</span>' : '<span class="pill tibio">read/write</span>');
-    const resuelve = !datos.agyDisponible
-      ? '<span class="apagado">?</span>'
-      : (a.resuelve ? '<span class="si">sí</span>' : '<span class="no">no</span>');
-    // El botón da a la fila foco, Enter y Espacio (FEAT-032).
-    fila.innerHTML = '<td><button type="button" class="expandir" aria-expanded="false" aria-controls="det-' + i + '">'
-      + '<strong>' + esc(a.nombre) + '</strong></button></td>'
-      + '<td class="apagado">' + esc(a.skill || '—') + '</td>'
-      + '<td>' + acceso + '</td>'
-      + '<td>' + resuelve + '</td>'
-      + '<td class="hilo">' + (a.conversationId ? esc(a.conversationId.slice(0, 8)) + '…' : '—') + '</td>'
-      + '<td>' + a.casts + '</td>'
-      + '<td class="apagado">' + esc(fecha(a.ultimoCast)) + '</td>';
+    const td = (texto, clase = '') => { const c = document.createElement('td'); c.className = clase; c.textContent = texto; return c; };
+    const nombreTd = document.createElement('td');
+    const boton = document.createElement('button');
+    boton.type = 'button'; boton.className = 'expandir'; boton.setAttribute('aria-expanded', 'false'); boton.setAttribute('aria-controls', 'det-' + i);
+    const fuerte = document.createElement('strong'); fuerte.textContent = a.nombre; boton.appendChild(fuerte); nombreTd.appendChild(boton);
+    const accesoTd = document.createElement('td');
+    const acceso = document.createElement('span'); acceso.className = 'pill ' + (a.readOnly === null ? 'apagado' : (a.readOnly ? 'si' : 'tibio')); acceso.textContent = a.readOnly === null ? 'huérfano' : (a.readOnly ? 'read-only' : 'read/write'); accesoTd.appendChild(acceso);
+    const resuelveTd = document.createElement('td');
+    const resuelve = document.createElement('span'); resuelve.className = !datos.agyDisponible ? 'apagado' : (a.resuelve ? 'si' : 'no'); resuelve.textContent = !datos.agyDisponible ? '?' : (a.resuelve ? 'sí' : 'no'); resuelveTd.appendChild(resuelve);
+    fila.append(nombreTd, td(a.skill || '—', 'apagado'), accesoTd, resuelveTd,
+      td(a.conversationId ? a.conversationId.slice(0, 8) + '…' : '—', 'hilo'), td(String(a.casts)), td(fecha(a.ultimoCast), 'apagado'));
     cuerpo.appendChild(fila);
 
     const detalle = document.createElement('tr');
@@ -797,6 +806,42 @@ pedir('/api/agentes').then(pintar).catch(err => {
 </script>
 </body>
 </html>`;
+}
+
+function paginaInventario(titulo, token, activa, contenido, script) {
+  const enlace = ruta => `${ruta}?t=${encodeURIComponent(token || '')}`;
+  const nav = [
+    ['/', 'resumen'], ['/fanout', 'fan-out'], ['/agents', 'agentes'],
+    ['/almas', 'almas'], ['/memories', 'memorias'], ['/profiles', 'perfiles']
+  ].map(([ruta, etiqueta]) => `<a${activa === ruta ? ' class="activa"' : ''} href="${enlace(ruta)}">${etiqueta}</a>`).join('');
+  return `<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>${escapar(titulo)}</title>
+<style>
+:root{color-scheme:dark light}body{margin:0;background:#11131a;color:#d7dae0;font:13px/1.5 ui-monospace,"Cascadia Code",Consolas,monospace}
+header{padding:12px 16px;border-bottom:1px solid #2a2f3a;display:flex;align-items:center;gap:16px}h1{font-size:15px;margin:0}nav{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}nav a{color:#9aa3b5;text-decoration:none;border:1px solid #3d4350;border-radius:999px;padding:2px 9px}nav a.activa{color:#58a6ff;border-color:#58a6ff}
+main{padding:16px;max-width:1100px;margin:0 auto}.panel{border:1px solid #2a2f3a;border-radius:7px;background:#161922;padding:12px;margin-bottom:12px}.meta{color:#9aa3b5}.error{color:#f85149}button{font:inherit;background:#1a2030;color:#d7dae0;border:1px solid #3d4350;border-radius:4px;padding:4px 9px;cursor:pointer}button:focus-visible,a:focus-visible{outline:2px solid #58a6ff;outline-offset:2px}pre{white-space:pre-wrap;word-break:break-word;background:#0d0f15;padding:10px;border-radius:5px;overflow:auto}.lista{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:10px}.item{border:1px solid #2a2f3a;border-radius:6px;padding:10px}
+</style></head><body><header><h1>${escapar(titulo)}</h1><nav>${nav}</nav></header><main>${contenido}</main>
+<script>const TOKEN=${JSON.stringify(token || '')};function pedir(ruta){return fetch(ruta+(ruta.includes('?')?'&':'?')+'t='+encodeURIComponent(TOKEN)).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.motivo||('HTTP '+r.status));return d})}${script}</script></body></html>`;
+}
+
+function paginaDashboard(token) {
+  return paginaInventario('Lagrange Watch', token, '/', '<div class="panel"><div id="estado" class="meta" aria-live="polite">cargando inventario local…</div><pre id="datos"></pre></div>', `
+const estado=document.getElementById('estado'),datos=document.getElementById('datos');
+Promise.all([pedir('/api/resumen'),pedir('/api/lotes')]).then(([r,l])=>{estado.textContent='inventario local · '+new Date(r.consultado).toLocaleString();datos.textContent=JSON.stringify({...r,lotes:l},null,2)}).catch(e=>{estado.textContent='no se pudo cargar';estado.className='error';datos.textContent=e.message});`);
+}
+
+function paginaAlmas(token, soloMemoria = false) {
+  const titulo = soloMemoria ? 'memorias' : 'almas';
+  const activa = soloMemoria ? '/memories' : '/almas';
+  return paginaInventario(titulo, token, activa, '<div class="panel"><div id="estado" class="meta" aria-live="polite">cargando…</div><div id="lista" class="lista"></div></div><div class="panel"><pre id="detalle">Seleccioná un alma.</pre></div>', `
+const estado=document.getElementById('estado'),lista=document.getElementById('lista'),detalle=document.getElementById('detalle');
+function boton(etiqueta,accion){const b=document.createElement('button');b.type='button';b.textContent=etiqueta;b.addEventListener('click',accion);return b}
+pedir('/api/almas').then(r=>{estado.textContent=r.almas.length+' alma(s)';for(const a of r.almas){const d=document.createElement('div');d.className='item';const n=document.createElement('strong');n.textContent=a.clave;d.append(n,document.createElement('br'),boton('Ver detalle',()=>pedir('/api/almas/'+encodeURIComponent(a.clave)).then(x=>{detalle.textContent=JSON.stringify(x,null,2)}).catch(e=>{detalle.textContent=e.message})));lista.appendChild(d)}const u=document.createElement('div');u.className='item';const n=document.createElement('strong');n.textContent='usuario.md · compartida';u.append(n,document.createElement('br'),boton('Ver memoria',()=>pedir('/api/memoria-usuario').then(x=>{detalle.textContent=JSON.stringify(x,null,2)}).catch(e=>{detalle.textContent=e.message})));lista.appendChild(u)}).catch(e=>{estado.textContent=e.message;estado.className='error'});`);
+}
+
+function paginaPerfiles(token) {
+  return paginaInventario('perfiles de voz', token, '/profiles', '<div class="panel"><button id="consultar" type="button">Consultar Voicebox</button><span id="estado" class="meta" aria-live="polite"></span><pre id="datos">La consulta no arranca Voicebox.</pre></div>', `
+const boton=document.getElementById('consultar'),estado=document.getElementById('estado'),datos=document.getElementById('datos');boton.addEventListener('click',()=>{boton.disabled=true;estado.textContent=' consultando…';pedir('/api/perfiles/voicebox').then(r=>{estado.textContent=' '+r.origen+' · '+r.disponibilidad;datos.textContent=JSON.stringify(r,null,2)}).catch(e=>{estado.textContent=' error';estado.className='error';datos.textContent=e.message}).finally(()=>{boton.disabled=false})});`);
 }
 
 function escapar(s) {
@@ -988,7 +1033,17 @@ async function diffDeTarea(repoPath, slug, taskId, { cargarPoliticaFn = cargarPo
 
 const AGY_BIN_VISOR =process.env.AGY_BIN || (process.platform === 'win32' ? 'agy.exe' : 'agy');
 
-function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, token, agyBin = AGY_BIN_VISOR, homeDir = os.homedir() } = {}) {
+function crearServidor(repoPath, slug, {
+  intervaloMs = INTERVALO_SONDEO_MS,
+  token,
+  agyBin = AGY_BIN_VISOR,
+  homeDir = os.homedir(),
+  env = process.env,
+  voiceboxUrl,
+  voiceboxTimeoutMs = 4000,
+  memoryTimeoutMs = 8000,
+  inventarioApi = inventario
+} = {}) {
   // Un token por sesión del visor. No se persiste: si el proceso se cae, el
   // que quedó en una pestaña abierta deja de servir, que es lo correcto.
   const tokenAcceso = token || crypto.randomBytes(24).toString('hex');
@@ -999,6 +1054,16 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, toke
     const rechazar = (codigo, mensaje) => {
       res.writeHead(codigo, { 'content-type': 'text/plain; charset=utf-8' });
       res.end(mensaje);
+    };
+    const json = (codigo, datos) => {
+      res.writeHead(codigo, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(datos));
+    };
+    const lecturaAutorizada = () => tokenCoincide(tokenAcceso, url.searchParams.get('t'));
+    const nombreDeRuta = patron => {
+      const m = patron.exec(url.pathname);
+      if (!m) return null;
+      try { return decodeURIComponent(m[1]); } catch { return ''; }
     };
 
     if (!hostEsLoopback(req)) {
@@ -1011,13 +1076,9 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, toke
       return rechazar(405, 'No.');
     }
 
-    // FEAT-023. Sin lote de fan-out la raíz muestra directamente los agentes:
-    // el visor dejó de ser solo el mirador de un fan-out, y exigir un lote para
-    // arrancar dejaba la vista de agentes inalcanzable en un repo donde nunca
-    // se corrió `agy_fanout`.
-    const rutaAgentes = url.pathname === '/agents' || (url.pathname === '/' && !slug);
-
-    if (req.method === 'GET' && rutaAgentes) {
+    // FEAT-050: páginas separadas que comparten navegación; el fan-out conserva
+    // su cliente SSE y no se convierte en una SPA.
+    if (req.method === 'GET' && ['/','/fanout','/agents','/almas','/memories','/profiles'].includes(url.pathname)) {
       if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
         return rechazar(403,
           'Falta el token de esta sesión del visor.\n\n'
@@ -1028,7 +1089,89 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, toke
         'cache-control': 'no-store',
         'referrer-policy': 'no-referrer'
       });
-      res.end(paginaAgentes(tokenAcceso, Boolean(slug)));
+      if (url.pathname === '/') res.end(paginaDashboard(tokenAcceso));
+      else if (url.pathname === '/fanout') res.end(slug ? paginaHtml(slug, tokenAcceso) : paginaDashboard(tokenAcceso));
+      else if (url.pathname === '/agents') res.end(paginaAgentes(tokenAcceso, Boolean(slug)));
+      else if (url.pathname === '/almas') res.end(paginaAlmas(tokenAcceso));
+      else if (url.pathname === '/memories') res.end(paginaAlmas(tokenAcceso, true));
+      else res.end(paginaPerfiles(tokenAcceso));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/resumen') {
+      if (!lecturaAutorizada()) return rechazar(403, 'token invalido');
+      try { return json(200, inventarioApi.resumenLocal({ repoPath, homeDir, env })); }
+      catch (err) { return json(500, { ok: false, motivo: 'no se pudo construir el resumen local' }); }
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/lotes') {
+      if (!lecturaAutorizada()) return rechazar(403, 'token invalido');
+      try { return json(200, inventarioApi.inspeccionarLotes(repoPath)); }
+      catch { return json(500, { ok: false, motivo: 'no se pudieron inspeccionar los lotes' }); }
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/almas') {
+      if (!lecturaAutorizada()) return rechazar(403, 'token invalido');
+      try { return json(200, inventarioApi.listarAlmas({ env })); }
+      catch { return json(500, { ok: false, motivo: 'no se pudieron leer las almas' }); }
+    }
+
+    const claveAlma = nombreDeRuta(/^\/api\/almas\/([^/]+)$/);
+    if (req.method === 'GET' && claveAlma !== null) {
+      if (!lecturaAutorizada()) return rechazar(403, 'token invalido');
+      try {
+        const datos = inventarioApi.detalleAlma(claveAlma, { env });
+        return datos ? json(200, datos) : json(404, { ok: false, motivo: 'no encontrado' });
+      } catch (err) {
+        return json(/inválida|invalida/.test(err.message) ? 400 : 500, { ok: false, motivo: /inválida|invalida/.test(err.message) ? 'alma invalida' : 'no se pudo leer el alma' });
+      }
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/memoria-usuario') {
+      if (!lecturaAutorizada()) return rechazar(403, 'token invalido');
+      try { return json(200, inventarioApi.memoriaUsuario({ env })); }
+      catch { return json(500, { ok: false, motivo: 'no se pudo leer la memoria compartida' }); }
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/perfiles/voicebox') {
+      if (!lecturaAutorizada()) return rechazar(403, 'token invalido');
+      inventarioApi.perfilesVoicebox({ repoPath, env, voiceboxUrl, timeoutMs: voiceboxTimeoutMs })
+        .then(datos => json(200, datos))
+        .catch(() => json(200, { ok: false, origen: 'UNAVAILABLE', disponibilidad: 'unavailable', motivo: 'no se pudieron consultar los perfiles' }));
+      return;
+    }
+
+    const detalleNombre = nombreDeRuta(/^\/api\/agentes\/([^/]+)\/detalle$/);
+    if (req.method === 'GET' && detalleNombre !== null) {
+      if (!lecturaAutorizada()) return rechazar(403, 'token invalido');
+      if (!registroAgentes.nombreValido(detalleNombre)) return json(400, { ok: false, motivo: 'agente invalido' });
+      inventarioApi.detalleAgente(detalleNombre, { homeDir, agyBin })
+        .then(datos => datos ? json(200, datos) : json(404, { ok: false, motivo: 'no encontrado' }))
+        .catch(() => json(500, { ok: false, motivo: 'no se pudo leer el agente' }));
+      return;
+    }
+
+    const criterioNombre = nombreDeRuta(/^\/api\/agentes\/([^/]+)\/criterio$/);
+    if (req.method === 'GET' && criterioNombre !== null) {
+      if (!lecturaAutorizada()) return rechazar(403, 'token invalido');
+      if (!registroAgentes.nombreValido(criterioNombre)) return json(400, { ok: false, motivo: 'agente invalido' });
+      inventarioApi.criterioAgente(criterioNombre, { homeDir, timeoutMs: memoryTimeoutMs })
+        .then(datos => json(200, datos)).catch(() => json(200, { ok: false, origen: 'UNAVAILABLE', disponibilidad: 'unavailable', motivo: 'sin respuesta' }));
+      return;
+    }
+
+    const bootstrapNombre = nombreDeRuta(/^\/api\/agentes\/([^/]+)\/bootstrap$/);
+    if (req.method === 'GET' && bootstrapNombre !== null) {
+      if (!lecturaAutorizada()) return rechazar(403, 'token invalido');
+      if (!registroAgentes.nombreValido(bootstrapNombre)) return json(400, { ok: false, motivo: 'agente invalido' });
+      const crudo = url.searchParams.get('budget_tokens');
+      const budgetTokens = crudo === null ? 2048 : Number(crudo);
+      if (!Number.isInteger(budgetTokens) || budgetTokens < 256 || budgetTokens > 4096) {
+        return json(400, { ok: false, motivo: 'budget_tokens debe ser un entero entre 256 y 4096' });
+      }
+      inventarioApi.bootstrapAgente(bootstrapNombre, { homeDir, budgetTokens, timeoutMs: memoryTimeoutMs })
+        .then(datos => datos ? json(200, datos) : json(404, { ok: false, motivo: 'no encontrado' }))
+        .catch(() => json(200, { ok: false, origen: 'UNAVAILABLE', disponibilidad: 'unavailable', motivo: 'sin respuesta' }));
       return;
     }
 
@@ -1061,7 +1204,7 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, toke
       }
       // El homeDir se propaga para que los tests no le peguen al servicio de
       // memoria real del usuario.
-      memoriaAgentes.criterioDeAgente(agente, { homeDir }).then(datos => {
+      inventarioApi.criterioAgente(agente, { homeDir, timeoutMs: memoryTimeoutMs }).then(datos => {
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
         res.end(JSON.stringify(datos));
       }).catch(err => {
@@ -1073,29 +1216,13 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, toke
       return;
     }
 
-    if (req.method === 'GET' && url.pathname === '/') {
-      if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
-        return rechazar(403,
-          'Falta el token de esta sesión del visor.\n\n'
-          + 'Abrí la URL completa que imprimió la terminal, la que termina en "?t=...".\n'
-          + 'El token cambia cada vez que arranca el visor.');
-      }
-      res.writeHead(200, {
-        'content-type': 'text/html; charset=utf-8',
-        // La página lleva el token adentro: que no quede en ninguna caché.
-        'cache-control': 'no-store',
-        'referrer-policy': 'no-referrer'
-      });
-      res.end(paginaHtml(slug, tokenAcceso));
-      return;
-    }
-
     if (req.method === 'GET' && url.pathname === '/api/eventos') {
       // El stream también va con token: por acá salen los prompts y el código
       // que genera cada subagente.
       if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
         return rechazar(403, 'token invalido');
       }
+      if (!slug) return rechazar(404, 'no hay lote seleccionado');
       res.writeHead(200, {
         'content-type': 'text/event-stream; charset=utf-8',
         'cache-control': 'no-cache',
@@ -1169,6 +1296,7 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, toke
       if (!tokenCoincide(tokenAcceso, url.searchParams.get('t'))) {
         return rechazar(403, 'token invalido');
       }
+      if (!slug) return rechazar(404, 'no hay lote seleccionado');
       diffDeTarea(repoPath, slug, url.searchParams.get('taskId') || '').then(({ codigo, cuerpo }) => {
         res.writeHead(codigo, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
         res.end(JSON.stringify(cuerpo));
@@ -1190,6 +1318,7 @@ function crearServidor(repoPath, slug, { intervaloMs = INTERVALO_SONDEO_MS, toke
       if (!origenAceptable(req)) {
         return rechazar(403, 'origen no permitido');
       }
+      if (!slug) return rechazar(404, 'no hay lote seleccionado');
 
       let cuerpo = '';
       req.on('data', c => {
@@ -1241,24 +1370,22 @@ function main() {
   const lotes = descubrirLotes(repoPath);
   const slug = slugPedido || (lotes[0] && lotes[0].slug);
 
-  // Antes de FEAT-023 esto salía con error: el visor era solo el mirador de un
-  // fan-out. Ahora también muestra los agentes persistidos, que no dependen de
-  // ningún lote ni de ningún repo, así que no tener lote deja de ser fatal.
   if (!slug) {
     process.stderr.write(
       `No hay ningún lote de fan-out en ${path.join(repoPath, DIR_WORKTREES)}: `
-      + 'se abre solo la vista de agentes persistidos.\n'
+      + 'el dashboard sigue disponible.\n'
     );
   }
 
   const servidor = crearServidor(repoPath, slug);
   // Solo loopback, a propósito: estos logs traen prompts y código.
   servidor.listen(puerto, '127.0.0.1', () => {
-    process.stdout.write(slug
-      ? `\nVisor de fan-out para "${slug}" (+ agentes persistidos en /agents)\n`
-      : '\nVisor de agentes persistidos\n');
+    process.stdout.write(slugPedido
+      ? `\nLagrange Watch · fan-out "${slug}"\n`
+      : '\nLagrange Watch · inventario persistente\n');
     // La URL SIN el token no sirve para nada: es a propósito (SEC-011).
-    process.stdout.write(`  http://127.0.0.1:${puerto}/?t=${servidor.tokenAcceso}\n\n`);
+    const rutaInicial = slugPedido ? '/fanout' : '/';
+    process.stdout.write(`  http://127.0.0.1:${puerto}${rutaInicial}?t=${servidor.tokenAcceso}\n\n`);
     if (lotes.length > 1) {
       process.stdout.write(`Otros lotes: ${lotes.slice(1).map(l => l.slug).join(', ')} (--slug <nombre>)\n\n`);
     }
@@ -1277,4 +1404,15 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { crearServidor, descubrirLotes, crearVigilante, paginaHtml, paginaAgentes, ultimaSenal, diffDeTarea };
+module.exports = {
+  crearServidor,
+  descubrirLotes,
+  crearVigilante,
+  paginaHtml,
+  paginaAgentes,
+  paginaDashboard,
+  paginaAlmas,
+  paginaPerfiles,
+  ultimaSenal,
+  diffDeTarea
+};

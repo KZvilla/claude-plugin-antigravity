@@ -1,13 +1,13 @@
 ---
-description: Watch a running fan-out live in the browser — per-subagent progress and a stop button
+description: Inspect Lagrange's local inventory and optionally watch a fan-out live
 argument-hint: [slug del lote (opcional) o --port N]
 ---
 
-Levantar el visor local de un fan-out en curso: una página en `127.0.0.1` que
-muestra todos los subagentes a la vez, su estado, lo que va haciendo cada uno en
-vivo, y un botón para detener cualquiera.
+Levantar Lagrange Watch: una consola read-only en `127.0.0.1` que muestra un inventario de
+agentes, almas, memorias y perfiles por origen, y conserva el visor en vivo de
+fan-out con diff y detención.
 
-Argumentos (opcionales — sin nada, toma el lote más reciente):
+Argumentos opcionales:
 $ARGUMENTS
 
 Instrucciones:
@@ -23,25 +23,26 @@ Instrucciones:
    node <plugin>/mcp-server/fanout-watch.js [repoPath] [--slug <nombre>] [--port <N>]
    ```
 
-   Sin `repoPath` usa el directorio actual; sin `--slug` toma el lote más
-   reciente de `.claude/worktrees/`; el puerto por defecto es 4517 (si está
-   ocupado, avisa y sugiere `--port`).
+   Sin `repoPath` usa el directorio actual. Sin `--slug` abre el dashboard
+   global; el lote más reciente queda disponible en la sección fan-out. El
+   puerto por defecto es 4517.
 
 3. Pasale al usuario **la URL completa que imprime**, con el `?t=<token>` incluido
    (`http://127.0.0.1:<puerto>/?t=...`). Sin ese token el visor responde 403: es
    por sesión, cambia en cada arranque y no se persiste. Recortarla a
    `http://127.0.0.1:<puerto>` no funciona.
 
-4. Si no hay ningún lote, el visor **igual arranca** y abre directamente la vista
-   de agentes persistidos (`/agents`). Para la vista de fan-out sí hace falta
+4. Si no hay ningún lote, el visor **igual arranca** y abre el dashboard. Para la vista de fan-out sí hace falta
    haber corrido un `agy_fanout` en ese repo: el visor lee lo que el fan-out deja
    (`.fanout-status-*.json` y `.agy-progress-*.jsonl` en `.claude/worktrees/`),
    no inventa nada.
 
-5. La pestaña `/agents` lista los agentes persistidos y, al hacer clic en uno,
-   muestra el criterio que fue acumulando en `mcp-memory` con la cantidad de
-   veces que cada memoria se usó de verdad. No tiene decision gates ni estado
-   "corriendo": ver el README.
+5. `/agents` muestra registro, SKILL, `agent.md`, resolución, divergencia,
+   criterio y un preview basal de `mcp-memory`. `/almas`, `/memories` y
+   `/profiles` conservan la procedencia. `CACHE` no significa live y `DERIVED`
+   no significa inyectado en una sesión.
+
+6. FEAT-050 V1.0 es read-only. No inventes ni ofrezcas endpoints de edición.
 
 Notas:
 

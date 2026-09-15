@@ -153,6 +153,8 @@ function resolverEjecutable({ env = process.env, config = {}, dataDir, platform 
 // ==============================================================================
 
 function aplicarClavesVoicebox(destino, parsed) {
+  if (parsed.voicebox_url !== undefined) destino.voiceboxUrl = parsed.voicebox_url || null;
+  if (Number.isFinite(parsed.voicebox_port)) destino.voiceboxPort = parsed.voicebox_port;
   if (parsed.voicebox_autostart !== undefined) destino.voiceboxAutostart = parsed.voicebox_autostart !== false;
   if (parsed.voicebox_server_exe !== undefined) destino.voiceboxServerExe = parsed.voicebox_server_exe || null;
   if (Number.isFinite(parsed.voicebox_idle_unload_minutes)) destino.voiceboxIdleUnloadMinutes = parsed.voicebox_idle_unload_minutes;
@@ -174,7 +176,11 @@ function aplicarClavesVoicebox(destino, parsed) {
 
 /** Global primero y proyecto encima, como `loadConfig` en index.js. */
 function leerConfigVoicebox(cwd = null, env = process.env) {
-  const cfg = { ...CONFIG_POR_DEFECTO };
+  const cfg = {
+    ...CONFIG_POR_DEFECTO,
+    voiceboxUrl: env.VOICEBOX_URL || null,
+    voiceboxPort: parseInt(env.VOICEBOX_PORT, 10) || null
+  };
   const rutas = [path.join(homeDir(env), '.claude', 'antigravity.json')];
   if (cwd) rutas.push(path.join(cwd, '.claude', 'antigravity.json'));
   for (const ruta of rutas) {
@@ -183,6 +189,14 @@ function leerConfigVoicebox(cwd = null, env = process.env) {
     } catch {}
   }
   return cfg;
+}
+
+/** Misma precedencia que el servidor MCP: explícito → config ya superpuesta → env → puerto default. */
+function resolverUrlVoicebox(args = {}, config = {}, env = process.env) {
+  const explicita = args.voicebox_url || config.voiceboxUrl || env.VOICEBOX_URL;
+  if (explicita) return String(explicita).replace(/\/+$/, '');
+  const puerto = args.voicebox_port || config.voiceboxPort || env.VOICEBOX_PORT || PUERTO_POR_DEFECTO;
+  return `http://127.0.0.1:${puerto}`;
 }
 
 // ==============================================================================
@@ -500,6 +514,18 @@ async function salud(baseUrl, timeout = 3000) {
   } catch (err) {
     return { ok: false, error: `No se pudo contactar Voicebox en ${baseUrl} (${err.message})` };
   }
+}
+
+/** Contrato compartido de lectura. Discovery nunca arranca Voicebox. */
+async function listarPerfiles(baseUrl, { timeout = 4000 } = {}) {
+  const r = await pedir(`${baseUrl}/profiles`, { timeout });
+  if (r.status < 200 || r.status >= 300) {
+    throw new Error(`Voicebox /profiles devolvió HTTP ${r.status}`);
+  }
+  let perfiles;
+  try { perfiles = JSON.parse(r.body); } catch { throw new Error('Voicebox /profiles devolvió JSON ilegible'); }
+  if (!Array.isArray(perfiles)) throw new Error('Voicebox /profiles no devolvió una lista');
+  return perfiles;
 }
 
 async function esperarSalud(baseUrl, totalMs, sondeoMs = 500) {
@@ -880,6 +906,7 @@ module.exports = {
   resolverEjecutable,
   aplicarClavesVoicebox,
   leerConfigVoicebox,
+  resolverUrlVoicebox,
   pidVivo,
   tomarLock,
   soltarLock,
@@ -898,6 +925,7 @@ module.exports = {
   minutosParaLiberar,
   pedir,
   salud,
+  listarPerfiles,
   esperarSalud,
   estadoModelos,
   descargarModelo,

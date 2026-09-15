@@ -14,7 +14,10 @@ const os = require('node:os');
 const http = require('node:http');
 const { check, group, report } = require('./lib/assert');
 
-const { crearServidor, descubrirLotes, crearVigilante, paginaHtml, paginaAgentes } = require('../mcp-server/fanout-watch.js');
+const {
+  crearServidor, descubrirLotes, crearVigilante, paginaHtml, paginaAgentes,
+  paginaDashboard, paginaAlmas, paginaPerfiles
+} = require('../mcp-server/fanout-watch.js');
 const { crearEscritorDeEstado, rutaProgreso, rutaControl, rutaEstado } = require('../mcp-server/fanout-estado.js');
 
 const borrar = d => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch {} };
@@ -241,7 +244,15 @@ async function main() {
     check('el token se interpola de verdad en el script',
       scriptAgentes.includes('const TOKEN = "tok3n"'), scriptAgentes.slice(0, 120));
     check('y el link al fan-out lleva el token resuelto',
-      htmlAgentes.includes('/?t=tok3n'));
+      htmlAgentes.includes('/fanout?t=tok3n'));
+    for (const [nombre, html] of [
+      ['dashboard', paginaDashboard('tok3n')],
+      ['almas', paginaAlmas('tok3n')],
+      ['perfiles', paginaPerfiles('tok3n')]
+    ]) {
+      const s = html.match(/<script>([\s\S]*?)<\/script>/);
+      check(`el JS de ${nombre} parsea`, Boolean(s) && (() => { try { new Function(s[1]); return true; } catch { return false; } })());
+    }
   });
 
   await group('servidor: sirve la página y transmite estado + eventos por SSE', async () => {
@@ -257,7 +268,7 @@ async function main() {
       servidor = lanzado.servidor;
       const { puerto, token } = lanzado;
 
-      const pagina = await pedir(puerto, '/', token);
+      const pagina = await pedir(puerto, '/fanout', token);
       check('GET / responde 200 html', pagina.status === 200 && /text\/html/.test(pagina.headers['content-type']));
       check('la página nombra el lote', pagina.cuerpo.includes('mi-lote'));
       check('trae el cliente SSE', pagina.cuerpo.includes("new EventSource('/api/eventos?t='"));
@@ -624,15 +635,58 @@ async function main() {
       // así que la vista de agentes quedaba inalcanzable en un repo donde nunca
       // se corrió un fan-out.
       const raiz = await pedir(puerto, '/', token);
-      check('sin lote, la raíz sirve directamente los agentes',
-        raiz.status === 200 && raiz.cuerpo.includes('agentes persistidos'));
-      check('y no ofrece una pestaña de fan-out que no existe',
-        !raiz.cuerpo.includes('>fan-out</a>'));
+      check('sin lote, la raíz sirve el dashboard global',
+        raiz.status === 200 && raiz.cuerpo.includes('Lagrange Watch'));
+      check('el dashboard conserva navegación a fan-out',
+        raiz.cuerpo.includes('>fan-out</a>'));
+      check('la página fan-out vacía no abre EventSource',
+        !(await pedir(puerto, '/fanout', token)).cuerpo.includes('new EventSource'));
 
       const matriz = JSON.parse((await pedir(puerto, '/api/agentes', token)).cuerpo);
       check('la matriz vacía no es un error', Array.isArray(matriz.agentes) && matriz.agentes.length === 0);
     } finally {
       if (servidor) await new Promise(r => servidor.close(r));
+      borrar(repo);
+      borrar(home);
+    }
+  });
+
+  await group('FEAT-050: inventario HTTP read-only y local-first', async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-050-repo-'));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-050-home-'));
+    const env = { HOME: home, USERPROFILE: home, LAGRANGE_ALMAS_DIR: path.join(home, 'almas'), LAGRANGE_VOICEBOX_DIR: path.join(home, 'voz') };
+    const inv = require('../mcp-server/watch-inventory.js');
+    const registry = require('../mcp-server/agents/registry.js');
+    fs.mkdirSync(path.join(home, '.gemini', 'config', 'skills', 's'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.gemini', 'config', 'skills', 's', 'SKILL.md'), '---\nname: s\n---\n\nCriterio de prueba suficientemente largo.\n');
+    registry.instalarAgente('reviewer', { skill: 's' }, home);
+    const almaDir = path.join(env.LAGRANGE_ALMAS_DIR, 'usuario');
+    fs.mkdirSync(almaDir, { recursive: true });
+    fs.writeFileSync(path.join(almaDir, 'alma.md'), '# Usuario\n');
+    let servidor;
+    try {
+      const api = { ...inv, perfilesVoicebox: async () => ({ ok: true, perfiles: [{ id: 'p1', name: 'Alya' }], origen: 'LIVE', disponibilidad: 'available' }) };
+      servidor = crearServidor(repo, null, { homeDir: home, env, agyBin: 'agy-inexistente', inventarioApi: api, token: 'tok050' });
+      await new Promise(resolve => servidor.listen(0, '127.0.0.1', resolve));
+      const puerto = servidor.address().port;
+      const get = async ruta => pedir(puerto, ruta, 'tok050');
+
+      check('resumen sin token → 403', (await pedir(puerto, '/api/resumen')).status === 403);
+      const resumen = JSON.parse((await get('/api/resumen')).cuerpo);
+      check('resumen local lista agentes y almas', resumen.agentes.registrados === 1 && resumen.almas.cantidad === 1);
+      check('lotes responde forma saneada', Array.isArray(JSON.parse((await get('/api/lotes')).cuerpo).lotes));
+      check('lista almas', JSON.parse((await get('/api/almas')).cuerpo).almas[0].clave === 'usuario');
+      check('detalle de alma no colisiona con memoria compartida', (await get('/api/almas/usuario')).status === 200 && (await get('/api/memoria-usuario')).status === 200);
+      check('traversal de alma → 400', (await get('/api/almas/%2E%2E%5Cevil')).status === 400);
+      check('detalle de agente', (await get('/api/agentes/reviewer/detalle')).status === 200);
+      check('criterio remoto degrada sin 500', (await get('/api/agentes/reviewer/criterio')).status === 200);
+      check('bootstrap valida budget', (await get('/api/agentes/reviewer/bootstrap?budget_tokens=5')).status === 400);
+      const perfil = JSON.parse((await get('/api/perfiles/voicebox')).cuerpo);
+      check('perfiles conserva procedencia', perfil.origen === 'LIVE' && perfil.perfiles[0].name === 'Alya');
+      check('sin slug, SSE/diff/detención no construyen rutas null',
+        (await get('/api/eventos')).status === 404 && (await get('/api/diff?taskId=x')).status === 404);
+    } finally {
+      if (servidor) await new Promise(resolve => servidor.close(resolve));
       borrar(repo);
       borrar(home);
     }
@@ -645,7 +699,8 @@ async function main() {
       check(`${nombre}: sin #4d5566 (2.35:1)`, !html.includes('#4d5566'));
       check(`${nombre}: sin #6b7385 (≈3.7:1)`, !html.includes('#6b7385'));
     }
-    check('agentes: cada fila tiene un botón con aria-expanded', ag.includes('class="expandir" aria-expanded="false"'));
+    check('agentes: cada fila crea un botón con aria-expanded',
+      ag.includes("boton.className = 'expandir'") && ag.includes("setAttribute('aria-expanded', 'false')"));
     check('agentes: la tabla hace scroll horizontal', ag.includes('class="tabla-scroll"'));
     check('agentes: el resumen se anuncia', /id="resumen" aria-live="polite"/.test(ag));
     check('fan-out: el anuncio vive en un span aparte', /class="sr-only" aria-live="polite" id="anuncio"/.test(fan));

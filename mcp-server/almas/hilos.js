@@ -19,7 +19,7 @@ function rutaEstado(env = process.env) {
   return path.join(dirAlmas(env), 'estado.json');
 }
 
-function leer(env) {
+function leerEstado(env) {
   const { datos, ilegible } = leerJson(rutaEstado(env));
   const estado = datos && typeof datos.almas === 'object' && datos.almas ? datos : { almas: {} };
   Object.defineProperty(estado, '_ilegible', { value: ilegible, enumerable: false });
@@ -33,7 +33,7 @@ function guardar(estado, env) {
 /** El hilo vigente de un alma, o `null` si no hay o si venció la ventana. */
 function hiloDe(clave, { ventanaMs = VENTANA_MS, ahora = Date.now(), env = process.env } = {}) {
   validarClave(clave);
-  const entrada = leer(env).almas[clave];
+  const entrada = leerEstado(env).almas[clave];
   if (!entrada || !entrada.conversation_id) return null;
   const ultimo = Date.parse(entrada.ultimo_turno || '');
   if (!Number.isFinite(ultimo)) return entrada.conversation_id;
@@ -43,7 +43,7 @@ function hiloDe(clave, { ventanaMs = VENTANA_MS, ahora = Date.now(), env = proce
 /** Anota el turno y su hilo. Se llama aunque el turno haya fallado: perder el hilo obliga a empezar de cero. */
 function registrarTurno(clave, { conversationId } = {}, env = process.env) {
   validarClave(clave);
-  const estado = leer(env);
+  const estado = leerEstado(env);
   const previo = estado.almas[clave] || {};
   estado.almas[clave] = {
     ...previo,
@@ -58,7 +58,7 @@ function registrarTurno(clave, { conversationId } = {}, env = process.env) {
 /** Olvida el hilo (no la memoria): el próximo turno arranca limpio y relee el contexto. */
 function olvidarHilo(clave, env = process.env) {
   validarClave(clave);
-  const estado = leer(env);
+  const estado = leerEstado(env);
   const previo = estado.almas[clave];
   if (!previo || !previo.conversation_id) return false;
   estado.almas[clave] = { ...previo, conversation_id: null };
@@ -75,7 +75,7 @@ function olvidarHilo(clave, env = process.env) {
  */
 function esHiloDeAlma(conversationId, env = process.env) {
   if (!conversationId) return false;
-  return Object.values(leer(env).almas).some(a => a && a.conversation_id === conversationId);
+  return Object.values(leerEstado(env).almas).some(a => a && a.conversation_id === conversationId);
 }
 
-module.exports = { VENTANA_MS, rutaEstado, hiloDe, registrarTurno, olvidarHilo, esHiloDeAlma };
+module.exports = { VENTANA_MS, rutaEstado, leerEstado, hiloDe, registrarTurno, olvidarHilo, esHiloDeAlma };

@@ -102,7 +102,7 @@ Codex do not split agent memory or configuration.
 |---|---------|-------------|
 | 🤖 | **Autonomous Subagent** | Claude spins up Antigravity to execute complex tasks, multi-step refactors, and test suites |
 | 🔀 | **Concurrent Fan-Out** | Runs parallel Antigravity subagents across isolated git worktrees with disjoint-file safety checks (`/lagrange:fanout`) |
-| 👁️ | **Live Fan-Out Viewer** | Watch every subagent in your browser — streamed prose, tool calls, elapsed time, failure reasons, and a stop button (`/lagrange:watch`) |
+| 👁️ | **Lagrange Watch** | Inspect the local Lagrange inventory by source, plus live fan-out progress, diffs and stop controls (`/lagrange:watch`) |
 | 🧠 | **Dual Model Intelligence** | Combines Claude with Gemini models (3.8 / 3.7 Flash, 3.1 Pro) with configurable reasoning effort |
 | 🎙️ | **Voice Checkpoint Narration** | Zero-Claude-token spoken status updates with declarative voice routing, independent Souls, and text-only degradation |
 | 🗣️ | **Real-Time Voice Mode** | Full-duplex spoken conversation with barge-in, mic capture, Silero VAD and independent Soul/acoustic routing through local Voicebox or OmniVoice providers |
@@ -136,7 +136,7 @@ Codex do not split agent memory or configuration.
 | `/lagrange:run <prompt>` | Delegate any task to Antigravity (read + write) |
 | `/lagrange:plan <task>` | Generate an architectural plan (read-only, no file changes) |
 | `/lagrange:fanout [plan]` | Run atomic tasks in parallel, one Antigravity subagent per isolated git worktree |
-| `/lagrange:watch [slug]` | Watch a running fan-out in your browser: live per-subagent progress, elapsed time, and a stop button |
+| `/lagrange:watch [slug]` | Open the local Lagrange inventory; with a slug, open that fan-out directly |
 | `/lagrange:review [target]` | Adversarial code review on staged/unstaged diffs or specific files |
 | `/lagrange:audit [target]` | Heavyweight, evidence-based adversarial audit (Mode 1: Code vs Plan, Mode 2: Plan vs Repo) |
 | `/lagrange:summary [focus]` | Generate structured session summary from Claude Code's raw JSONL logs (`full`, `decisions`, `changes`, `debugging`) |
@@ -347,17 +347,21 @@ Subagents are strictly scoped to **implement**:
 
 ---
 
-## 👁️ Watching a Fan-Out Live (`/lagrange:watch`)
+## 👁️ Lagrange Watch (`/lagrange:watch`)
 
-`agy_fanout` is a single blocking MCP call that can run for 15+ minutes. While it does, the viewer shows you what every subagent is actually doing — in your browser, since it's already open.
+Watch is a standalone, read-only local console. Its dashboard inventories fan-out batches, persistent agents, Souls, shared memory and Voicebox profiles while labeling every source as local, generated, live, cached, derived or unavailable. Network services and `agy agents` are queried only when their section is opened; the initial summary reads local state only.
 
 ```bash
-node <plugin>/mcp-server/fanout-watch.js            # newest batch in this repo
-node <plugin>/mcp-server/fanout-watch.js --slug X   # a specific batch
+node <plugin>/mcp-server/fanout-watch.js            # global dashboard
+node <plugin>/mcp-server/fanout-watch.js --slug X   # open a specific batch
 node <plugin>/mcp-server/fanout-watch.js --port 4600
 ```
 
-It prints a `http://127.0.0.1:4517` URL and holds the terminal until `Ctrl+C`. **You run it; nothing auto-spawns it.**
+It prints a tokenized `http://127.0.0.1:4517/...` URL and holds the terminal until `Ctrl+C`. **You run it; nothing auto-spawns it.** The token is required on every page and API request.
+
+The dashboard links to `/fanout`, `/agents`, `/almas`, `/memories` and `/profiles`. Voicebox discovery never starts the service: a failed live query falls back to the existing profile cache and says so. `mcp-memory` bootstrap output is explicitly a derived preview, not context already loaded into a cast. This release does not add editing endpoints.
+
+### Live fan-out
 
 Each subagent gets a card showing:
 
@@ -373,7 +377,7 @@ The header reports the batch total, and distinguishes a finished batch (`termina
 
 The same viewer also lists your persistent agents — and, more usefully, **what each one has actually learned**. Click a row to expand its accumulated criteria: every decision and correction it committed to `mcp-memory`, with the date and how many times that memory has actually been used to rehydrate it. That last number is what separates criteria that earn their place in the token budget from criteria that just sit there.
 
-The viewer no longer needs a fan-out batch to start: in a repo where you never ran `agy_fanout`, it opens straight into `/agents`.
+The viewer does not need a fan-out batch to start. Without one, the global dashboard and persistent inventory remain available; `/fanout` shows the empty state.
 
 What this view deliberately does **not** have: decision gates (there is no escalation protocol — that item was dropped after an adversarial audit) and a live "running" state (`cast_agent` runs synchronously inside the MCP server and leaves no on-disk trace while it does, so no other process can observe it). The states it shows are only the ones that can actually be read.
 
@@ -863,7 +867,8 @@ Backed by the `agy_research` MCP tool, which is read-only and requires the `netw
 |-----------|------|-------------|
 | **MCP Server** | `mcp-server/index.js` | Zero-dependency JSON-RPC stdio server (18 tools) |
 | | `mcp-server/fanout.js` | Orchestrator for concurrent subagent fan-out across git worktrees |
-| | `mcp-server/fanout-watch.js` | Local viewer for a running fan-out (`/lagrange:watch`) — HTTP + SSE on loopback, zero dependencies |
+| | `mcp-server/fanout-watch.js` | Local Lagrange inventory and live fan-out viewer — HTTP + SSE on loopback, zero dependencies |
+| | `mcp-server/watch-inventory.js` | Local-first read model for agents, Souls, memory, batches and voice profiles |
 | | `mcp-server/fanout-estado.js` | Per-batch state, per-subagent progress log paths, and stop sentinels |
 | | `mcp-server/fanout-tail.js` | Formats one subagent's NDJSON log; also `tail -f` for a single subagent |
 | | `mcp-server/fanout-stop.js` | CLI to request a running subagent be stopped |

@@ -195,7 +195,9 @@ function textoDeResultado(resultado) {
  * Nunca lanza.
  */
 async function rehidratar(agentId, opciones = {}) {
-  const config = opciones.config || descubrirConfig();
+  const config = Object.prototype.hasOwnProperty.call(opciones, 'config')
+    ? opciones.config
+    : (opciones.homeDir ? descubrirConfig(opciones.homeDir) : descubrirConfig());
   if (!config) {
     return { ok: false, motivo: 'no hay servicio de memoria configurado' };
   }
@@ -324,8 +326,9 @@ const TAGS_CRITERIO = 'decision,user-correction';
 async function criterioDeAgente(agentId, opciones = {}) {
   // `config: null` explicito no puede caer de vuelta al home real: los tests
   // dependen de que un home sin configuracion signifique "no hay servicio".
-  const config = opciones.config
-    || (opciones.homeDir ? descubrirConfig(opciones.homeDir) : descubrirConfig());
+  const config = Object.prototype.hasOwnProperty.call(opciones, 'config')
+    ? opciones.config
+    : (opciones.homeDir ? descubrirConfig(opciones.homeDir) : descubrirConfig());
   if (!config) return { ok: false, motivo: 'no hay servicio de memoria configurado' };
 
   const cliente = new ClienteMemoria(config, { timeoutMs: opciones.timeoutMs });

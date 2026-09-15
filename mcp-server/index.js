@@ -1868,14 +1868,7 @@ function httpRequest(urlStr, options = {}, postData = null) {
   });
 }
 
-function resolveVoiceboxUrl(args = {}, config = {}) {
-  if (args.voicebox_url) return args.voicebox_url.replace(/\/+$/, '');
-  if (config.voiceboxUrl) return config.voiceboxUrl.replace(/\/+$/, '');
-  if (process.env.VOICEBOX_URL) return process.env.VOICEBOX_URL.replace(/\/+$/, '');
-
-  const port = args.voicebox_port || config.voiceboxPort || process.env.VOICEBOX_PORT || 17493;
-  return `http://127.0.0.1:${port}`;
-}
+const resolveVoiceboxUrl = (args = {}, config = {}) => vb.resolverUrlVoicebox(args, config);
 
 /**
  * `agy_voice_model` action "status". Solo lee: nunca levanta Voicebox.
@@ -1939,13 +1932,8 @@ function formatearActivacion(r, action, deVoz) {
   return out;
 }
 
-async function getVoiceboxProfiles(baseUrl, { timeoutMs = 4000 } = {}) {
-  const res = await httpRequest(`${baseUrl}/profiles`, { timeout: timeoutMs });
-  if (res.statusCode >= 200 && res.statusCode < 300) {
-    return JSON.parse(res.body);
-  }
-  throw new Error(`Failed to fetch Voicebox profiles: HTTP ${res.statusCode}`);
-}
+const getVoiceboxProfiles = (baseUrl, { timeoutMs = 4000 } = {}) =>
+  vb.listarPerfiles(baseUrl, { timeout: timeoutMs });
 
 // Fase 1 (Modo Charla): pre-warm the TTS model into VRAM before opening the mic,
 // so the first spoken reply doesn't pay the 3-8s cold-load-from-disk cost.

@@ -124,23 +124,8 @@ function listarSkills(homeDir = os.homedir()) {
  * replace_file_content y run_command del contexto — no como instruccion, sino
  * como ausencia.
  */
-function instalarAgente(nombre, opciones = {}, homeDir = os.homedir()) {
-  if (!nombreValido(nombre)) {
-    throw new Error(`Nombre de agente invalido: "${nombre}". Solo letras, digitos, guion y guion bajo.`);
-  }
-
-  const nombreSkill = opciones.skill;
-  const cuerpo = leerCuerpoSkill(nombreSkill, homeDir);
-  if (!cuerpo) {
-    throw new Error(`No se pudo leer el SKILL "${nombreSkill}" en ${dirSkills(homeDir)}.`);
-  }
-
-  const readOnly = opciones.readOnly !== false;
-  const tools = opciones.tools && opciones.tools.length
-    ? opciones.tools
-    : (readOnly ? TOOLS_LECTURA : [...TOOLS_LECTURA, ...TOOLS_ESCRITURA]);
-
-  const descripcion = (opciones.description || `Agente persistido Lagrange derivado de ${nombreSkill}`)
+function renderizarAgentMd({ nombre, nombreSkill, cuerpo, readOnly, tools, description, addendum = '' }) {
+  const descripcion = (description || `Agente persistido Lagrange derivado de ${nombreSkill}`)
     .replace(/\r?\n/g, ' ')
     .slice(0, 300);
 
@@ -173,17 +158,6 @@ function instalarAgente(nombre, opciones = {}, homeDir = os.homedir()) {
       ].join('\n')
     : '';
 
-  // El addendum acota un SKILL escrito para otro contexto (uno que ordena
-  // correr comandos, o citar un estandar que este repo no tiene). Va al final
-  // porque tiene que prevalecer sobre el cuerpo. Un re-register sin addendum
-  // conserva el anterior: perderlo en silencio devolveria al agente las
-  // instrucciones que se le quisieron sacar. `''` lo borra a proposito.
-  const registro = leerRegistro(homeDir);
-  const previo = registro.agents[nombre];
-  const addendum = typeof opciones.addendum === 'string'
-    ? opciones.addendum.trim()
-    : (previo && previo.skill === nombreSkill && previo.addendum) || '';
-
   const bloqueAddendum = addendum
     ? [
         '',
@@ -196,10 +170,46 @@ function instalarAgente(nombre, opciones = {}, homeDir = os.homedir()) {
       ].join('\n')
     : '';
 
+  return `${frontmatter}\n${encabezado}${aviso}\n${cuerpo}\n${bloqueAddendum}`;
+}
+
+function instalarAgente(nombre, opciones = {}, homeDir = os.homedir()) {
+  if (!nombreValido(nombre)) {
+    throw new Error(`Nombre de agente invalido: "${nombre}". Solo letras, digitos, guion y guion bajo.`);
+  }
+
+  const nombreSkill = opciones.skill;
+  const cuerpo = leerCuerpoSkill(nombreSkill, homeDir);
+  if (!cuerpo) {
+    throw new Error(`No se pudo leer el SKILL "${nombreSkill}" en ${dirSkills(homeDir)}.`);
+  }
+
+  const readOnly = opciones.readOnly !== false;
+  const tools = opciones.tools && opciones.tools.length
+    ? opciones.tools
+    : (readOnly ? TOOLS_LECTURA : [...TOOLS_LECTURA, ...TOOLS_ESCRITURA]);
+
+  // El addendum acota un SKILL escrito para otro contexto. Un re-register sin
+  // addendum conserva el anterior; `''` lo borra a propósito.
+  const registro = leerRegistro(homeDir);
+  const previo = registro.agents[nombre];
+  const addendum = typeof opciones.addendum === 'string'
+    ? opciones.addendum.trim()
+    : (previo && previo.skill === nombreSkill && previo.addendum) || '';
+  const contenido = renderizarAgentMd({
+    nombre,
+    nombreSkill,
+    cuerpo,
+    readOnly,
+    tools,
+    description: opciones.description,
+    addendum
+  });
+
   const destino = path.join(dirAgentesAgy(homeDir), nombre);
   fs.mkdirSync(destino, { recursive: true });
   const rutaAgente = path.join(destino, 'agent.md');
-  fs.writeFileSync(rutaAgente, `${frontmatter}\n${encabezado}${aviso}\n${cuerpo}\n${bloqueAddendum}`, 'utf8');
+  fs.writeFileSync(rutaAgente, contenido, 'utf8');
 
   registro.agents[nombre] = {
     skill: nombreSkill,
@@ -237,7 +247,8 @@ function desinstalarAgente(nombre, homeDir = os.homedir()) {
 function agentesResueltos(agyBin, opciones = {}) {
   return new Promise(resolve => {
     execFile(agyBin, ['agents'], { timeout: opciones.timeoutMs || 10000, encoding: 'utf8' }, (err, stdout) => {
-      if (err && !stdout) return resolve({ ok: false, agentes: [], motivo: err.message });
+      // Una salida parcial tras timeout/error no es un inventario confiable.
+      if (err) return resolve({ ok: false, agentes: [], motivo: err.message });
       const agentes = String(stdout || '')
         .split(/\r?\n/)
         .map(l => l.trim())
@@ -299,6 +310,7 @@ module.exports = {
   nombreValido,
   leerCuerpoSkill,
   listarSkills,
+  renderizarAgentMd,
   instalarAgente,
   desinstalarAgente,
   agentesResueltos,

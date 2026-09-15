@@ -43,6 +43,48 @@ function fakeVoicebox(port) {
 }
 
 async function main() {
+  await group('FEAT-050: config y contrato compartido de perfiles', async () => {
+    const dir = tmp();
+    const home = path.join(dir, 'home');
+    const proyecto = path.join(dir, 'repo');
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    fs.mkdirSync(path.join(proyecto, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude', 'antigravity.json'), JSON.stringify({ voicebox_url: 'http://global', voicebox_port: 1111 }));
+    fs.writeFileSync(path.join(proyecto, '.claude', 'antigravity.json'), JSON.stringify({ voicebox_url: 'http://proyecto/', voicebox_port: 2222 }));
+    const env = { HOME: home, USERPROFILE: home, VOICEBOX_URL: 'http://env', VOICEBOX_PORT: '3333' };
+    const cfg = vb.leerConfigVoicebox(proyecto, env);
+    check('proyecto gana a global y env', vb.resolverUrlVoicebox({}, cfg, env) === 'http://proyecto');
+    check('explícita gana a config', vb.resolverUrlVoicebox({ voicebox_url: 'http://explicita/' }, cfg, env) === 'http://explicita');
+    check('puerto default', vb.resolverUrlVoicebox({}, {}, {}) === 'http://127.0.0.1:17493');
+
+    let modo = 'ok';
+    const server = http.createServer((req, res) => {
+      if (req.url === '/profiles') {
+        if (modo === 'timeout') return;
+        if (modo === 'http') { res.statusCode = 500; return res.end('{}'); }
+        res.setHeader('content-type', 'application/json');
+        return res.end(modo === 'json' ? '{' : '[{"id":"p1","name":"Alya"}]');
+      }
+      res.statusCode = 500;
+      res.end('{}');
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${server.address().port}`;
+    try {
+      const perfiles = await vb.listarPerfiles(url);
+      check('lista perfiles', perfiles.length === 1 && perfiles[0].name === 'Alya');
+      modo = 'json';
+      check('rechaza JSON ilegible', await vb.listarPerfiles(url).then(() => false, e => /JSON ilegible/.test(e.message)));
+      modo = 'http';
+      check('rechaza HTTP no-2xx', await vb.listarPerfiles(url).then(() => false, e => /HTTP 500/.test(e.message)));
+      modo = 'timeout';
+      check('timeout acotado', await vb.listarPerfiles(url, { timeout: 20 }).then(() => false, e => /timeout/.test(e.message)));
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+      removeFixture(dir);
+    }
+  });
+
   await group('resolverEjecutable: CUDA antes que CPU, override sin caída silenciosa', () => {
     const dataDir = path.join('D:', 'vb');
     const cuda = path.join(dataDir, 'backends', 'cuda', 'voicebox-server-cuda.exe');

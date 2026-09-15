@@ -117,13 +117,19 @@ async function sintetizarOmni(url, { texto, refAudio, refText = null, classTempe
 // Caché de voces (un solo escritor lógico: el MCP)
 // ==============================================================================
 
-function leerCacheVoces(env = process.env) {
+function estadoCacheVoces(env = process.env) {
   try {
     const c = JSON.parse(fs.readFileSync(rutasOmni(env).cacheVoces, 'utf8'));
-    return c && typeof c === 'object' ? c : null;
-  } catch {
-    return null;
+    return c && typeof c === 'object' && !Array.isArray(c)
+      ? { datos: c, ilegible: false, existe: true }
+      : { datos: null, ilegible: true, existe: true };
+  } catch (err) {
+    return { datos: null, ilegible: err.code !== 'ENOENT', existe: err.code !== 'ENOENT' };
   }
+}
+
+function leerCacheVoces(env = process.env) {
+  return estadoCacheVoces(env).datos;
 }
 
 function guardarCacheVoces({ perfiles = null, muestra = null }, env = process.env) {
@@ -226,6 +232,7 @@ module.exports = {
   ensureOmniVoice,
   sintetizarOmni,
   leerCacheVoces,
+  estadoCacheVoces,
   guardarCacheVoces,
   duracionWav,
   muestraDePerfil,
