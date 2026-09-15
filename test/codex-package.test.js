@@ -37,9 +37,14 @@ async function main() {
     check('Codex descubre las skills compartidas', codex.skills === './skills/' && fs.existsSync(path.join(ROOT, 'skills')));
     check('Codex declara los hooks de sesión', codex.hooks === './hooks/hooks.json' && Boolean(hooksCodex.hooks?.SessionStart && hooksCodex.hooks?.SessionEnd));
     const hookInicio = hooksCodex.hooks.SessionStart[0].hooks[0];
-    check('el hook resuelve PLUGIN_ROOT en ambos shells',
-      hookInicio.command.includes('$PLUGIN_ROOT') && hookInicio.commandWindows.includes('$env:PLUGIN_ROOT'),
-      JSON.stringify(hookInicio));
+    const hooksSesion = [
+      hookInicio,
+      hooksCodex.hooks.SessionEnd[0].hooks[0]
+    ];
+    check('el hook compartido resuelve la raiz en Claude y Codex',
+      hooksSesion.every(hook =>
+        hook.command.includes('${CLAUDE_PLUGIN_ROOT}') && hook.commandWindows.includes('$env:PLUGIN_ROOT')),
+      JSON.stringify(hooksSesion));
     check('no hay una copia de skills dentro del overlay', !fs.existsSync(path.join(ROOT, '.codex-plugin', 'skills')));
   });
 

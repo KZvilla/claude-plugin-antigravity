@@ -1,5 +1,5 @@
 {
-  "description": "Record Codex transcript identity for session summaries and narration.",
+  "description": "Record Claude Code and Codex transcript identity for session summaries and narration.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$PLUGIN_ROOT/hooks/codex-session-pointer.js\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/codex-session-pointer.js\"",
             "commandWindows": "node \"$env:PLUGIN_ROOT\\hooks\\codex-session-pointer.js\"",
             "timeout": 5,
             "statusMessage": "Registering Lagrange session source"
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$PLUGIN_ROOT/hooks/codex-session-pointer.js\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/codex-session-pointer.js\"",
             "commandWindows": "node \"$env:PLUGIN_ROOT\\hooks\\codex-session-pointer.js\"",
             "timeout": 3
           }
